@@ -1,0 +1,16 @@
+[Unit]
+Description=Formant Spot Adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/formant-spot-adapter
+ExecStart=/opt/formant-spot-adapter/scripts/run.sh
+Restart=always
+RestartSec=2
+User=formant
+Group=formant
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package fsa.config;
+
+import "google/protobuf/wrappers.proto";
+
+message AdapterConfig {
+  google.protobuf.StringValue spot_host = 1;
+  google.protobuf.StringValue formant_agent_target = 2;
+  google.protobuf.StringValue teleop_twist_stream = 3;
+  google.protobuf.StringValue teleop_buttons_stream = 4;
+  google.protobuf.StringValue camera_source = 5;
+  google.protobuf.StringValue camera_stream_name = 6;
+  google.protobuf.StringValue left_camera_source = 43;
+  google.protobuf.StringValue left_camera_stream_name = 44;
+  google.protobuf.StringValue right_camera_source = 45;
+  google.protobuf.StringValue right_camera_stream_name = 46;
+  google.protobuf.StringValue back_camera_source = 47;
+  google.protobuf.StringValue back_camera_stream_name = 48;
+  google.protobuf.Int32Value camera_fps = 7;
+  google.protobuf.DoubleValue twist_deadband = 8;
+  google.protobuf.Int32Value teleop_idle_timeout_ms = 9;
+  google.protobuf.DoubleValue max_vx_mps = 10;
+  google.protobuf.DoubleValue max_vy_mps = 11;
+  google.protobuf.DoubleValue max_wz_rps = 12;
+  google.protobuf.DoubleValue max_body_pitch_rad = 49;
+  google.protobuf.Int32Value lease_retain_hz = 13;
+  google.protobuf.Int32Value heartbeat_timeout_ms = 14;
+  google.protobuf.Int32Value zero_velocity_repeats = 15;
+  google.protobuf.StringValue stand_button_stream = 16;
+  google.protobuf.StringValue sit_button_stream = 17;
+  google.protobuf.StringValue estop_button_stream = 18;
+  google.protobuf.StringValue recover_button_stream = 19;
+  google.protobuf.StringValue walk_button_stream = 20;
+  google.protobuf.StringValue stairs_button_stream = 21;
+  google.protobuf.StringValue crawl_button_stream = 22;
+  google.protobuf.StringValue reset_arm_button_stream = 23;
+  google.protobuf.StringValue arm_raise_button_stream = 24;
+  google.protobuf.StringValue dock_button_stream = 25;
+  google.protobuf.StringValue can_dock_stream = 26;
+  google.protobuf.StringValue stateful_mode_stream = 27;
+  google.protobuf.BoolValue camera_auto_rotate = 28;
+  google.protobuf.DoubleValue camera_rotate_wr1_threshold_rad = 29;
+  google.protobuf.Int32Value dock_station_id = 30;
+  google.protobuf.Int32Value dock_attempts = 31;
+  google.protobuf.Int32Value dock_poll_ms = 32;
+  google.protobuf.Int32Value dock_command_timeout_sec = 33;
+  google.protobuf.DoubleValue arm_raise_x = 34;
+  google.protobuf.DoubleValue arm_raise_y = 35;
+  google.protobuf.DoubleValue arm_raise_z = 36;
+  google.protobuf.DoubleValue arm_raise_qw = 37;
+  google.protobuf.DoubleValue arm_raise_qx = 38;
+  google.protobuf.DoubleValue arm_raise_qy = 39;
+  google.protobuf.DoubleValue arm_raise_qz = 40;
+  google.protobuf.DoubleValue arm_raise_move_sec = 41;
+  google.protobuf.Int32Value arm_hold_interval_ms = 42;
+}
