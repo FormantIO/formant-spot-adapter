@@ -4,6 +4,8 @@
 
 /build/
 /logs/
+/data/*
+!/data/.gitkeep
 build_log*
 
 /.venv/
