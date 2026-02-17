@@ -28,15 +28,6 @@ When an issue is finished, remove it from this file and archive the completed wo
     - Implement the methods and expose command/status wiring, or remove declarations until needed.
   - References: `include/formant_spot_adapter/spot_client.hpp`, `src/spot_client.cpp`
 
-### P3 - Deployment Hardening
-
-- [ ] Harden systemd service configuration for production
-  - Problem: Generated service unit is minimal and lacks standard hardening/reliability controls.
-  - Risk: Reduced fault isolation and weaker production posture.
-  - Initial fix direction:
-    - Add service hardening and operational defaults (restart policy tuning, runtime directory strategy, privilege and filesystem restrictions as appropriate for this adapter).
-  - References: `scripts/setup_service.sh`, `systemd/formant-spot-adapter.service`
-
 ### P3 - Validation and Operational Readiness
 
 - [ ] Add repeatable production smoke/regression checks

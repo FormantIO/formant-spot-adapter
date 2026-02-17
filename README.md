@@ -131,12 +131,54 @@ nano config/formant-spot-adapter.json
 ./scripts/run.sh
 ```
 
-4. Or install/start service:
+4. Or deploy as a persistent service:
 
 ```bash
-sudo ./scripts/install.sh
-sudo ./scripts/setup_service.sh
-sudo systemctl enable --now formant-spot-adapter.service
+./scripts/deploy.sh
+```
+
+## Service Lifecycle Scripts
+
+- First-time deploy (build + install/update service + enable/start):
+
+```bash
+./scripts/deploy.sh
+```
+
+- Update from git + rebuild + restart service:
+
+```bash
+./scripts/update.sh
+```
+
+- Rebuild/restart without pulling from git:
+
+```bash
+PULL_FROM_GIT=0 ./scripts/update.sh
+```
+
+- Remove service unit and stop service:
+
+```bash
+./scripts/uninstall.sh
+```
+
+- Check service status:
+
+```bash
+./scripts/service_status.sh
+```
+
+- Tail service logs:
+
+```bash
+./scripts/service_logs.sh
+```
+
+- Install/update log rotation policy only:
+
+```bash
+./scripts/setup_logrotate.sh
 ```
 
 ## Arm State Utility

@@ -2,6 +2,33 @@
 
 ## 2026-02-17
 
+### Completed: Production Service Lifecycle Scripts and Hardened systemd Unit
+
+- Added operational scripts for persistent deployment and maintenance:
+  - `scripts/deploy.sh`: build + service install/update + enable/start + restart.
+  - `scripts/update.sh`: optional git pull + rebuild + service restart.
+  - `scripts/uninstall.sh`: disable/stop/remove service unit.
+  - `scripts/service_status.sh` and `scripts/service_logs.sh` for operations.
+  - `scripts/setup_logrotate.sh` for persistent file-log retention.
+- Hardened generated and templated systemd unit defaults:
+  - Added explicit `ENV_FILE`/`CONFIG_PATH` environment wiring.
+  - Added restart tuning and shutdown timeout.
+  - Added baseline hardening (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem`,
+    `ProtectHome`, `UMask`) and restricted writable paths to adapter `logs/` and `data/`.
+- Updated `README.md` with the service lifecycle workflow.
+- Added log rotation policy install (`/etc/logrotate.d/formant-spot-adapter`) for `logs/*.log`.
+- Files:
+  - `scripts/deploy.sh`
+  - `scripts/update.sh`
+  - `scripts/uninstall.sh`
+  - `scripts/service_status.sh`
+  - `scripts/service_logs.sh`
+  - `scripts/setup_logrotate.sh`
+  - `scripts/setup_service.sh`
+  - `systemd/formant-spot-adapter.service`
+  - `README.md`
+  - `PLAN.md`
+
 ### Completed: Soft Automatic Non-E-Stop Safety Recovery
 
 - Added non-E-Stop degraded-state handling driven by robot diagnostics.
