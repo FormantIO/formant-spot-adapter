@@ -86,6 +86,17 @@ std::string fault_list_to_json(const std::vector<SpotClient::FaultInfo>& faults)
   return oss.str();
 }
 
+bool fault_requires_soft_recovery(const SpotClient::FaultInfo& fault) {
+  return fault.severity == "critical" || fault.severity == "unclearable";
+}
+
+bool any_fault_requires_soft_recovery(const std::vector<SpotClient::FaultInfo>& faults) {
+  for (const auto& fault : faults) {
+    if (fault_requires_soft_recovery(fault)) return true;
+  }
+  return false;
+}
+
 std::string robot_state_to_json(const SpotClient::RobotStateSnapshot& s) {
   std::ostringstream oss;
   oss << "{\"motor_power_state\":\"" << json_escape(s.motor_power_state)
@@ -216,13 +227,25 @@ bool Adapter::Init() {
     return false;
   }
 
+  last_spot_connect_success_ms_ = 0;
+  last_spot_connect_attempt_ms_ = 0;
+  next_spot_connect_attempt_ms_ = 0;
+  last_spot_healthcheck_ms_ = 0;
+  spot_reconnect_attempt_ = 0;
+  spot_health_failures_ = 0;
+  spot_degraded_non_estop_ = false;
+  last_soft_recovery_log_ms_ = 0;
+
   if (!spot_.Connect(cfg_.spot_host, cfg_.spot_username, cfg_.spot_password)) {
-    std::cerr << "Failed to connect/authenticate with Spot: " << spot_.LastError() << std::endl;
-    return false;
+    std::cerr << "Initial Spot connect failed; adapter will continue and retry in background: "
+              << spot_.LastError() << std::endl;
+    SetSpotDisconnected(spot_.LastError());
+  } else {
+    SetSpotConnected();
   }
 
   std::vector<SpotClient::ImageSourceInfo> sources;
-  if (spot_.ListImageSources(&sources)) {
+  if (SpotConnected() && spot_.ListImageSources(&sources)) {
     std::unordered_map<std::string, SpotClient::ImageSourceInfo> source_map;
     for (const auto& src : sources) {
       source_map[src.name] = src;
@@ -345,6 +368,7 @@ void Adapter::Run() {
   start_camera(cfg_.back_camera_source, cfg_.back_camera_stream_name, side_fps);
   lease_thread_ = std::thread(&Adapter::LeaseRetainLoop, this);
   dock_thread_ = std::thread(&Adapter::DockLoop, this);
+  connection_thread_ = std::thread(&Adapter::ConnectionLoop, this);
   EmitLog("[adapter] adapter log stream online");
 
   bool last_logged_teleop_active = false;
@@ -368,7 +392,7 @@ void Adapter::Run() {
       }
       last_logged_teleop_active = teleop_active;
     }
-    if (teleop_active && !lease_owned_) {
+    if (teleop_active && !lease_owned_ && SpotConnected()) {
       if ((now - last_lease_attempt_ms_.load()) >= 1000) {
         last_lease_attempt_ms_ = now;
         lease_owned_ = spot_.AcquireBodyLease();
@@ -407,7 +431,8 @@ void Adapter::Run() {
       }
     }
 
-    if (lease_owned_ && teleop_active && !docking_in_progress_) {
+    if (lease_owned_ && teleop_active && !docking_in_progress_ &&
+        SpotConnected() && !spot_degraded_non_estop_.load()) {
       double vx = 0.0;
       double vy = 0.0;
       double wz = 0.0;
@@ -482,6 +507,7 @@ void Adapter::Run() {
   camera_threads_.clear();
   if (lease_thread_.joinable()) lease_thread_.join();
   if (dock_thread_.joinable()) dock_thread_.join();
+  if (connection_thread_.joinable()) connection_thread_.join();
   spot_.ZeroVelocity(cfg_.zero_velocity_repeats);
   if (lease_owned_) {
     (void)WaitForArmStow(3000);
@@ -548,6 +574,10 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
     }
+    if (!SpotConnected()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      continue;
+    }
     std::string jpg;
     if (spot_.GetImageJpeg(source, &jpg)) {
       failure_backoff_ms = period_ms;
@@ -587,7 +617,8 @@ void Adapter::LeaseRetainLoop() {
     MaybeRestoreActiveMap(now);
     PollGraphNavNavigation(now);
 
-    if (lease_owned_ && (now - last_retain_ms) >= std::max(100, 1000 / std::max(1, cfg_.lease_retain_hz))) {
+    if (lease_owned_ && SpotConnected() &&
+        (now - last_retain_ms) >= std::max(100, 1000 / std::max(1, cfg_.lease_retain_hz))) {
       spot_.RetainLease();
       last_retain_ms = now;
     }
@@ -596,7 +627,7 @@ void Adapter::LeaseRetainLoop() {
       int dock_id = resolved_dock_id_.load();
       if (dock_id <= 0) dock_id = ResolveDockId();
       bool can_dock = false;
-      if (dock_id > 0) {
+      if (SpotConnected() && dock_id > 0) {
         bool ok = spot_.CanDock(dock_id, &can_dock);
         if (!ok) can_dock = false;
       }
@@ -608,10 +639,13 @@ void Adapter::LeaseRetainLoop() {
     if ((now - last_status_pub_ms) >= periodic_publish_ms) {
       QueueStatusBitset("spot.status", {
         {"Has lease", lease_owned_.load()},
+        {"Robot available", SpotConnected()},
+        {"Robot degraded", spot_degraded_non_estop_.load()},
         {"Teleop running", running_.load()},
         {"Teleop active", TeleopSessionActive()},
         {"Docking", docking_in_progress_.load()},
       });
+      QueueStatusText("spot.connection", BuildSpotConnectionJson());
       last_status_pub_ms = now;
     }
 
@@ -624,9 +658,10 @@ void Adapter::LeaseRetainLoop() {
       last_mode_pub_ms = now;
     }
 
-    if ((now - last_robot_diag_pub_ms) >= periodic_publish_ms) {
+    if ((now - last_robot_diag_pub_ms) >= periodic_publish_ms && SpotConnected()) {
       SpotClient::RobotStateSnapshot snap;
       if (spot_.GetRobotStateSnapshot(&snap)) {
+        ApplySoftRecoveryForRobotState(snap);
         QueueStatusText("spot.robot_state.power", robot_state_to_json(snap));
         if (snap.has_battery_pct) {
           QueueStatusNumeric("spot.robot_state.battery", snap.battery_pct);
@@ -643,7 +678,7 @@ void Adapter::LeaseRetainLoop() {
       last_robot_diag_pub_ms = now;
     }
 
-    if ((now - last_map_progress_pub_ms) >= periodic_publish_ms) {
+    if ((now - last_map_progress_pub_ms) >= periodic_publish_ms && SpotConnected()) {
       SpotClient::MappingStatus map_status;
       if (spot_.GetMappingStatus(&map_status)) {
         QueueStatusText("spot.map.progress", mapping_status_to_json(map_status));
@@ -682,6 +717,169 @@ bool Adapter::IsGraphNavNavigationActive() const {
   return graphnav_navigation_active_.load();
 }
 
+bool Adapter::SpotConnected() const {
+  return spot_connection_state_.load() == 2;
+}
+
+void Adapter::SetSpotConnected() {
+  const bool was_connected = SpotConnected();
+  spot_connection_state_ = 2;
+  spot_health_failures_ = 0;
+  spot_reconnect_attempt_ = 0;
+  spot_degraded_non_estop_ = false;
+  last_spot_connect_success_ms_ = now_ms();
+  {
+    std::lock_guard<std::mutex> lk(spot_connection_mu_);
+    last_spot_error_.clear();
+    spot_degraded_reason_.clear();
+  }
+  if (!was_connected) {
+    EmitLog("[spot] connection established");
+  }
+}
+
+void Adapter::SetSpotDisconnected(const std::string& reason) {
+  const bool was_connected = SpotConnected();
+  spot_connection_state_ = 0;
+  lease_owned_ = false;
+  moving_ = false;
+  spot_degraded_non_estop_ = false;
+  graphnav_navigation_active_ = false;
+  last_graph_nav_command_id_ = 0;
+  desired_twist_valid_ = false;
+  {
+    std::lock_guard<std::mutex> lk(twist_cmd_mu_);
+    desired_vx_ = 0.0;
+    desired_vy_ = 0.0;
+    desired_wz_ = 0.0;
+    desired_body_pitch_ = 0.0;
+  }
+  {
+    std::lock_guard<std::mutex> lk(spot_connection_mu_);
+    last_spot_error_ = reason;
+    spot_degraded_reason_.clear();
+  }
+  if (was_connected) {
+    EmitLog(std::string("[spot] connection lost: ") + reason);
+  }
+}
+
+std::string Adapter::BuildSpotConnectionJson() const {
+  std::string state = "disconnected";
+  const int raw_state = spot_connection_state_.load();
+  if (raw_state == 1) {
+    state = "connecting";
+  } else if (raw_state == 2) {
+    state = "connected";
+  }
+  std::string err;
+  std::string degraded_reason;
+  {
+    std::lock_guard<std::mutex> lk(spot_connection_mu_);
+    err = last_spot_error_;
+    degraded_reason = spot_degraded_reason_;
+  }
+  std::ostringstream oss;
+  oss << "{\"state\":\"" << state
+      << "\",\"connected\":" << (SpotConnected() ? "true" : "false")
+      << ",\"degraded_non_estop\":" << (spot_degraded_non_estop_.load() ? "true" : "false")
+      << ",\"reconnect_attempt\":" << spot_reconnect_attempt_.load()
+      << ",\"last_success_ms\":" << last_spot_connect_success_ms_.load()
+      << ",\"last_attempt_ms\":" << last_spot_connect_attempt_ms_.load()
+      << ",\"error\":\"" << json_escape(err) << "\""
+      << ",\"degraded_reason\":\"" << json_escape(degraded_reason) << "\"}";
+  return oss.str();
+}
+
+void Adapter::ApplySoftRecoveryForRobotState(const SpotClient::RobotStateSnapshot& snap) {
+  std::string reason;
+  if (!snap.any_estopped) {
+    const bool has_critical_system_fault = any_fault_requires_soft_recovery(snap.system_faults);
+    const bool has_critical_service_fault = any_fault_requires_soft_recovery(snap.service_faults);
+    const bool has_unclearable_behavior_fault = any_fault_requires_soft_recovery(snap.behavior_faults);
+    if (has_critical_system_fault) {
+      reason = "critical_system_fault";
+    } else if (has_critical_service_fault) {
+      reason = "critical_service_fault";
+    } else if (has_unclearable_behavior_fault) {
+      reason = "unclearable_behavior_fault";
+    } else if (snap.motor_power_state == "error") {
+      reason = "motor_power_error";
+    }
+  }
+
+  const bool degraded = !reason.empty();
+  spot_degraded_non_estop_ = degraded;
+  {
+    std::lock_guard<std::mutex> lk(spot_connection_mu_);
+    spot_degraded_reason_ = reason;
+  }
+  if (!degraded) return;
+
+  desired_twist_valid_ = false;
+  {
+    std::lock_guard<std::mutex> lk(twist_cmd_mu_);
+    desired_vx_ = 0.0;
+    desired_vy_ = 0.0;
+    desired_wz_ = 0.0;
+    desired_body_pitch_ = 0.0;
+  }
+  if (moving_.load()) {
+    spot_.ZeroVelocity(1);
+    moving_ = false;
+  }
+
+  const long long now = now_ms();
+  const long long last_log = last_soft_recovery_log_ms_.load();
+  if ((now - last_log) >= 3000) {
+    EmitLog("[safety] soft recovery active (non-estop): " + reason +
+            " ; motion commands are gated");
+    last_soft_recovery_log_ms_ = now;
+  }
+}
+
+void Adapter::ConnectionLoop() {
+  while (running_) {
+    const long long now = now_ms();
+    if (!SpotConnected()) {
+      if (now < next_spot_connect_attempt_ms_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      }
+      spot_connection_state_ = 1;
+      const int attempt = spot_reconnect_attempt_.load() + 1;
+      spot_reconnect_attempt_ = attempt;
+      last_spot_connect_attempt_ms_ = now;
+      if (spot_.Connect(cfg_.spot_host, cfg_.spot_username, cfg_.spot_password)) {
+        SetSpotConnected();
+        continue;
+      }
+      const std::string err = spot_.LastError();
+      SetSpotDisconnected(err);
+      const int backoff_ms = std::min(30000, 1000 * (1 << std::min(5, std::max(0, attempt - 1))));
+      next_spot_connect_attempt_ms_ = now + backoff_ms;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+
+    if ((now - last_spot_healthcheck_ms_.load()) >= 2000) {
+      last_spot_healthcheck_ms_ = now;
+      SpotClient::RobotStateSnapshot snap;
+      if (spot_.GetRobotStateSnapshot(&snap)) {
+        spot_health_failures_ = 0;
+      } else {
+        const int failures = spot_health_failures_.load() + 1;
+        spot_health_failures_ = failures;
+        if (failures >= 3) {
+          SetSpotDisconnected(std::string("health check failed: ") + spot_.LastError());
+          next_spot_connect_attempt_ms_ = now + 1000;
+        }
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+}
+
 void Adapter::MaybeRestoreActiveMap(long long now) {
   if (!lease_owned_.load()) return;
   if (now < next_map_restore_attempt_ms_.load()) return;
@@ -718,6 +916,7 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
 }
 
 void Adapter::PollGraphNavNavigation(long long now) {
+  if (!SpotConnected()) return;
   if ((now - last_nav_feedback_poll_ms_.load()) < 500) return;
   last_nav_feedback_poll_ms_ = now;
 
@@ -1052,6 +1251,12 @@ void Adapter::HandleCommand(const v1::model::CommandRequest& request) {
     return;
   }
 
+  if (!SpotConnected()) {
+    EmitLog(std::string("[command] rejected while robot unavailable: ") + request.command());
+    agent_.SendCommandResponse(request.id(), false);
+    return;
+  }
+
   if (request.command() == "spot.robot.reboot") {
     EmitLog("[command] spot.robot.reboot requested");
     const bool ok = spot_.RebootRobotBody();
@@ -1290,6 +1495,8 @@ void Adapter::HandleTwist(const v1::model::Twist& twist) {
   if (now_ms() < dock_cooldown_until_ms_.load()) return;
   if (!TeleopSessionActive()) return;
   if (docking_in_progress_) return;
+  if (!SpotConnected()) return;
+  if (spot_degraded_non_estop_.load()) return;
   if (!lease_owned_) return;
   const long long now = now_ms();
   last_twist_ms_ = now;
@@ -1362,6 +1569,7 @@ bool Adapter::TeleopSessionActive() const {
 void Adapter::RequestDock() { dock_requested_ = true; }
 
 int Adapter::ResolveDockId() {
+  if (!SpotConnected()) return -1;
   int current = resolved_dock_id_.load();
   if (current > 0) return current;
   if (cfg_.dock_station_id > 0) {
@@ -1386,6 +1594,14 @@ void Adapter::DockLoop() {
     }
     if (!TeleopSessionActive()) {
       EmitLog("[dock] request ignored: teleop session not active");
+      continue;
+    }
+    if (!SpotConnected()) {
+      EmitLog("[dock] request ignored: robot unavailable");
+      continue;
+    }
+    if (spot_degraded_non_estop_.load()) {
+      EmitLog("[dock] request ignored: robot degraded (non-estop)");
       continue;
     }
 

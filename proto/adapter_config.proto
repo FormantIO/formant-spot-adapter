@@ -54,4 +54,8 @@ message AdapterConfig {
   google.protobuf.DoubleValue arm_raise_qz = 40;
   google.protobuf.DoubleValue arm_raise_move_sec = 41;
   google.protobuf.Int32Value arm_hold_interval_ms = 42;
+  google.protobuf.StringValue graphnav_store_dir = 50;
+  google.protobuf.StringValue waypoint_text_stream = 51;
+  google.protobuf.Int32Value graphnav_command_timeout_sec = 52;
+  google.protobuf.StringValue maps_text_stream = 53;
 }

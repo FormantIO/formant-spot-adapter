@@ -45,7 +45,7 @@ struct Config {
   double max_body_pitch_rad{0.25};
 
   int lease_retain_hz{2};
-  int heartbeat_timeout_ms{1000};
+  int heartbeat_timeout_ms{5000};
   int zero_velocity_repeats{3};
 
   int dock_station_id{-1};  // -1 => auto-discover if exactly one dock is configured.
@@ -63,6 +63,11 @@ struct Config {
   double arm_raise_qz{0.0};
   double arm_raise_move_sec{1.5};
   int arm_hold_interval_ms{2500};
+
+  std::string graphnav_store_dir{"data/graphnav"};
+  std::string waypoint_text_stream{"spot.waypoints"};
+  std::string maps_text_stream{"spot.maps"};
+  int graphnav_command_timeout_sec{60};
 };
 
 Config load_config_from_env();

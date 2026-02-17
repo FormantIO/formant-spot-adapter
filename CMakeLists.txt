@@ -91,6 +91,7 @@ add_executable(formant-spot-adapter
   src/config.cpp
   src/formant_agent_client.cpp
   src/spot_client.cpp
+  src/spot_check_client.cpp
   src/adapter.cpp
 )
 

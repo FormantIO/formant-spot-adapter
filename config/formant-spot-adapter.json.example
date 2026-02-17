@@ -1,4 +1,8 @@
 {
   "spotHost": "192.168.50.3",
-  "formantAgentTarget": "localhost:5501"
+  "formantAgentTarget": "localhost:5501",
+  "graphnavStoreDir": "data/graphnav",
+  "waypointTextStream": "spot.waypoints",
+  "mapsTextStream": "spot.maps",
+  "graphnavCommandTimeoutSec": 60
 }

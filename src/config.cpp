@@ -110,6 +110,12 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_arm_raise_qz()) c->arm_raise_qz = j.arm_raise_qz().value();
   if (j.has_arm_raise_move_sec()) c->arm_raise_move_sec = j.arm_raise_move_sec().value();
   if (j.has_arm_hold_interval_ms()) c->arm_hold_interval_ms = j.arm_hold_interval_ms().value();
+  if (j.has_graphnav_store_dir()) c->graphnav_store_dir = j.graphnav_store_dir().value();
+  if (j.has_waypoint_text_stream()) c->waypoint_text_stream = j.waypoint_text_stream().value();
+  if (j.has_maps_text_stream()) c->maps_text_stream = j.maps_text_stream().value();
+  if (j.has_graphnav_command_timeout_sec()) {
+    c->graphnav_command_timeout_sec = j.graphnav_command_timeout_sec().value();
+  }
 }
 
 }  // namespace
@@ -179,6 +185,11 @@ Config load_config_from_env() {
   c.arm_raise_qz = getenv_double_or("ARM_RAISE_QZ", c.arm_raise_qz);
   c.arm_raise_move_sec = getenv_double_or("ARM_RAISE_MOVE_SEC", c.arm_raise_move_sec);
   c.arm_hold_interval_ms = getenv_int_or("ARM_HOLD_INTERVAL_MS", c.arm_hold_interval_ms);
+  c.graphnav_store_dir = getenv_or("GRAPHNAV_STORE_DIR", c.graphnav_store_dir);
+  c.waypoint_text_stream = getenv_or("WAYPOINT_TEXT_STREAM", c.waypoint_text_stream);
+  c.maps_text_stream = getenv_or("MAPS_TEXT_STREAM", c.maps_text_stream);
+  c.graphnav_command_timeout_sec =
+      getenv_int_or("GRAPHNAV_COMMAND_TIMEOUT_SEC", c.graphnav_command_timeout_sec);
   return c;
 }
 
