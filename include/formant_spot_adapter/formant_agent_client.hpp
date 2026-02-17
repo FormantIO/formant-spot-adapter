@@ -21,6 +21,8 @@ class FormantAgentClient {
   explicit FormantAgentClient(const std::string& target);
 
   bool PostImage(const std::string& stream, const std::string& content_type, const std::string& bytes);
+  bool PostNumeric(const std::string& stream, double value);
+  bool PostText(const std::string& stream, const std::string& value);
   bool PostBitset(const std::string& stream, const std::vector<std::pair<std::string, bool>>& bits);
   bool SendCommandResponse(const std::string& request_id, bool success);
 
@@ -35,6 +37,7 @@ class FormantAgentClient {
 
  private:
   long long NowMs() const;
+  void SleepWithBackoff(int attempt) const;
 
   std::string target_;
   std::unique_ptr<v1::agent::Agent::Stub> stub_;
@@ -43,6 +46,7 @@ class FormantAgentClient {
   std::thread command_thread_;
   std::thread heartbeat_thread_;
   std::mutex ctx_mu_;
+  std::mutex post_mu_;
   std::shared_ptr<grpc::ClientContext> teleop_ctx_;
   std::shared_ptr<grpc::ClientContext> command_ctx_;
   std::shared_ptr<grpc::ClientContext> heartbeat_ctx_;
