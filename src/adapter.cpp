@@ -97,6 +97,50 @@ bool any_fault_requires_soft_recovery(const std::vector<SpotClient::FaultInfo>& 
   return false;
 }
 
+std::string fault_event_key(const std::string& fault_type, const SpotClient::FaultInfo& fault) {
+  return fault_type + ":" + fault.id;
+}
+
+std::string format_fault_event_prefix(const std::string& action,
+                                      const std::string& fault_type,
+                                      const SpotClient::FaultInfo& fault) {
+  return "FAULT " + action + " [" + fault.severity + "] " + fault_type + ":" + fault.id;
+}
+
+void add_faults_for_events(const std::string& fault_type,
+                           const std::vector<SpotClient::FaultInfo>& faults,
+                           std::unordered_map<std::string, SpotClient::FaultInfo>* out_map) {
+  if (!out_map) return;
+  for (const auto& fault : faults) {
+    (*out_map)[fault_event_key(fault_type, fault)] = fault;
+  }
+}
+
+int fault_severity_rank(const std::string& severity) {
+  if (severity == "critical") return 4;
+  if (severity == "warn") return 3;
+  if (severity == "unclearable") return 3;
+  if (severity == "clearable") return 2;
+  if (severity == "info") return 1;
+  return 0;
+}
+
+std::string fault_type_from_key(const std::string& key) {
+  const size_t pos = key.find(':');
+  if (pos == std::string::npos) return "fault";
+  return key.substr(0, pos);
+}
+
+std::string fault_id_from_key(const std::string& key) {
+  const size_t pos = key.find(':');
+  if (pos == std::string::npos) return key;
+  return key.substr(pos + 1);
+}
+
+bool fault_event_key_order_less(const std::string& a, const std::string& b) {
+  return a < b;
+}
+
 std::string robot_state_to_json(const SpotClient::RobotStateSnapshot& s) {
   std::ostringstream oss;
   oss << "{\"motor_power_state\":\"" << json_escape(s.motor_power_state)
@@ -235,6 +279,7 @@ bool Adapter::Init() {
   spot_health_failures_ = 0;
   spot_degraded_non_estop_ = false;
   last_soft_recovery_log_ms_ = 0;
+  ResetFaultEventsState();
 
   if (!spot_.Connect(cfg_.spot_host, cfg_.spot_username, cfg_.spot_password)) {
     std::cerr << "Initial Spot connect failed; adapter will continue and retry in background: "
@@ -672,6 +717,7 @@ void Adapter::LeaseRetainLoop() {
         QueueStatusText("spot.faults.system", fault_list_to_json(snap.system_faults));
         QueueStatusText("spot.faults.behavior", fault_list_to_json(snap.behavior_faults));
         QueueStatusText("spot.faults.service", fault_list_to_json(snap.service_faults));
+        PublishFaultEvents(snap, now);
       } else {
         std::cerr << "[state] failed to fetch robot state: " << spot_.LastError() << std::endl;
       }
@@ -759,6 +805,7 @@ void Adapter::SetSpotDisconnected(const std::string& reason) {
     last_spot_error_ = reason;
     spot_degraded_reason_.clear();
   }
+  ResetFaultEventsState();
   if (was_connected) {
     EmitLog(std::string("[spot] connection lost: ") + reason);
   }
@@ -836,6 +883,106 @@ void Adapter::ApplySoftRecoveryForRobotState(const SpotClient::RobotStateSnapsho
             " ; motion commands are gated");
     last_soft_recovery_log_ms_ = now;
   }
+}
+
+void Adapter::ResetFaultEventsState() {
+  std::lock_guard<std::mutex> lk(fault_events_mu_);
+  last_fault_events_.clear();
+  last_fault_summary_pub_ms_ = 0;
+}
+
+void Adapter::PublishFaultEvents(const SpotClient::RobotStateSnapshot& snap, long long now) {
+  std::unordered_map<std::string, SpotClient::FaultInfo> current_faults;
+  add_faults_for_events("system", snap.system_faults, &current_faults);
+  add_faults_for_events("behavior", snap.behavior_faults, &current_faults);
+  add_faults_for_events("service", snap.service_faults, &current_faults);
+
+  std::unordered_map<std::string, SpotClient::FaultInfo> previous_faults;
+  {
+    std::lock_guard<std::mutex> lk(fault_events_mu_);
+    previous_faults = last_fault_events_;
+    last_fault_events_ = current_faults;
+  }
+
+  std::vector<std::string> opened_keys;
+  std::vector<std::string> changed_keys;
+  std::vector<std::string> cleared_keys;
+  opened_keys.reserve(current_faults.size());
+  changed_keys.reserve(current_faults.size());
+  cleared_keys.reserve(previous_faults.size());
+
+  for (const auto& kv : current_faults) {
+    const auto it = previous_faults.find(kv.first);
+    if (it == previous_faults.end()) {
+      opened_keys.push_back(kv.first);
+      continue;
+    }
+    const auto& prev = it->second;
+    const auto& cur = kv.second;
+    if (prev.severity != cur.severity || prev.message != cur.message) {
+      changed_keys.push_back(kv.first);
+    }
+  }
+  for (const auto& kv : previous_faults) {
+    if (current_faults.find(kv.first) == current_faults.end()) {
+      cleared_keys.push_back(kv.first);
+    }
+  }
+
+  std::sort(opened_keys.begin(), opened_keys.end(), fault_event_key_order_less);
+  std::sort(changed_keys.begin(), changed_keys.end(), fault_event_key_order_less);
+  std::sort(cleared_keys.begin(), cleared_keys.end(), fault_event_key_order_less);
+
+  std::vector<std::string> lines;
+  lines.reserve(opened_keys.size() + changed_keys.size() + cleared_keys.size() + 1);
+
+  for (const auto& key : opened_keys) {
+    const auto& cur = current_faults[key];
+    const std::string fault_type = fault_type_from_key(key);
+    std::string line = format_fault_event_prefix("OPEN", fault_type, cur);
+    if (!cur.message.empty()) line += " " + cur.message;
+    lines.push_back(std::move(line));
+  }
+  for (const auto& key : changed_keys) {
+    const auto& prev = previous_faults[key];
+    const auto& cur = current_faults[key];
+    const std::string fault_type = fault_type_from_key(key);
+    std::string line = "FAULT CHANGED [" + prev.severity + "->" + cur.severity + "] " +
+                       fault_type + ":" + cur.id;
+    if (!cur.message.empty()) line += " " + cur.message;
+    lines.push_back(std::move(line));
+  }
+  for (const auto& key : cleared_keys) {
+    const std::string fault_type = fault_type_from_key(key);
+    const std::string fault_id = fault_id_from_key(key);
+    lines.push_back("FAULT CLEARED " + fault_type + ":" + fault_id);
+  }
+
+  int active_count = 0;
+  int elevated_count = 0;
+  int critical_count = 0;
+  for (const auto& kv : current_faults) {
+    ++active_count;
+    const int rank = fault_severity_rank(kv.second.severity);
+    if (rank >= 3) ++elevated_count;
+    if (kv.second.severity == "critical") ++critical_count;
+  }
+  const bool has_changes = !opened_keys.empty() || !changed_keys.empty() || !cleared_keys.empty();
+  const bool summary_due = (now - last_fault_summary_pub_ms_.load()) >= 30000;
+  if (has_changes || summary_due) {
+    lines.push_back("FAULT SUMMARY active=" + std::to_string(active_count) +
+                    " elevated=" + std::to_string(elevated_count) +
+                    " critical=" + std::to_string(critical_count));
+    last_fault_summary_pub_ms_ = now;
+  }
+
+  if (lines.empty()) return;
+  std::ostringstream payload;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    payload << lines[i];
+    if (i + 1 < lines.size()) payload << "\n";
+  }
+  QueueStatusText("spot.fault.events", payload.str());
 }
 
 void Adapter::ConnectionLoop() {

@@ -69,6 +69,8 @@ class Adapter {
   void SetSpotDisconnected(const std::string& reason);
   std::string BuildSpotConnectionJson() const;
   void ApplySoftRecoveryForRobotState(const SpotClient::RobotStateSnapshot& snap);
+  void PublishFaultEvents(const SpotClient::RobotStateSnapshot& snap, long long now_ms);
+  void ResetFaultEventsState();
   bool ResolveWaypointNameLocked(const std::string& name, std::string* out_waypoint_id) const;
   void PruneAliasesForLoadedGraphLocked();
   std::string BuildWaypointTextLocked() const;
@@ -152,6 +154,9 @@ class Adapter {
   mutable std::mutex spot_connection_mu_;
   std::string last_spot_error_;
   std::string spot_degraded_reason_;
+  mutable std::mutex fault_events_mu_;
+  std::unordered_map<std::string, SpotClient::FaultInfo> last_fault_events_;
+  std::atomic<long long> last_fault_summary_pub_ms_{0};
 
   std::mutex map_mu_;
   std::string active_map_id_;

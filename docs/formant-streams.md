@@ -112,29 +112,38 @@ Configure these streams in your Formant teleop view/device config.
 14. `spot.faults.service` (type: text/json, 0.2 Hz / every 5s)
 - Active service fault summary.
 
-15. `spot.nav.feedback` (type: text/json, ~2 Hz while nav command active)
+15. `spot.fault.events` (type: text, event-driven + periodic summary)
+- Simplified fault feed for operators.
+- Emits only on fault changes:
+  - `FAULT OPEN ...`
+  - `FAULT CHANGED ...`
+  - `FAULT CLEARED ...`
+- Also emits periodic summary:
+  - `FAULT SUMMARY active=<n> elevated=<n> critical=<n>`
+
+16. `spot.nav.feedback` (type: text/json, ~2 Hz while nav command active)
 - GraphNav feedback snapshot (`status`, `remaining_route_length_m`, route/blockage context).
 
-16. `spot.adapter.log` (type: text, 1 Hz batched)
+17. `spot.adapter.log` (type: text, 1 Hz batched)
 - Buffered adapter-side operational log lines (command/recovery events).
 
-17. `spot.waypoints` (type: text, 1 Hz)
+18. `spot.waypoints` (type: text, 1 Hz)
 - Newline-separated waypoint names for the currently loaded GraphNav map.
 - Names come from adapter aliases (`spot.waypoint.save/update`) and fall back to GraphNav labels.
 
-18. `spot.maps` (type: text, 0.2 Hz / every 5s)
+19. `spot.maps` (type: text, 0.2 Hz / every 5s)
 - Newline-separated saved map IDs discovered in adapter map storage.
 
-19. `spot.map.progress` (type: text/json, 0.2 Hz / every 5s)
+20. `spot.map.progress` (type: text/json, 0.2 Hz / every 5s)
 - Recording/map statistics summary from GraphNav recording status.
 
-20. `spot.map.progress.waypoints` (type: numeric, 0.2 Hz / every 5s)
+21. `spot.map.progress.waypoints` (type: numeric, 0.2 Hz / every 5s)
 - Waypoint count in current loaded graph.
 
-21. `spot.map.progress.path_length_m` (type: numeric, 0.2 Hz / every 5s)
+22. `spot.map.progress.path_length_m` (type: numeric, 0.2 Hz / every 5s)
 - Total recorded path length in meters.
 
-22. `spot.map.progress.fiducials` (type: numeric, 0.2 Hz / every 5s)
+23. `spot.map.progress.fiducials` (type: numeric, 0.2 Hz / every 5s)
 - Count of visible fiducials in recording status.
 
 ## Commands (Formant -> Adapter)
