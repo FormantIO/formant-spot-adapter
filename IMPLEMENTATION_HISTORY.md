@@ -2,6 +2,15 @@
 
 ## 2026-02-17
 
+### Completed: Fix systemd CHDIR Failure For Home-Directory Deployments
+
+- Updated service hardening to allow running from a repository under `/home/...`.
+- Changed `ProtectHome` from `true` to `read-only` so systemd can enter `WorkingDirectory`
+  while still restricting write access to home paths by default.
+- Files:
+  - `scripts/setup_service.sh`
+  - `systemd/formant-spot-adapter.service`
+
 ### Completed: Production Service Lifecycle Scripts and Hardened systemd Unit
 
 - Added operational scripts for persistent deployment and maintenance:

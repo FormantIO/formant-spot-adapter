@@ -27,7 +27,7 @@ Environment=CONFIG_PATH=${CONFIG_PATH}
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=true
+ProtectHome=read-only
 ReadWritePaths=${ROOT_DIR}/logs ${ROOT_DIR}/data
 UMask=0077
 TimeoutStopSec=20

@@ -16,7 +16,7 @@ Environment=CONFIG_PATH=/opt/formant-spot-adapter/config/formant-spot-adapter.js
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=true
+ProtectHome=read-only
 ReadWritePaths=/opt/formant-spot-adapter/logs /opt/formant-spot-adapter/data
 UMask=0077
 TimeoutStopSec=20
