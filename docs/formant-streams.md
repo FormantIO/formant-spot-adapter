@@ -112,14 +112,12 @@ Configure these streams in your Formant teleop view/device config.
 14. `spot.faults.service` (type: text/json, 0.2 Hz / every 5s)
 - Active service fault summary.
 
-15. `spot.fault.events` (type: text, event-driven + periodic summary)
+15. `spot.fault.events` (type: text, event-driven)
 - Simplified fault feed for operators.
 - Emits only on fault changes:
   - `FAULT OPEN ...`
   - `FAULT CHANGED ...`
   - `FAULT CLEARED ...`
-- Also emits periodic summary:
-  - `FAULT SUMMARY active=<n> elevated=<n> critical=<n>`
 
 16. `spot.nav.feedback` (type: text/json, ~2 Hz while nav command active)
 - GraphNav feedback snapshot (`status`, `remaining_route_length_m`, route/blockage context).

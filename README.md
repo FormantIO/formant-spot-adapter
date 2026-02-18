@@ -56,7 +56,7 @@ Additional control channels (not streams):
 | `spot.faults.system` | Text (JSON) | Active system faults summary |
 | `spot.faults.behavior` | Text (JSON) | Active behavior faults summary |
 | `spot.faults.service` | Text (JSON) | Active service faults summary |
-| `spot.fault.events` | Text | Simplified fault event feed (`FAULT OPEN/CHANGED/CLEARED`, plus periodic summary) |
+| `spot.fault.events` | Text | Simplified fault event feed (`FAULT OPEN/CHANGED/CLEARED` only) |
 | `spot.nav.feedback` | Text (JSON) | GraphNav command status/route-following diagnostics |
 | `spot.adapter.log` | Text | Buffered adapter event log batches (1 Hz) |
 

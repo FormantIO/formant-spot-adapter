@@ -9,8 +9,6 @@
   - Emits `FAULT OPEN` when a fault first appears.
   - Emits `FAULT CHANGED` when severity/message changes for an active fault.
   - Emits `FAULT CLEARED` when a previous fault disappears.
-  - Emits periodic `FAULT SUMMARY` (`active`, `elevated`, `critical`) at least every 30s,
-    and immediately when there are changes.
   - Stream is deduplicated by fault identity (`type:id`) so operators only see meaningful deltas.
 - Files:
   - `src/adapter.cpp`

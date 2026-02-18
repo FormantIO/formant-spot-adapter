@@ -116,15 +116,6 @@ void add_faults_for_events(const std::string& fault_type,
   }
 }
 
-int fault_severity_rank(const std::string& severity) {
-  if (severity == "critical") return 4;
-  if (severity == "warn") return 3;
-  if (severity == "unclearable") return 3;
-  if (severity == "clearable") return 2;
-  if (severity == "info") return 1;
-  return 0;
-}
-
 std::string fault_type_from_key(const std::string& key) {
   const size_t pos = key.find(':');
   if (pos == std::string::npos) return "fault";
@@ -717,7 +708,7 @@ void Adapter::LeaseRetainLoop() {
         QueueStatusText("spot.faults.system", fault_list_to_json(snap.system_faults));
         QueueStatusText("spot.faults.behavior", fault_list_to_json(snap.behavior_faults));
         QueueStatusText("spot.faults.service", fault_list_to_json(snap.service_faults));
-        PublishFaultEvents(snap, now);
+        PublishFaultEvents(snap);
       } else {
         std::cerr << "[state] failed to fetch robot state: " << spot_.LastError() << std::endl;
       }
@@ -888,10 +879,9 @@ void Adapter::ApplySoftRecoveryForRobotState(const SpotClient::RobotStateSnapsho
 void Adapter::ResetFaultEventsState() {
   std::lock_guard<std::mutex> lk(fault_events_mu_);
   last_fault_events_.clear();
-  last_fault_summary_pub_ms_ = 0;
 }
 
-void Adapter::PublishFaultEvents(const SpotClient::RobotStateSnapshot& snap, long long now) {
+void Adapter::PublishFaultEvents(const SpotClient::RobotStateSnapshot& snap) {
   std::unordered_map<std::string, SpotClient::FaultInfo> current_faults;
   add_faults_for_events("system", snap.system_faults, &current_faults);
   add_faults_for_events("behavior", snap.behavior_faults, &current_faults);
@@ -934,7 +924,7 @@ void Adapter::PublishFaultEvents(const SpotClient::RobotStateSnapshot& snap, lon
   std::sort(cleared_keys.begin(), cleared_keys.end(), fault_event_key_order_less);
 
   std::vector<std::string> lines;
-  lines.reserve(opened_keys.size() + changed_keys.size() + cleared_keys.size() + 1);
+  lines.reserve(opened_keys.size() + changed_keys.size() + cleared_keys.size());
 
   for (const auto& key : opened_keys) {
     const auto& cur = current_faults[key];
@@ -956,24 +946,6 @@ void Adapter::PublishFaultEvents(const SpotClient::RobotStateSnapshot& snap, lon
     const std::string fault_type = fault_type_from_key(key);
     const std::string fault_id = fault_id_from_key(key);
     lines.push_back("FAULT CLEARED " + fault_type + ":" + fault_id);
-  }
-
-  int active_count = 0;
-  int elevated_count = 0;
-  int critical_count = 0;
-  for (const auto& kv : current_faults) {
-    ++active_count;
-    const int rank = fault_severity_rank(kv.second.severity);
-    if (rank >= 3) ++elevated_count;
-    if (kv.second.severity == "critical") ++critical_count;
-  }
-  const bool has_changes = !opened_keys.empty() || !changed_keys.empty() || !cleared_keys.empty();
-  const bool summary_due = (now - last_fault_summary_pub_ms_.load()) >= 30000;
-  if (has_changes || summary_due) {
-    lines.push_back("FAULT SUMMARY active=" + std::to_string(active_count) +
-                    " elevated=" + std::to_string(elevated_count) +
-                    " critical=" + std::to_string(critical_count));
-    last_fault_summary_pub_ms_ = now;
   }
 
   if (lines.empty()) return;
