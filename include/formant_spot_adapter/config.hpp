@@ -50,7 +50,7 @@ struct Config {
 
   int dock_station_id{-1};  // -1 => auto-discover if exactly one dock is configured.
   int dock_attempts{3};
-  int dock_poll_ms{500};
+  int dock_poll_ms{1000};
   int dock_command_timeout_sec{30};
 
   // Saved "raised" hand pose in body frame. Set in config JSON.

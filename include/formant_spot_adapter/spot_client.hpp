@@ -88,6 +88,14 @@ class SpotClient {
     std::vector<FaultInfo> service_faults;
   };
 
+  struct LocalizationSnapshot {
+    std::string waypoint_id;
+    bool has_waypoint_tform_body{false};
+    double waypoint_tform_body_x{0.0};
+    double waypoint_tform_body_y{0.0};
+    double waypoint_tform_body_z{0.0};
+  };
+
   SpotClient() = default;
 
   bool Connect(const std::string& host, const std::string& username, const std::string& password);
@@ -124,6 +132,8 @@ class SpotClient {
   bool UploadGraphMap(const StoredMap& map_data);
   bool ClearGraph();
   bool SetLocalizationFiducial();
+  bool GetLocalizationWaypointId(std::string* out_waypoint_id);
+  bool GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot);
   bool NavigateToWaypoint(const std::string& waypoint_id, int command_timeout_sec,
                           uint32_t* out_command_id = nullptr);
   bool GetNavigationFeedback(uint32_t command_id, int* out_status);

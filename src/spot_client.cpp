@@ -310,6 +310,42 @@ bool SpotClient::StartCameraCalibration() {
   return true;
 }
 
+bool SpotClient::CancelCameraCalibration() {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!EnsureSpotCheckClient()) return false;
+  if (!EnsureTimeSync()) return false;
+  if (body_lease_.resource().empty()) {
+    SetLastError("Camera calibration cancel requires an active body lease.");
+    return false;
+  }
+
+  ::bosdyn::api::spot::CameraCalibrationCommandRequest req;
+  req.set_command(::bosdyn::api::spot::CameraCalibrationCommandRequest::COMMAND_CANCEL);
+  auto r = spot_check_client_->CameraCalibrationCommand(req);
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+  return true;
+}
+
+bool SpotClient::GetCameraCalibrationFeedback(int* out_status, float* out_progress) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!out_status || !out_progress) return false;
+  if (!EnsureSpotCheckClient()) return false;
+  if (!EnsureTimeSync()) return false;
+
+  auto r = spot_check_client_->CameraCalibrationFeedback();
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+
+  *out_status = static_cast<int>(r.response.status());
+  *out_progress = r.response.progress();
+  return true;
+}
+
 bool SpotClient::ResetArmToStow() {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!robot_command_client_) return false;
@@ -742,6 +778,53 @@ bool SpotClient::SetLocalizationFiducial() {
     SetLastError("SetLocalization failed status=" + std::to_string(static_cast<int>(r.response.status())));
     return false;
   }
+  return true;
+}
+
+bool SpotClient::GetLocalizationWaypointId(std::string* out_waypoint_id) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!out_waypoint_id) return false;
+  if (!EnsureGraphNavClient()) return false;
+  ::bosdyn::api::graph_nav::GetLocalizationStateRequest req;
+  auto r = graph_nav_client_->GetLocalizationState(req);
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+  const auto& localization = r.response.localization();
+  if (localization.waypoint_id().empty()) {
+    SetLastError("GetLocalizationState returned empty waypoint_id");
+    return false;
+  }
+  *out_waypoint_id = localization.waypoint_id();
+  return true;
+}
+
+bool SpotClient::GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!out_snapshot) return false;
+  if (!EnsureGraphNavClient()) return false;
+  ::bosdyn::api::graph_nav::GetLocalizationStateRequest req;
+  auto r = graph_nav_client_->GetLocalizationState(req);
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+  const auto& localization = r.response.localization();
+  if (localization.waypoint_id().empty()) {
+    SetLastError("GetLocalizationState returned empty waypoint_id");
+    return false;
+  }
+
+  LocalizationSnapshot snapshot;
+  snapshot.waypoint_id = localization.waypoint_id();
+  if (localization.has_waypoint_tform_body()) {
+    snapshot.has_waypoint_tform_body = true;
+    snapshot.waypoint_tform_body_x = localization.waypoint_tform_body().position().x();
+    snapshot.waypoint_tform_body_y = localization.waypoint_tform_body().position().y();
+    snapshot.waypoint_tform_body_z = localization.waypoint_tform_body().position().z();
+  }
+  *out_snapshot = std::move(snapshot);
   return true;
 }
 

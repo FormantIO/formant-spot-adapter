@@ -1,6 +1,48 @@
 # IMPLEMENTATION HISTORY
 
+## 2026-02-18
+
+### Completed: Terminal Async Command Execution/Response Pipeline
+
+- Reworked Formant command handling to execute through a dedicated command queue worker thread.
+- Command responses are now sent only after command procedures reach terminal success/failure.
+- Added command-specific completion procedures for long-running operations:
+  - `spot.camera.calibrate`: waits for SpotCheck terminal feedback status.
+  - `spot.waypoint.goto`: waits for GraphNav terminal navigation feedback.
+  - `spot.dock` and `spot.return_and_dock`: run full dock sequence and return terminal result.
+  - `spot.reset_arm`: waits for arm stow confirmation window before responding.
+- Normalized polling cadence for these completion loops to 1 Hz (or slower), including GraphNav and dock command feedback paths.
+- Files:
+  - `src/adapter.cpp`
+  - `include/formant_spot_adapter/adapter.hpp`
+  - `include/formant_spot_adapter/config.hpp`
+
+### Completed: Implement Missing Spot Camera Calibration API Methods
+
+- Implemented `SpotClient::CancelCameraCalibration`.
+- Implemented `SpotClient::GetCameraCalibrationFeedback`.
+- Resolved header/implementation drift and linker failure introduced by terminal command completion flow.
+- Files:
+  - `src/spot_client.cpp`
+  - `include/formant_spot_adapter/spot_client.hpp`
+
 ## 2026-02-17
+
+### Completed: Add Command-Channel Equivalents For Core Teleop Actions
+
+- Added Formant command-channel actions:
+  - `spot.stand`
+  - `spot.sit`
+  - `spot.recover`
+  - `spot.dock`
+  - `spot.reset_arm`
+- Refactored action handling so command and button triggers use the same execution paths
+  (shared gating/behavior/logging).
+- Files:
+  - `src/adapter.cpp`
+  - `include/formant_spot_adapter/adapter.hpp`
+  - `README.md`
+  - `docs/formant-streams.md`
 
 ### Completed: Add Simplified Fault Event Stream For Operators
 

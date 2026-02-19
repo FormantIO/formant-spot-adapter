@@ -220,6 +220,15 @@ bool is_robot_impaired_error_text(const std::string& error_text) {
          error_text.find("status=5") != std::string::npos;
 }
 
+bool is_not_localized_error_text(const std::string& error_text) {
+  std::string lower = error_text;
+  for (char& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return error_text.find("STATUS_NOT_LOCALIZED_TO_MAP") != std::string::npos ||
+         lower.find("not_localized") != std::string::npos ||
+         lower.find("not localized") != std::string::npos ||
+         error_text.find("status=13") != std::string::npos;
+}
+
 std::string nav_feedback_signature(const SpotClient::NavigationFeedbackSnapshot& fb) {
   std::ostringstream oss;
   oss << fb.status << "|"
@@ -356,7 +365,8 @@ bool Adapter::Init() {
       pending_restore_map_id_ = active_map_id_;
     }
     loaded_waypoint_id_to_label_.clear();
-    loaded_waypoint_label_to_id_.clear();
+    loaded_waypoint_label_to_ids_.clear();
+    loaded_waypoint_lower_label_to_ids_.clear();
   }
   force_waypoint_publish_ = true;
   force_maps_publish_ = true;
@@ -382,7 +392,10 @@ void Adapter::Run() {
   agent_.StartTeleopLoop(stream_filter,
                          [this](const v1::model::ControlDatapoint& dp) { HandleTeleop(dp); });
   agent_.StartCommandLoop({"spot.jetson.reboot", "spot.robot.reboot", "spot.camera.calibrate",
-                           "spot.map.load", "spot.map.set_default", "spot.map.delete",
+                           "spot.stand", "spot.sit", "spot.recover", "spot.dock",
+                           "spot.return_and_dock", "spot.rotate_left", "spot.rotate_right",
+                           "spot.reset_arm",
+                           "spot.map.create", "spot.map.load", "spot.map.set_default", "spot.map.delete",
                            "spot.map.start_mapping", "spot.map.stop_mapping",
                            "spot.waypoint.save", "spot.waypoint.update",
                            "spot.waypoint.delete", "spot.waypoint.goto"},
@@ -396,8 +409,8 @@ void Adapter::Run() {
     camera_threads_.emplace_back(&Adapter::CameraLoop, this, source, stream, fps);
   };
   const int hand_fps = std::max(1, cfg_.camera_fps);
-  // Prioritize teleop hand camera smoothness over surround-camera throughput.
-  const int side_fps = std::max(1, std::min(2, cfg_.camera_fps));
+  // Keep surround cameras at very low rate to avoid Formant stream throttling.
+  const int side_fps = 1;
   start_camera(cfg_.camera_source, cfg_.camera_stream_name, hand_fps);
   start_camera(cfg_.left_camera_source, cfg_.left_camera_stream_name, side_fps);
   start_camera(cfg_.right_camera_source, cfg_.right_camera_stream_name, side_fps);
@@ -405,6 +418,7 @@ void Adapter::Run() {
   lease_thread_ = std::thread(&Adapter::LeaseRetainLoop, this);
   dock_thread_ = std::thread(&Adapter::DockLoop, this);
   connection_thread_ = std::thread(&Adapter::ConnectionLoop, this);
+  command_exec_thread_ = std::thread(&Adapter::CommandExecutionLoop, this);
   EmitLog("[adapter] adapter log stream online");
 
   bool last_logged_teleop_active = false;
@@ -413,6 +427,10 @@ void Adapter::Run() {
     const long long now = now_ms();
     FlushQueuedStatus(now);
     FlushAdapterLogStream(now);
+    PublishWaypointsText(false);
+    PublishMapsText(false);
+    PublishCurrentMapText(false);
+    PublishDefaultMapText(false);
 
     if (HeartbeatExpired() && lease_owned_.load() && moving_.load()) {
       spot_.ZeroVelocity(cfg_.zero_velocity_repeats);
@@ -440,10 +458,13 @@ void Adapter::Run() {
         }
       }
     } else if (!teleop_active && lease_owned_) {
-      if (IsGraphNavNavigationActive()) {
+      const bool keep_lease_for_autonomy =
+          IsGraphNavNavigationActive() || docking_in_progress_.load() ||
+          map_recording_active_.load() || command_action_in_progress_.load();
+      if (keep_lease_for_autonomy) {
         if ((now - last_nav_hold_log_ms_.load()) >= 5000) {
           last_nav_hold_log_ms_ = now;
-          EmitLog("[adapter] teleop inactive but graphnav navigation is active; keeping lease");
+          EmitLog("[adapter] teleop inactive but autonomy command is active; keeping lease");
         }
       } else {
         EmitLog("[adapter] teleop inactive, stopping motion and returning body lease");
@@ -544,6 +565,7 @@ void Adapter::Run() {
   if (lease_thread_.joinable()) lease_thread_.join();
   if (dock_thread_.joinable()) dock_thread_.join();
   if (connection_thread_.joinable()) connection_thread_.join();
+  if (command_exec_thread_.joinable()) command_exec_thread_.join();
   spot_.ZeroVelocity(cfg_.zero_velocity_repeats);
   if (lease_owned_) {
     (void)WaitForArmStow(3000);
@@ -555,14 +577,19 @@ void Adapter::Run() {
 void Adapter::Stop() {
   running_ = false;
   spot_.RequestDockCancel();
+  command_queue_cv_.notify_all();
   agent_.StopLoops();
 }
 
 void Adapter::CameraLoop(const std::string& source, const std::string& stream, int fps) {
-  const int period_ms = std::max(1, 1000 / std::max(1, fps));
+  int period_ms = std::max(1, 1000 / std::max(1, fps));
   long long last_error_log_ms = 0;
-  int failure_backoff_ms = period_ms;
   const bool is_primary_teleop_stream = (stream == cfg_.camera_stream_name);
+  if (!is_primary_teleop_stream) {
+    // Left/right/back cameras are intentionally capped to 0.2 Hz (one frame every 5s).
+    period_ms = std::max(period_ms, 5000);
+  }
+  int failure_backoff_ms = period_ms;
   std::mutex latest_mu;
   std::condition_variable latest_cv;
   std::string latest_jpg;
@@ -600,12 +627,6 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
   });
 
   while (running_) {
-    const bool teleop_active = TeleopSessionActive();
-    if (!is_primary_teleop_stream && teleop_active) {
-      // While teleop is active, heavily de-prioritize non-primary cameras.
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-      continue;
-    }
     if (now_ms() < dock_cooldown_until_ms_.load()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
@@ -648,6 +669,7 @@ void Adapter::LeaseRetainLoop() {
   long long last_mode_pub_ms = 0;
   long long last_robot_diag_pub_ms = 0;
   long long last_map_progress_pub_ms = 0;
+  long long last_localization_pub_ms = 0;
   while (running_) {
     const long long now = now_ms();
     MaybeRestoreActiveMap(now);
@@ -740,12 +762,34 @@ void Adapter::LeaseRetainLoop() {
       last_map_progress_pub_ms = now;
     }
 
+    if ((now - last_localization_pub_ms) >= periodic_publish_ms) {
+      bool localized = false;
+      std::string waypoint_id;
+      std::string error;
+      if (SpotConnected()) {
+        if (spot_.GetLocalizationWaypointId(&waypoint_id)) {
+          localized = true;
+        } else {
+          error = spot_.LastError();
+        }
+      } else {
+        error = "robot_disconnected";
+      }
+      std::ostringstream oss;
+      oss << "{\"localized\":" << (localized ? "true" : "false")
+          << ",\"waypoint_id\":\"" << json_escape(waypoint_id) << "\""
+          << ",\"error\":\"" << json_escape(error) << "\"}";
+      QueueStatusText("spot.localization", oss.str());
+      last_localization_pub_ms = now;
+    }
+
+    PollCurrentWaypointAtStatus(now);
+
     if (lease_owned_ && TeleopSessionActive() && !docking_in_progress_) {
       ApplyDesiredArmMode(false);
     }
 
-    PublishWaypointsText(false);
-    PublishMapsText(false);
+    PublishCurrentWaypointText(now);
     std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
   }
 }
@@ -1036,7 +1080,7 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
 
 void Adapter::PollGraphNavNavigation(long long now) {
   if (!SpotConnected()) return;
-  if ((now - last_nav_feedback_poll_ms_.load()) < 500) return;
+  if ((now - last_nav_feedback_poll_ms_.load()) < 1000) return;
   last_nav_feedback_poll_ms_ = now;
 
   const uint32_t command_id = last_graph_nav_command_id_.load();
@@ -1357,69 +1401,310 @@ void Adapter::HandleHeartbeat(const v1::agent::GetTeleopHeartbeatStreamResponse&
 }
 
 void Adapter::HandleCommand(const v1::model::CommandRequest& request) {
-  if (request.command() == "spot.jetson.reboot") {
-    const bool accepted = !reboot_requested_.exchange(true);
-    agent_.SendCommandResponse(request.id(), accepted);
-    if (!accepted) return;
+  {
+    std::lock_guard<std::mutex> lk(command_queue_mu_);
+    command_queue_.push_back(request);
+  }
+  command_queue_cv_.notify_one();
+}
 
+void Adapter::CommandExecutionLoop() {
+  while (running_.load()) {
+    v1::model::CommandRequest request;
+    {
+      std::unique_lock<std::mutex> lk(command_queue_mu_);
+      command_queue_cv_.wait(lk, [this]() { return !running_.load() || !command_queue_.empty(); });
+      if (!running_.load() && command_queue_.empty()) break;
+      request = command_queue_.front();
+      command_queue_.pop_front();
+    }
+
+    command_action_in_progress_ = true;
+    const bool ok = ExecuteQueuedCommand(request);
+    command_action_in_progress_ = false;
+    agent_.SendCommandResponse(request.id(), ok);
+  }
+}
+
+bool Adapter::ExecuteCameraCalibrateCommand() {
+  if (!EnsureLeaseForCommand("spot.camera.calibrate")) return false;
+  EmitLog("[command] spot.camera.calibrate requested");
+  if (!spot_.StartCameraCalibration()) {
+    EmitLog(std::string("[command] spot.camera.calibrate failed: ") + spot_.LastError());
+    return false;
+  }
+
+  // Wait for terminal camera calibration feedback (1 Hz poll).
+  const long long deadline_ms = now_ms() + 180000;
+  while (running_.load()) {
+    if (now_ms() > deadline_ms) {
+      EmitLog("[command] spot.camera.calibrate failed: timeout");
+      return false;
+    }
+    int status = 0;
+    float progress = 0.0f;
+    if (!spot_.GetCameraCalibrationFeedback(&status, &progress)) {
+      EmitLog(std::string("[command] spot.camera.calibrate feedback failed: ") + spot_.LastError());
+      return false;
+    }
+    if (status == 1) {  // STATUS_PROCESSING
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      continue;
+    }
+    if (status == 2) {  // STATUS_SUCCESS
+      EmitLog("[command] spot.camera.calibrate success");
+      return true;
+    }
+    EmitLog("[command] spot.camera.calibrate failed status=" + std::to_string(status));
+    return false;
+  }
+  return false;
+}
+
+bool Adapter::WaitForGraphNavCommandResult(uint32_t command_id, long long timeout_ms) {
+  if (command_id == 0) return false;
+  using Resp = ::bosdyn::api::graph_nav::NavigationFeedbackResponse;
+  const long long deadline = now_ms() + timeout_ms;
+  while (running_.load()) {
+    if (now_ms() > deadline) {
+      EmitLog("[command] graphnav command timeout");
+      return false;
+    }
+    SpotClient::NavigationFeedbackSnapshot fb;
+    if (!spot_.GetNavigationFeedbackSnapshot(command_id, &fb)) {
+      EmitLog(std::string("[command] graphnav feedback failed: ") + spot_.LastError());
+      return false;
+    }
+    QueueStatusText("spot.nav.feedback", nav_feedback_to_json(command_id, fb));
+    if (fb.status == Resp::STATUS_REACHED_GOAL) return true;
+    if (fb.status != Resp::STATUS_FOLLOWING_ROUTE) {
+      EmitLog("[command] graphnav ended status=" + std::to_string(fb.status) +
+              " (" + nav_status_name(fb.status) + ")");
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+  return false;
+}
+
+bool Adapter::EnsureLocalizedForNavigation(const std::string& action_name) {
+  std::string waypoint_id;
+  if (spot_.GetLocalizationWaypointId(&waypoint_id)) return true;
+
+  EmitLog("[graphnav] " + action_name +
+          " localization missing; attempting SetLocalization(fiducial)");
+  if (!spot_.SetLocalizationFiducial()) {
+    EmitLog("[graphnav] " + action_name + " relocalization failed: " + spot_.LastError());
+    return false;
+  }
+  if (!spot_.GetLocalizationWaypointId(&waypoint_id)) {
+    EmitLog("[graphnav] " + action_name + " relocalization did not produce waypoint: " +
+            spot_.LastError());
+    return false;
+  }
+  EmitLog("[graphnav] " + action_name + " relocalized to waypoint_id=" + waypoint_id);
+  return true;
+}
+
+bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
+                                        const std::string& waypoint_id,
+                                        uint32_t* out_command_id) {
+  if (!EnsureLocalizedForNavigation(action_name)) return false;
+
+  bool retried_localization = false;
+  bool retried_recover = false;
+  for (;;) {
+    uint32_t command_id = 0;
+    if (spot_.NavigateToWaypoint(waypoint_id, cfg_.graphnav_command_timeout_sec, &command_id)) {
+      if (out_command_id) *out_command_id = command_id;
+      return true;
+    }
+
+    const std::string nav_error = spot_.LastError();
+    if (is_not_localized_error_text(nav_error) && !retried_localization) {
+      retried_localization = true;
+      EmitLog("[graphnav] " + action_name + " navigate failed: not localized; relocalizing");
+      if (!EnsureLocalizedForNavigation(action_name)) return false;
+      continue;
+    }
+    if (is_robot_impaired_error_text(nav_error) && !retried_recover) {
+      retried_recover = true;
+      EmitLog("[graphnav] " + action_name + " navigate detected robot impairment, auto-recovering");
+      if (!spot_.RecoverSelfRight()) {
+        EmitLog("[graphnav] " + action_name + " auto-recover failed: " + spot_.LastError());
+        return false;
+      }
+      (void)spot_.Stand();
+      continue;
+    }
+
+    EmitLog("[graphnav] " + action_name + " navigate failed: " + nav_error);
+    return false;
+  }
+}
+
+bool Adapter::ExecuteWaypointGotoCommand(const v1::model::CommandRequest& request) {
+  if (!EnsureLeaseForCommand("spot.waypoint.goto")) return false;
+  std::string text;
+  (void)ExtractCommandText(request, &text);
+  std::string name = Trim(ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"}));
+  if (name.empty()) {
+    EmitLog("[graphnav] spot.waypoint.goto rejected: missing waypoint name");
+    return false;
+  }
+
+  std::string waypoint_id;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      if (!ResolveWaypointNameLocked(name, &waypoint_id)) {
+        EmitLog(std::string("[graphnav] spot.waypoint.goto failed: unresolved or ambiguous name=") + name);
+        return false;
+      }
+    }
+
+  uint32_t command_id = 0;
+  if (!StartNavigateWithRecovery("spot.waypoint.goto", waypoint_id, &command_id)) return false;
+
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    nav_target_waypoint_id_ = waypoint_id;
+    nav_target_waypoint_name_ = name;
+  }
+  last_graph_nav_command_id_ = command_id;
+  graphnav_navigation_active_ = true;
+  nav_auto_recovered_ = false;
+  const bool ok = WaitForGraphNavCommandResult(
+      command_id, static_cast<long long>(std::max(30, cfg_.graphnav_command_timeout_sec)) * 1000LL + 30000LL);
+  graphnav_navigation_active_ = false;
+  last_graph_nav_command_id_ = 0;
+  if (ok) EmitLog(std::string("[graphnav] spot.waypoint.goto success name=") + name);
+  return ok;
+}
+
+bool Adapter::ExecuteDockSequence(bool return_and_dock) {
+  if (docking_in_progress_.load()) {
+    EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+            " request ignored: dock already in progress");
+    return false;
+  }
+  if (!SpotConnected()) {
+    EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " failed: robot unavailable");
+    return false;
+  }
+  if (spot_degraded_non_estop_.load()) {
+    EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+            " failed: robot degraded (non-estop)");
+    return false;
+  }
+  if (!EnsureLeaseForCommand(return_and_dock ? "spot.return_and_dock" : "spot.dock")) return false;
+
+  if (return_and_dock) {
+    std::string dock_waypoint_id;
+    std::string map_id;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      if (!ResolveSavedDockHomeLocked(&map_id, &dock_waypoint_id)) {
+        EmitLog("[return_and_dock] failed: no saved docking waypoint for active map");
+        return false;
+      }
+    }
+    EmitLog("[return_and_dock] navigating to dock waypoint map_id=" + map_id +
+            " waypoint_id=" + dock_waypoint_id);
+    uint32_t nav_command_id = 0;
+    if (!StartNavigateWithRecovery("spot.return_and_dock", dock_waypoint_id, &nav_command_id)) return false;
+    last_graph_nav_command_id_ = nav_command_id;
+    graphnav_navigation_active_ = true;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      nav_target_waypoint_id_ = dock_waypoint_id;
+      nav_target_waypoint_name_ = "dock_home";
+    }
+    const bool nav_ok = WaitForGraphNavCommandResult(
+        nav_command_id, static_cast<long long>(std::max(30, cfg_.graphnav_command_timeout_sec)) * 1000LL + 30000LL);
+    graphnav_navigation_active_ = false;
+    last_graph_nav_command_id_ = 0;
+    if (!nav_ok) {
+      EmitLog("[return_and_dock] failed: navigation did not reach dock waypoint");
+      return false;
+    }
+    EmitLog("[return_and_dock] reached dock waypoint; starting dock");
+  } else {
+    CaptureDockWaypointCandidate();
+  }
+
+  int dock_id = ResolveDockId();
+  if (dock_id <= 0) {
+    EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+            " no dock id resolved: " + spot_.LastError());
+    return false;
+  }
+
+  bool can_dock = false;
+  if (!spot_.CanDock(dock_id, &can_dock) || !can_dock) {
+    EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+            " dock unavailable id=" + std::to_string(dock_id));
+    return false;
+  }
+
+  docking_in_progress_ = true;
+  moving_ = false;
+  spot_.ZeroVelocity(1);
+  const int dock_poll_ms = std::max(1000, cfg_.dock_poll_ms);
+  const bool ok = spot_.AutoDock(dock_id, cfg_.dock_attempts, dock_poll_ms, cfg_.dock_command_timeout_sec);
+  docking_in_progress_ = false;
+  if (!ok) {
+    EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " failed: " + spot_.LastError());
+    if (!return_and_dock) {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      ClearDockWaypointCandidateLocked();
+    }
+    return false;
+  }
+  if (!return_and_dock) CommitDockWaypointCandidateOnSuccess();
+  dock_cooldown_until_ms_ = now_ms() + 5000;
+  EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " success");
+  return true;
+}
+
+bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
+  const std::string& command = request.command();
+  if (command != "spot.jetson.reboot" && !SpotConnected()) {
+    EmitLog(std::string("[command] rejected while robot unavailable: ") + command);
+    return false;
+  }
+
+  if (command == "spot.jetson.reboot") {
+    const bool accepted = !reboot_requested_.exchange(true);
+    if (!accepted) return false;
     std::thread([]() {
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
       const int rc = std::system("/bin/systemctl reboot");
       (void)rc;
     }).detach();
-    return;
+    return true;
   }
-
-  if (!SpotConnected()) {
-    EmitLog(std::string("[command] rejected while robot unavailable: ") + request.command());
-    agent_.SendCommandResponse(request.id(), false);
-    return;
-  }
-
-  if (request.command() == "spot.robot.reboot") {
+  if (command == "spot.robot.reboot") {
     EmitLog("[command] spot.robot.reboot requested");
     const bool ok = spot_.RebootRobotBody();
-    if (!ok) {
-      EmitLog(std::string("[command] spot.robot.reboot failed: ") + spot_.LastError());
-    } else {
-      EmitLog("[command] spot.robot.reboot sent");
-    }
-    agent_.SendCommandResponse(request.id(), ok);
-    return;
+    if (!ok) EmitLog(std::string("[command] spot.robot.reboot failed: ") + spot_.LastError());
+    return ok;
   }
-
-  if (request.command() == "spot.camera.calibrate") {
-    if (!TeleopSessionActive()) {
-      EmitLog("[command] spot.camera.calibrate rejected: teleop inactive");
-      agent_.SendCommandResponse(request.id(), false);
-      return;
-    }
-    if (!lease_owned_) {
-      EmitLog("[command] spot.camera.calibrate rejected: no body lease");
-      agent_.SendCommandResponse(request.id(), false);
-      return;
-    }
-    EmitLog("[command] spot.camera.calibrate requested");
-    const bool ok = spot_.StartCameraCalibration();
-    if (!ok) {
-      EmitLog(std::string("[command] spot.camera.calibrate failed: ") + spot_.LastError());
-    } else {
-      EmitLog("[command] spot.camera.calibrate started");
-    }
-    agent_.SendCommandResponse(request.id(), ok);
-    return;
+  if (command == "spot.camera.calibrate") return ExecuteCameraCalibrateCommand();
+  if (command == "spot.stand") return ExecuteStandAction(false, true);
+  if (command == "spot.sit") return ExecuteSitAction(false, true);
+  if (command == "spot.recover") return ExecuteRecoverAction(false, true);
+  if (command == "spot.dock") return ExecuteDockSequence(false);
+  if (command == "spot.return_and_dock") return ExecuteDockSequence(true);
+  if (command == "spot.rotate_left") return ExecuteRotateCommand(request, true);
+  if (command == "spot.rotate_right") return ExecuteRotateCommand(request, false);
+  if (command == "spot.reset_arm") {
+    if (!ExecuteResetArmAction(false, true)) return false;
+    return WaitForArmStow(15000);
   }
-
-  if (request.command().rfind("spot.map.", 0) == 0) {
-    agent_.SendCommandResponse(request.id(), HandleMapCommand(request));
-    return;
-  }
-  if (request.command().rfind("spot.waypoint.", 0) == 0) {
-    agent_.SendCommandResponse(request.id(), HandleWaypointCommand(request));
-    return;
-  }
-
-  agent_.SendCommandResponse(request.id(), false);
+  if (command.rfind("spot.map.", 0) == 0) return HandleMapCommand(request);
+  if (command == "spot.waypoint.goto") return ExecuteWaypointGotoCommand(request);
+  if (command.rfind("spot.waypoint.", 0) == 0) return HandleWaypointCommand(request);
+  return false;
 }
 
 void Adapter::HandleButtons(const v1::model::Bitset& bitset, const std::string& source_stream) {
@@ -1447,36 +1732,12 @@ void Adapter::HandleButtonPress(const std::string& button_key, const std::string
   EmitLog(std::string("[teleop] button press key=") + button_key + " stream=" + source_stream);
 
   if (matches(cfg_.stand_button_stream, {"stand"})) {
-    if (!TeleopSessionActive()) {
-      EmitLog("[teleop] action stand rejected: session inactive");
-      return;
-    }
-    if (!lease_owned_) {
-      EmitLog("[teleop] action stand rejected: no body lease");
-      return;
-    }
-    if (!spot_.Stand()) {
-      EmitLog(std::string("[teleop] action stand failed: ") + spot_.LastError());
-    } else {
-      EmitLog("[teleop] action stand sent");
-    }
+    (void)ExecuteStandAction(true, false);
     return;
   }
 
   if (matches(cfg_.sit_button_stream, {"sit"})) {
-    if (!TeleopSessionActive()) {
-      EmitLog("[teleop] action sit rejected: session inactive");
-      return;
-    }
-    if (!lease_owned_) {
-      EmitLog("[teleop] action sit rejected: no body lease");
-      return;
-    }
-    if (!spot_.Sit()) {
-      EmitLog(std::string("[teleop] action sit failed: ") + spot_.LastError());
-    } else {
-      EmitLog("[teleop] action sit sent");
-    }
+    (void)ExecuteSitAction(true, false);
     return;
   }
 
@@ -1495,20 +1756,7 @@ void Adapter::HandleButtonPress(const std::string& button_key, const std::string
   }
 
   if (matches(cfg_.recover_button_stream, {"recover", "selfright", "self-right"})) {
-    if (!TeleopSessionActive()) {
-      EmitLog("[teleop] action recover rejected: session inactive");
-      return;
-    }
-    if (!lease_owned_) {
-      EmitLog("[teleop] action recover rejected: no body lease");
-      return;
-    }
-    if (!spot_.RecoverSelfRight()) {
-      EmitLog(std::string("[teleop] action recover failed: ") + spot_.LastError());
-    } else {
-      EmitLog("[teleop] action recover sent");
-      moving_ = false;
-    }
+    (void)ExecuteRecoverAction(true, false);
     return;
   }
 
@@ -1531,31 +1779,193 @@ void Adapter::HandleButtonPress(const std::string& button_key, const std::string
   }
 
   if (matches(cfg_.dock_button_stream, {"dock"})) {
-    if (!TeleopSessionActive()) {
-      EmitLog("[dock] request rejected: session inactive");
-      return;
-    }
-    EmitLog("[dock] request accepted");
-    RequestDock();
+    (void)ExecuteDockAction(true);
     return;
   }
 
   if (matches(cfg_.reset_arm_button_stream, {"resetarm", "armreset"})) {
-    if (!TeleopSessionActive()) {
-      EmitLog("[arm] reset rejected: session inactive");
-      return;
-    }
-    if (!lease_owned_) {
-      EmitLog("[arm] reset rejected: no body lease");
-      return;
-    }
-    EmitLog("[arm] reset requested");
-    ApplyDesiredArmMode(true);
+    (void)ExecuteResetArmAction(true, false);
     return;
   }
 
   EmitLog(std::string("[teleop] action ignored: unknown button key=") + button_key +
           " stream=" + source_stream);
+}
+
+bool Adapter::EnsureLeaseForCommand(const std::string& action_name) {
+  if (lease_owned_.load()) return true;
+  lease_owned_ = spot_.AcquireBodyLease();
+  if (!lease_owned_.load()) {
+    EmitLog(std::string("[command] ") + action_name + " rejected: no body lease (" + spot_.LastError() + ")");
+    return false;
+  }
+  EmitLog(std::string("[command] ") + action_name + " acquired body lease");
+  return true;
+}
+
+bool Adapter::ExecuteStandAction(bool require_teleop, bool auto_acquire_lease) {
+  if (require_teleop && !TeleopSessionActive()) {
+    EmitLog("[teleop] action stand rejected: session inactive");
+    return false;
+  }
+  if (!lease_owned_.load() && (!auto_acquire_lease || !EnsureLeaseForCommand("spot.stand"))) {
+    if (require_teleop) EmitLog("[teleop] action stand rejected: no body lease");
+    return false;
+  }
+  if (!spot_.Stand()) {
+    EmitLog(std::string(require_teleop ? "[teleop] action stand failed: " : "[command] spot.stand failed: ") +
+            spot_.LastError());
+    return false;
+  }
+  EmitLog(require_teleop ? "[teleop] action stand sent" : "[command] spot.stand sent");
+  return true;
+}
+
+bool Adapter::ExecuteSitAction(bool require_teleop, bool auto_acquire_lease) {
+  if (require_teleop && !TeleopSessionActive()) {
+    EmitLog("[teleop] action sit rejected: session inactive");
+    return false;
+  }
+  if (!lease_owned_.load() && (!auto_acquire_lease || !EnsureLeaseForCommand("spot.sit"))) {
+    if (require_teleop) EmitLog("[teleop] action sit rejected: no body lease");
+    return false;
+  }
+  if (!spot_.Sit()) {
+    EmitLog(std::string(require_teleop ? "[teleop] action sit failed: " : "[command] spot.sit failed: ") +
+            spot_.LastError());
+    return false;
+  }
+  EmitLog(require_teleop ? "[teleop] action sit sent" : "[command] spot.sit sent");
+  return true;
+}
+
+bool Adapter::ExecuteRecoverAction(bool require_teleop, bool auto_acquire_lease) {
+  if (require_teleop && !TeleopSessionActive()) {
+    EmitLog("[teleop] action recover rejected: session inactive");
+    return false;
+  }
+  if (!lease_owned_.load() && (!auto_acquire_lease || !EnsureLeaseForCommand("spot.recover"))) {
+    if (require_teleop) EmitLog("[teleop] action recover rejected: no body lease");
+    return false;
+  }
+  if (!spot_.RecoverSelfRight()) {
+    EmitLog(std::string(require_teleop ? "[teleop] action recover failed: "
+                                       : "[command] spot.recover failed: ") + spot_.LastError());
+    return false;
+  }
+  EmitLog(require_teleop ? "[teleop] action recover sent" : "[command] spot.recover sent");
+  moving_ = false;
+  return true;
+}
+
+bool Adapter::ExecuteDockAction(bool require_teleop) {
+  if (require_teleop && !TeleopSessionActive()) {
+    EmitLog("[dock] request rejected: session inactive");
+    return false;
+  }
+  CaptureDockWaypointCandidate();
+  EmitLog("[dock] request accepted");
+  RequestDock();
+  return true;
+}
+
+bool Adapter::ExecuteReturnAndDockAction(bool require_teleop) {
+  if (require_teleop && !TeleopSessionActive()) {
+    EmitLog("[return_and_dock] request rejected: session inactive");
+    return false;
+  }
+  if (docking_in_progress_.load()) {
+    EmitLog("[return_and_dock] request rejected: dock already in progress");
+    return false;
+  }
+
+  std::string map_id;
+  std::string waypoint_id;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (!ResolveSavedDockHomeLocked(&map_id, &waypoint_id)) {
+      EmitLog("[return_and_dock] request rejected: no saved docking waypoint for active map");
+      return false;
+    }
+  }
+
+  EmitLog("[return_and_dock] request accepted map_id=" + map_id + " waypoint_id=" + waypoint_id);
+  return_and_dock_requested_ = true;
+  return true;
+}
+
+bool Adapter::ExecuteResetArmAction(bool require_teleop, bool auto_acquire_lease) {
+  if (require_teleop && !TeleopSessionActive()) {
+    EmitLog("[arm] reset rejected: session inactive");
+    return false;
+  }
+  if (!lease_owned_.load() && (!auto_acquire_lease || !EnsureLeaseForCommand("spot.reset_arm"))) {
+    if (require_teleop) EmitLog("[arm] reset rejected: no body lease");
+    return false;
+  }
+  EmitLog(require_teleop ? "[arm] reset requested" : "[command] spot.reset_arm requested");
+  ApplyDesiredArmMode(true);
+  return true;
+}
+
+bool Adapter::ExecuteRotateCommand(const v1::model::CommandRequest& request, bool left) {
+  const std::string command_name = left ? "spot.rotate_left" : "spot.rotate_right";
+  if (docking_in_progress_.load()) {
+    EmitLog("[command] " + command_name + " rejected: docking in progress");
+    return false;
+  }
+  if (IsGraphNavNavigationActive()) {
+    EmitLog("[command] " + command_name + " rejected: graphnav navigation active");
+    return false;
+  }
+  if (spot_degraded_non_estop_.load()) {
+    EmitLog("[command] " + command_name + " rejected: robot degraded (non-estop)");
+    return false;
+  }
+  if (!EnsureLeaseForCommand(command_name)) return false;
+
+  std::string text;
+  (void)ExtractCommandText(request, &text);
+  const std::string degrees_text = Trim(ExtractParam(text, {"degrees", "deg"}));
+  if (degrees_text.empty()) {
+    EmitLog("[command] " + command_name + " rejected: missing required parameter degrees");
+    return false;
+  }
+
+  double degrees = 0.0;
+  try {
+    size_t consumed = 0;
+    degrees = std::stod(degrees_text, &consumed);
+    if (consumed != degrees_text.size()) {
+      EmitLog("[command] " + command_name + " rejected: invalid degrees value");
+      return false;
+    }
+  } catch (...) {
+    EmitLog("[command] " + command_name + " rejected: invalid degrees value");
+    return false;
+  }
+
+  if (degrees <= 0.0 || degrees > 360.0) {
+    EmitLog("[command] " + command_name + " rejected: degrees must be > 0 and <= 360");
+    return false;
+  }
+
+  const double rotate_rad = degrees * 3.14159265358979323846 / 180.0;
+  const double rate_mag = std::max(0.3, std::min(1.0, std::abs(cfg_.max_wz_rps)));
+  const double wz = left ? rate_mag : -rate_mag;
+  const int duration_ms = std::max(300, static_cast<int>(std::llround((rotate_rad / rate_mag) * 1000.0)));
+
+  EmitLog("[command] " + command_name + " requested degrees=" + std::to_string(degrees) +
+          " rate=" + std::to_string(wz) + " duration_ms=" + std::to_string(duration_ms));
+  if (!spot_.Velocity(0.0, 0.0, wz, duration_ms + 300, MotionMode::kWalk, 0.0)) {
+    EmitLog(std::string("[command] " + command_name + " failed: ") + spot_.LastError());
+    return false;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms + 120));
+  (void)spot_.ZeroVelocity(1);
+  moving_ = false;
+  EmitLog("[command] " + command_name + " complete");
+  return true;
 }
 
 void Adapter::ApplyDesiredArmMode(bool force) {
@@ -1603,7 +2013,7 @@ bool Adapter::WaitForArmStow(int timeout_ms) {
   while (lease_owned_) {
     if (IsArmLikelyStowed()) return true;
     ApplyDesiredArmMode(true);
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::this_thread::sleep_for(std::chrono::seconds(1));
     if ((std::chrono::steady_clock::now() - start) >= timeout) break;
   }
   return IsArmLikelyStowed();
@@ -1704,48 +2114,151 @@ int Adapter::ResolveDockId() {
 }
 
 void Adapter::DockLoop() {
+  auto navigate_with_recovery = [this](const std::string& waypoint_id,
+                                       uint32_t* out_command_id) -> bool {
+    return StartNavigateWithRecovery("return_and_dock.teleop", waypoint_id, out_command_id);
+  };
+
+  auto wait_for_navigation = [this, &navigate_with_recovery](uint32_t command_id) -> bool {
+    if (command_id == 0) return false;
+    const long long timeout_ms =
+        static_cast<long long>(std::max(30, cfg_.graphnav_command_timeout_sec)) * 1000LL + 30000LL;
+    const long long start_ms = now_ms();
+    using Resp = ::bosdyn::api::graph_nav::NavigationFeedbackResponse;
+    bool recovered_once = false;
+    while (running_.load()) {
+      if (now_ms() - start_ms > timeout_ms) {
+        EmitLog("[return_and_dock] navigation timeout");
+        return false;
+      }
+      SpotClient::NavigationFeedbackSnapshot fb;
+      if (!spot_.GetNavigationFeedbackSnapshot(command_id, &fb)) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+      QueueStatusText("spot.nav.feedback", nav_feedback_to_json(command_id, fb));
+      if (nav_status_in_progress(fb.status)) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+      if (fb.status == Resp::STATUS_REACHED_GOAL) {
+        return true;
+      }
+      if (fb.status == Resp::STATUS_ROBOT_IMPAIRED && !recovered_once) {
+        recovered_once = true;
+        EmitLog("[return_and_dock] navigation feedback impaired, retrying after recover");
+        if (!spot_.RecoverSelfRight()) return false;
+        (void)spot_.Stand();
+        uint32_t retry_id = 0;
+        std::string waypoint_id;
+        {
+          std::lock_guard<std::mutex> lk(map_mu_);
+          waypoint_id = nav_target_waypoint_id_;
+        }
+        if (waypoint_id.empty()) return false;
+        if (!navigate_with_recovery(waypoint_id, &retry_id)) return false;
+        command_id = retry_id;
+        last_graph_nav_command_id_ = command_id;
+        continue;
+      }
+      EmitLog("[return_and_dock] navigation ended status=" + std::to_string(fb.status) +
+              " (" + nav_status_name(fb.status) + ")");
+      return false;
+    }
+    return false;
+  };
+
   while (running_) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (!dock_requested_.exchange(false)) continue;
+    const bool return_and_dock = return_and_dock_requested_.exchange(false);
+    const bool dock_requested = dock_requested_.exchange(false);
+    if (!return_and_dock && !dock_requested) continue;
     if (docking_in_progress_) {
-      EmitLog("[dock] request ignored: dock already in progress");
-      continue;
-    }
-    if (!TeleopSessionActive()) {
-      EmitLog("[dock] request ignored: teleop session not active");
+      EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+              " request ignored: dock already in progress");
       continue;
     }
     if (!SpotConnected()) {
-      EmitLog("[dock] request ignored: robot unavailable");
+      EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+              " request ignored: robot unavailable");
       continue;
     }
     if (spot_degraded_non_estop_.load()) {
-      EmitLog("[dock] request ignored: robot degraded (non-estop)");
+      EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+              " request ignored: robot degraded (non-estop)");
       continue;
+    }
+
+    if (return_and_dock) {
+      std::string dock_waypoint_id;
+      std::string map_id;
+      {
+        std::lock_guard<std::mutex> lk(map_mu_);
+        if (!ResolveSavedDockHomeLocked(&map_id, &dock_waypoint_id)) {
+          EmitLog("[return_and_dock] failed: no saved docking waypoint for active map");
+          continue;
+        }
+      }
+      EmitLog("[return_and_dock] navigating to dock waypoint map_id=" + map_id +
+              " waypoint_id=" + dock_waypoint_id);
+      uint32_t nav_command_id = 0;
+      if (!navigate_with_recovery(dock_waypoint_id, &nav_command_id)) {
+        EmitLog(std::string("[return_and_dock] navigation start failed: ") + spot_.LastError());
+        continue;
+      }
+      last_graph_nav_command_id_ = nav_command_id;
+      graphnav_navigation_active_ = true;
+      nav_auto_recovered_ = false;
+      desired_twist_valid_ = false;
+      {
+        std::lock_guard<std::mutex> lk(twist_cmd_mu_);
+        desired_vx_ = 0.0;
+        desired_vy_ = 0.0;
+        desired_wz_ = 0.0;
+        desired_body_pitch_ = 0.0;
+      }
+      {
+        std::lock_guard<std::mutex> lk(map_mu_);
+        nav_target_waypoint_id_ = dock_waypoint_id;
+        nav_target_waypoint_name_ = "dock_home";
+      }
+      if (!wait_for_navigation(nav_command_id)) {
+        graphnav_navigation_active_ = false;
+        last_graph_nav_command_id_ = 0;
+        EmitLog("[return_and_dock] failed: navigation did not reach dock waypoint");
+        continue;
+      }
+      graphnav_navigation_active_ = false;
+      last_graph_nav_command_id_ = 0;
+      EmitLog("[return_and_dock] reached dock waypoint; starting dock");
     }
 
     int dock_id = ResolveDockId();
     if (dock_id <= 0) {
-      EmitLog(std::string("[dock] no dock id resolved: ") + spot_.LastError());
+      EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+              " no dock id resolved: " + spot_.LastError());
       continue;
     }
 
     bool can_dock = false;
     if (!spot_.CanDock(dock_id, &can_dock)) {
-      EmitLog(std::string("[dock] dock availability check failed id=") + std::to_string(dock_id) +
+      EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+              " dock availability check failed id=" + std::to_string(dock_id) +
               " error=" + spot_.LastError());
       resolved_dock_id_ = -1;
       continue;
     }
     if (!can_dock) {
-      EmitLog(std::string("[dock] dock unavailable id=") + std::to_string(dock_id));
+      EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+              " dock unavailable id=" + std::to_string(dock_id));
       continue;
     }
 
     if (!lease_owned_) {
       lease_owned_ = spot_.AcquireBodyLease();
       if (!lease_owned_) {
-        EmitLog(std::string("[dock] failed to acquire lease for dock: ") + spot_.LastError());
+        EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+                " failed to acquire lease for dock: " + spot_.LastError());
         continue;
       }
     }
@@ -1753,17 +2266,25 @@ void Adapter::DockLoop() {
     docking_in_progress_ = true;
     moving_ = false;
     spot_.ZeroVelocity(1);
-    EmitLog(std::string("[dock] starting dock id=") + std::to_string(dock_id));
-    bool ok = spot_.AutoDock(dock_id, cfg_.dock_attempts, cfg_.dock_poll_ms, cfg_.dock_command_timeout_sec);
+    EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+            " starting dock id=" + std::to_string(dock_id));
+    const int dock_poll_ms = std::max(1000, cfg_.dock_poll_ms);
+    bool ok = spot_.AutoDock(dock_id, cfg_.dock_attempts, dock_poll_ms, cfg_.dock_command_timeout_sec);
     if (!ok) {
       const std::string err = spot_.LastError();
-      EmitLog(std::string("[dock] failed: ") + err);
+      EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " failed: " + err);
+      if (!return_and_dock) {
+        std::lock_guard<std::mutex> lk(map_mu_);
+        ClearDockWaypointCandidateLocked();
+      }
       if (err.find("STATUS_ERROR_DOCK_NOT_FOUND") != std::string::npos) {
         resolved_dock_id_ = -1;
-        EmitLog("[dock] clearing cached dock id after not-found error");
+        EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+                " clearing cached dock id after not-found error");
       }
     } else {
-      EmitLog("[dock] success");
+      EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " success");
+      if (!return_and_dock) CommitDockWaypointCandidateOnSuccess();
       dock_cooldown_until_ms_ = now_ms() + 5000;
     }
     docking_in_progress_ = false;
@@ -1916,6 +2437,8 @@ bool Adapter::DeleteMapFromDisk(const std::string& map_id) {
 bool Adapter::LoadAdapterMapState() {
   std::lock_guard<std::mutex> lk(map_mu_);
   waypoint_aliases_by_map_.clear();
+  dock_waypoint_by_map_.clear();
+  ClearDockWaypointCandidateLocked();
   active_map_id_.clear();
   default_map_id_.clear();
   std::ifstream in(cfg_.graphnav_store_dir + "/state.txt");
@@ -1940,6 +2463,16 @@ bool Adapter::LoadAdapterMapState() {
       if (parts.size() >= 4) {
         waypoint_aliases_by_map_[parts[1]][parts[2]] = parts[3];
       }
+      continue;
+    }
+    if (t.rfind("dock_waypoint\t", 0) == 0) {
+      std::vector<std::string> parts;
+      std::stringstream ss(t);
+      std::string part;
+      while (std::getline(ss, part, '\t')) parts.push_back(part);
+      if (parts.size() >= 3) {
+        dock_waypoint_by_map_[parts[1]] = parts[2];
+      }
     }
   }
   return true;
@@ -1960,6 +2493,10 @@ bool Adapter::SaveAdapterMapState() {
       out << "alias\t" << map_entry.first << "\t" << alias.first << "\t" << alias.second << "\n";
     }
   }
+  for (const auto& entry : dock_waypoint_by_map_) {
+    if (entry.first.find('\t') != std::string::npos || entry.first.find('\n') != std::string::npos) continue;
+    out << "dock_waypoint\t" << entry.first << "\t" << entry.second << "\n";
+  }
   return true;
 }
 
@@ -1970,20 +2507,21 @@ void Adapter::RefreshGraphWaypointIndex() {
     return;
   }
   std::unordered_map<std::string, std::string> id_to_label;
-  std::unordered_map<std::string, std::string> label_to_id;
+  std::unordered_map<std::string, std::vector<std::string>> label_to_ids;
+  std::unordered_map<std::string, std::vector<std::string>> lower_label_to_ids;
   id_to_label.reserve(static_cast<size_t>(graph.waypoints_size()));
   for (const auto& waypoint : graph.waypoints()) {
     std::string label = waypoint.annotations().name();
     if (label.empty()) label = waypoint.id();
     id_to_label[waypoint.id()] = label;
-    if (!label.empty() && label_to_id.find(label) == label_to_id.end()) {
-      label_to_id[label] = waypoint.id();
-    }
+    label_to_ids[label].push_back(waypoint.id());
+    lower_label_to_ids[ToLower(label)].push_back(waypoint.id());
   }
   {
     std::lock_guard<std::mutex> lk(map_mu_);
     loaded_waypoint_id_to_label_ = std::move(id_to_label);
-    loaded_waypoint_label_to_id_ = std::move(label_to_id);
+    loaded_waypoint_label_to_ids_ = std::move(label_to_ids);
+    loaded_waypoint_lower_label_to_ids_ = std::move(lower_label_to_ids);
     PruneAliasesForLoadedGraphLocked();
   }
   force_waypoint_publish_ = true;
@@ -2025,19 +2563,86 @@ bool Adapter::ResolveWaypointNameLocked(const std::string& name, std::string* ou
     }
   }
 
-  auto it = loaded_waypoint_label_to_id_.find(key);
-  if (it != loaded_waypoint_label_to_id_.end()) {
-    *out_waypoint_id = it->second;
-    return true;
-  }
-  const std::string lower_key = ToLower(key);
-  for (const auto& pair : loaded_waypoint_label_to_id_) {
-    if (ToLower(pair.first) == lower_key) {
-      *out_waypoint_id = pair.second;
+  auto exact_it = loaded_waypoint_label_to_ids_.find(key);
+  if (exact_it != loaded_waypoint_label_to_ids_.end()) {
+    if (exact_it->second.size() == 1) {
+      *out_waypoint_id = exact_it->second.front();
       return true;
     }
+    return false;
+  }
+
+  const std::string lower_key = ToLower(key);
+  auto lower_it = loaded_waypoint_lower_label_to_ids_.find(lower_key);
+  if (lower_it != loaded_waypoint_lower_label_to_ids_.end()) {
+    if (lower_it->second.size() == 1) {
+      *out_waypoint_id = lower_it->second.front();
+      return true;
+    }
+    return false;
   }
   return false;
+}
+
+bool Adapter::ResolveSavedDockHomeLocked(std::string* out_map_id, std::string* out_waypoint_id) const {
+  if (!out_map_id || !out_waypoint_id) return false;
+  std::string map_id = active_map_id_;
+  if (map_id.empty()) map_id = default_map_id_;
+  if (map_id.empty()) return false;
+  const auto it = dock_waypoint_by_map_.find(map_id);
+  if (it == dock_waypoint_by_map_.end() || it->second.empty()) return false;
+  *out_map_id = map_id;
+  *out_waypoint_id = it->second;
+  return true;
+}
+
+void Adapter::ClearDockWaypointCandidateLocked() {
+  pending_dock_candidate_map_id_.clear();
+  pending_dock_candidate_waypoint_id_.clear();
+}
+
+void Adapter::CaptureDockWaypointCandidate() {
+  std::string map_id;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    map_id = active_map_id_;
+    if (map_id.empty()) map_id = default_map_id_;
+    ClearDockWaypointCandidateLocked();
+  }
+  if (map_id.empty()) {
+    EmitLog("[dock] not learning dock waypoint: no active/default map");
+    return;
+  }
+
+  std::string waypoint_id;
+  if (!spot_.GetLocalizationWaypointId(&waypoint_id)) {
+    EmitLog(std::string("[dock] not learning dock waypoint: localization unavailable: ") + spot_.LastError());
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    pending_dock_candidate_map_id_ = map_id;
+    pending_dock_candidate_waypoint_id_ = waypoint_id;
+  }
+  EmitLog("[dock] learned dock candidate map_id=" + map_id + " waypoint_id=" + waypoint_id);
+}
+
+void Adapter::CommitDockWaypointCandidateOnSuccess() {
+  std::string map_id;
+  std::string waypoint_id;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    map_id = pending_dock_candidate_map_id_;
+    waypoint_id = pending_dock_candidate_waypoint_id_;
+    ClearDockWaypointCandidateLocked();
+    if (map_id.empty() || waypoint_id.empty()) return;
+    dock_waypoint_by_map_[map_id] = waypoint_id;
+  }
+  if (!SaveAdapterMapState()) {
+    EmitLog("[dock] warning: failed to persist dock waypoint state");
+  }
+  EmitLog("[dock] dock waypoint saved map_id=" + map_id + " waypoint_id=" + waypoint_id);
 }
 
 std::string Adapter::BuildWaypointTextLocked() const {
@@ -2061,6 +2666,23 @@ std::string Adapter::BuildWaypointTextLocked() const {
   return oss.str();
 }
 
+std::string Adapter::ResolveWaypointNameForIdLocked(const std::string& waypoint_id) const {
+  if (waypoint_id.empty()) return "";
+  std::string map_id = active_map_id_;
+  if (map_id.empty()) map_id = default_map_id_;
+  if (!map_id.empty()) {
+    auto map_it = waypoint_aliases_by_map_.find(map_id);
+    if (map_it != waypoint_aliases_by_map_.end()) {
+      for (const auto& alias : map_it->second) {
+        if (alias.second == waypoint_id) return alias.first;
+      }
+    }
+  }
+  auto it = loaded_waypoint_id_to_label_.find(waypoint_id);
+  if (it != loaded_waypoint_id_to_label_.end()) return it->second;
+  return "";
+}
+
 std::string Adapter::BuildMapsTextLocked() const {
   std::vector<std::string> map_ids;
   std::error_code ec;
@@ -2082,6 +2704,14 @@ std::string Adapter::BuildMapsTextLocked() const {
     if (i + 1 < map_ids.size()) oss << "\n";
   }
   return oss.str();
+}
+
+std::string Adapter::BuildCurrentMapTextLocked() const {
+  return active_map_id_.empty() ? "none" : active_map_id_;
+}
+
+std::string Adapter::BuildDefaultMapTextLocked() const {
+  return default_map_id_.empty() ? "none" : default_map_id_;
 }
 
 std::string Adapter::EnsureActiveMapIdLocked() {
@@ -2136,11 +2766,140 @@ void Adapter::PublishMapsText(bool force) {
   last_maps_pub_ms_ = now;
 }
 
+void Adapter::PublishCurrentMapText(bool force) {
+  const long long kPeriodicMs = 10000;
+  const long long now = now_ms();
+  std::string text;
+  bool changed = false;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    text = BuildCurrentMapTextLocked();
+    changed = (text != last_current_map_text_payload_);
+    if (changed) last_current_map_text_payload_ = text;
+  }
+  if (!force && !changed && (now - last_current_map_pub_ms_.load()) < kPeriodicMs) return;
+  QueueStatusText("spot.map.current", text);
+  last_current_map_pub_ms_ = now;
+}
+
+void Adapter::PublishDefaultMapText(bool force) {
+  const long long kPeriodicMs = 10000;
+  const long long now = now_ms();
+  std::string text;
+  bool changed = false;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    text = BuildDefaultMapTextLocked();
+    changed = (text != last_default_map_text_payload_);
+    if (changed) last_default_map_text_payload_ = text;
+  }
+  if (!force && !changed && (now - last_default_map_pub_ms_.load()) < kPeriodicMs) return;
+  QueueStatusText("spot.map.default", text);
+  last_default_map_pub_ms_ = now;
+}
+
+void Adapter::PollCurrentWaypointAtStatus(long long now) {
+  if ((now - last_waypoint_at_poll_ms_.load()) < 1000) return;
+  last_waypoint_at_poll_ms_ = now;
+
+  std::string resolved_name;
+  if (SpotConnected()) {
+    SpotClient::LocalizationSnapshot localization;
+    if (spot_.GetLocalizationSnapshot(&localization) && localization.has_waypoint_tform_body) {
+      const double dx = localization.waypoint_tform_body_x;
+      const double dy = localization.waypoint_tform_body_y;
+      const double dz = localization.waypoint_tform_body_z;
+      const double distance_m = std::sqrt(dx * dx + dy * dy + dz * dz);
+      if (distance_m <= 0.3048) {
+        std::lock_guard<std::mutex> lk(map_mu_);
+        resolved_name = ResolveWaypointNameForIdLocked(localization.waypoint_id);
+      }
+    }
+  }
+
+  std::lock_guard<std::mutex> lk(map_mu_);
+  current_waypoint_at_text_ = resolved_name;
+}
+
+void Adapter::PublishCurrentWaypointText(long long now) {
+  if ((now - last_waypoint_at_pub_ms_.load()) < 10000) return;
+  std::string text;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    text = current_waypoint_at_text_;
+  }
+  QueueStatusText("spot.waypoint.current", text);
+  last_waypoint_at_pub_ms_ = now;
+}
+
 bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
   std::string text;
   (void)ExtractCommandText(request, &text);
 
+  if (request.command() == "spot.map.create") {
+    if (!EnsureLeaseForCommand("spot.map.create")) return false;
+    if (map_recording_active_) {
+      EmitLog("[graphnav] map.create rejected: stop mapping first");
+      return false;
+    }
+
+    std::string map_id = ExtractParam(text, {"name", "map_id", "map", "id"});
+    map_id = sanitize_id_token(map_id);
+    if (map_id.empty()) {
+      EmitLog("[graphnav] map.create rejected: missing name");
+      return false;
+    }
+
+    bool exists_in_state = false;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      exists_in_state = (waypoint_aliases_by_map_.find(map_id) != waypoint_aliases_by_map_.end()) ||
+                        (dock_waypoint_by_map_.find(map_id) != dock_waypoint_by_map_.end());
+    }
+    std::error_code ec;
+    const bool exists_on_disk = std::filesystem::exists(MapDirectoryFor(map_id), ec) && !ec;
+    if (exists_in_state || exists_on_disk) {
+      EmitLog(std::string("[graphnav] map.create rejected: map already exists map_id=") + map_id);
+      return false;
+    }
+
+    if (!spot_.ClearGraph()) {
+      EmitLog(std::string("[graphnav] map.create failed clearing graph: ") + spot_.LastError());
+      return false;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      active_map_id_ = map_id;
+      if (default_map_id_.empty()) default_map_id_ = map_id;
+      pending_restore_map_id_.clear();
+      nav_target_waypoint_id_.clear();
+      nav_target_waypoint_name_.clear();
+      loaded_waypoint_id_to_label_.clear();
+      loaded_waypoint_label_to_ids_.clear();
+      loaded_waypoint_lower_label_to_ids_.clear();
+      ClearDockWaypointCandidateLocked();
+    }
+
+    last_graph_nav_command_id_ = 0;
+    graphnav_navigation_active_ = false;
+    nav_auto_recovered_ = false;
+    last_nav_feedback_signature_.clear();
+    last_nav_status_ = 0;
+    last_nav_remaining_route_m_ = 0.0;
+    last_nav_progress_change_ms_ = 0;
+
+    if (!SaveAdapterMapState()) {
+      EmitLog("[graphnav] map.create warning: failed to persist adapter map state");
+    }
+    PublishWaypointsText(true);
+    PublishMapsText(true);
+    EmitLog(std::string("[graphnav] map created: ") + map_id);
+    return true;
+  }
+
   if (request.command() == "spot.map.load") {
+    if (!EnsureLeaseForCommand("spot.map.load")) return false;
     std::string map_id = ExtractParam(text, {"map_id", "map", "id"});
     map_id = sanitize_id_token(map_id);
     if (map_id.empty()) {
@@ -2213,6 +2972,10 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
     {
       std::lock_guard<std::mutex> lk(map_mu_);
       waypoint_aliases_by_map_.erase(map_id);
+      dock_waypoint_by_map_.erase(map_id);
+      if (pending_dock_candidate_map_id_ == map_id) {
+        ClearDockWaypointCandidateLocked();
+      }
       if (default_map_id_ == map_id) default_map_id_.clear();
       if (active_map_id_ == map_id) {
         active_map_id_.clear();
@@ -2220,7 +2983,8 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
         nav_target_waypoint_id_.clear();
         nav_target_waypoint_name_.clear();
         loaded_waypoint_id_to_label_.clear();
-        loaded_waypoint_label_to_id_.clear();
+        loaded_waypoint_label_to_ids_.clear();
+        loaded_waypoint_lower_label_to_ids_.clear();
         clear_loaded_graph = true;
       }
     }
@@ -2246,6 +3010,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
   }
 
   if (request.command() == "spot.map.start_mapping") {
+    if (!EnsureLeaseForCommand("spot.map.start_mapping")) return false;
     if (!spot_.StartGraphRecording()) {
       EmitLog(std::string("[graphnav] start_mapping failed: ") + spot_.LastError());
       return false;
@@ -2262,6 +3027,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
   }
 
   if (request.command() == "spot.map.stop_mapping") {
+    if (!EnsureLeaseForCommand("spot.map.stop_mapping")) return false;
     if (!spot_.StopGraphRecording()) {
       EmitLog(std::string("[graphnav] stop_mapping failed: ") + spot_.LastError());
       return false;
@@ -2299,6 +3065,7 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
 
   if (request.command() == "spot.waypoint.delete") {
     bool had_active_map = true;
+    bool removed = false;
     {
       std::lock_guard<std::mutex> lk(map_mu_);
       if (active_map_id_.empty()) {
@@ -2306,12 +3073,29 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
       } else {
         auto map_it = waypoint_aliases_by_map_.find(active_map_id_);
         if (map_it != waypoint_aliases_by_map_.end()) {
-          map_it->second.erase(name);
+          auto it = map_it->second.find(name);
+          if (it != map_it->second.end()) {
+            map_it->second.erase(it);
+            removed = true;
+          } else {
+            const std::string lower_name = ToLower(name);
+            for (auto alias_it = map_it->second.begin(); alias_it != map_it->second.end(); ++alias_it) {
+              if (ToLower(alias_it->first) == lower_name) {
+                map_it->second.erase(alias_it);
+                removed = true;
+                break;
+              }
+            }
+          }
         }
       }
     }
     if (!had_active_map) {
       EmitLog("[graphnav] waypoint.delete rejected: no active map");
+      return false;
+    }
+    if (!removed) {
+      EmitLog(std::string("[graphnav] waypoint.delete rejected: alias not found name=") + name);
       return false;
     }
     SaveAdapterMapState();
@@ -2321,32 +3105,17 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
   }
 
   if (request.command() == "spot.waypoint.goto") {
+    if (!EnsureLeaseForCommand("spot.waypoint.goto")) return false;
     std::string waypoint_id;
     {
       std::lock_guard<std::mutex> lk(map_mu_);
       if (!ResolveWaypointNameLocked(name, &waypoint_id)) {
-        EmitLog(std::string("[graphnav] waypoint.goto failed: unresolved name=") + name);
+        EmitLog(std::string("[graphnav] waypoint.goto failed: unresolved or ambiguous name=") + name);
         return false;
       }
     }
     uint32_t command_id = 0;
-    if (!spot_.NavigateToWaypoint(waypoint_id, cfg_.graphnav_command_timeout_sec, &command_id)) {
-      const std::string nav_error = spot_.LastError();
-      if (!is_robot_impaired_error_text(nav_error)) {
-        EmitLog(std::string("[graphnav] waypoint.goto failed: ") + nav_error);
-        return false;
-      }
-      EmitLog("[graphnav] waypoint.goto detected robot impairment, auto-recovering");
-      if (!spot_.RecoverSelfRight()) {
-        EmitLog(std::string("[graphnav] waypoint.goto auto-recover failed: ") + spot_.LastError());
-        return false;
-      }
-      (void)spot_.Stand();
-      if (!spot_.NavigateToWaypoint(waypoint_id, cfg_.graphnav_command_timeout_sec, &command_id)) {
-        EmitLog(std::string("[graphnav] waypoint.goto retry failed: ") + spot_.LastError());
-        return false;
-      }
-    }
+    if (!StartNavigateWithRecovery("spot.waypoint.goto", waypoint_id, &command_id)) return false;
     last_graph_nav_command_id_ = command_id;
     graphnav_navigation_active_ = true;
     nav_auto_recovered_ = false;
@@ -2372,6 +3141,7 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
   }
 
   if (request.command() == "spot.waypoint.save" || request.command() == "spot.waypoint.update") {
+    if (!EnsureLeaseForCommand(request.command())) return false;
     bool started_temp_recording = false;
     if (!map_recording_active_) {
       if (!spot_.StartGraphRecording()) {

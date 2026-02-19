@@ -21,13 +21,6 @@ When an issue is finished, remove it from this file and archive the completed wo
     - Implement arm-raise behavior and button handling, or remove deprecated fields/docs.
   - References: `include/formant_spot_adapter/config.hpp`, `src/config.cpp`, `src/adapter.cpp`
 
-- [ ] Reconcile SpotClient calibration API declarations with implementation
-  - Problem: `CancelCameraCalibration` and `GetCameraCalibrationFeedback` are declared but not implemented/used.
-  - Risk: API drift and future linker/maintenance issues.
-  - Initial fix direction:
-    - Implement the methods and expose command/status wiring, or remove declarations until needed.
-  - References: `include/formant_spot_adapter/spot_client.hpp`, `src/spot_client.cpp`
-
 ### P3 - Validation and Operational Readiness
 
 - [ ] Add repeatable production smoke/regression checks

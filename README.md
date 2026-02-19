@@ -34,6 +34,7 @@ C++ adapter for Boston Dynamics Spot + Formant Agent teleoperation without ROS.
 Additional control channels (not streams):
 - Teleop heartbeat from Formant agent controls session active/inactive behavior.
 - Command channel supports `spot.jetson.reboot`, `spot.robot.reboot`, `spot.camera.calibrate`,
+  `spot.stand`, `spot.sit`, `spot.recover`, `spot.dock`, `spot.reset_arm`,
   `spot.map.*`, and `spot.waypoint.*`.
 
 ### Streams published by adapter (adapter -> Formant)
@@ -46,10 +47,14 @@ Additional control channels (not streams):
 | `spot.back.image` | Image (JPEG) | Back fisheye (`back_fisheye_image`) |
 | `spot.status` | Bitset | `Has lease`, `Robot available`, `Robot degraded`, `Teleop running`, `Teleop active`, `Docking` |
 | `spot.connection` | Text (JSON) | Spot connection health (`state`, `connected`, `degraded_non_estop`, `degraded_reason`, reconnect/attempt timestamps, last error) |
+| `spot.localization` | Text (JSON) | GraphNav localization status (`localized`, `waypoint_id`, `error`) |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |
 | `spot.waypoints` | Text | Newline-separated waypoint names for the active map |
+| `spot.waypoint.current` | Text | Waypoint name if robot is within 1 ft of a saved waypoint, else empty string; checks every 1s, publishes every 10s |
 | `spot.maps` | Text | Newline-separated saved map IDs |
+| `spot.map.current` | Text | Active/current map ID (`none` if unset); publishes every 10s and on change |
+| `spot.map.default` | Text | Default map ID (`none` if unset); publishes every 10s and on change |
 | `spot.robot_state.power` | Text (JSON) | Motor power state, estop summary, battery availability |
 | `spot.robot_state.battery` | Numeric | Battery percentage (0-100) when available |
 | `spot.robot_state.body_pitch_rad` | Numeric | Measured body pitch in radians (`odom` frame) |
@@ -66,6 +71,7 @@ Additional control channels (not streams):
 - Adapter stays online if Spot is unavailable and retries robot connection in the background.
 - While Spot is unavailable, robot actions are rejected and availability is published on `spot.connection`.
 - Adapter applies soft non-E-Stop recovery gating: teleop motion/dock commands are blocked only for critical/unclearable robot faults or motor power error.
+- For GraphNav nav commands, adapter prechecks localization and attempts fiducial relocalization before failing.
 - If lease is already held, adapter attempts takeover (`TakeLease`) to recover from stale owners.
 - On teleop inactivity: sends zero velocity, stows arm, then returns lease unless GraphNav nav is active.
 - Heartbeat timeout behavior is zero-velocity only (no auto-sit).
@@ -79,6 +85,21 @@ Additional control channels (not streams):
 
 All commands are namespaced as `spot.*` and accept optional text parameters.
 
+Additional non-GraphNav command-channel actions:
+- `spot.stand`: stand command; command path does not require active teleop heartbeat.
+- `spot.sit`: sit command; command path does not require active teleop heartbeat.
+- `spot.recover`: self-right command; command path does not require active teleop heartbeat.
+- `spot.dock`: run autodock procedure; command path does not require active teleop heartbeat.
+- `spot.return_and_dock`: navigate to saved dock waypoint for active map, then run dock.
+  - No parameters.
+  - Fails if no dock waypoint is saved yet for the active/default map.
+  - Successful manual `spot.dock` learns/saves current localized waypoint as dock waypoint.
+- `spot.rotate_left`: rotate left in place by a requested angle. Parameter: `degrees`.
+- `spot.rotate_right`: rotate right in place by a requested angle. Parameter: `degrees`.
+- `spot.reset_arm`: arm reset/stow; command path does not require active teleop heartbeat.
+
+- `spot.map.create`: create a new empty map context and make it active.
+  - Parameter examples: `name=warehouse_a`
 - `spot.map.load`: load a saved map into GraphNav.
   - Parameter examples: `map_id=warehouse_a` or `{"map_id":"warehouse_a"}`
 - `spot.map.set_default`: set default map ID in adapter state.
@@ -98,6 +119,11 @@ All commands are namespaced as `spot.*` and accept optional text parameters.
 
 Note: `spot.waypoint.save`/`spot.waypoint.update` can be called while not actively mapping; the
 adapter runs a temporary start/create/stop recording sequence.
+
+Command responses:
+- Responses are terminal: success/failure is returned after the action reaches a terminal state.
+- Long-running commands (`spot.camera.calibrate`, `spot.waypoint.goto`, `spot.dock`,
+  `spot.return_and_dock`) keep the response pending until completion.
 
 ## Configuration Model
 

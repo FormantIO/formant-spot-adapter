@@ -4,7 +4,7 @@ Configure these streams in your Formant teleop view/device config.
 
 ## Control Streams (Formant -> Adapter)
 
-1. `Joystick` (type: `geometry_msgs/Twist` equivalent RTC twist stream)
+- `Joystick` (type: `geometry_msgs/Twist` equivalent RTC twist stream)
 - This is the primary driving control.
 - Two joystick UI modules can both publish to `Joystick`.
 - Default mapping:
@@ -13,64 +13,64 @@ Configure these streams in your Formant teleop view/device config.
 - `angular.z` = yaw left/right
 - `angular.y` = body pitch up/down (clamped by `maxBodyPitchRad`)
 
-2. `Buttons` (type: Bitset)
+- `Buttons` (type: Bitset)
 - Include at least two buttons:
 - `Stand`
 - `Sit`
 
-3. `Stand` (type: boolean-to-device / bitset true click)
+- `Stand` (type: boolean-to-device / bitset true click)
 - Preferred for simple teleop UI button wiring.
 - Any `true` bitset value on this stream triggers stand.
 
-4. `Sit` (type: boolean-to-device / bitset true click)
+- `Sit` (type: boolean-to-device / bitset true click)
 - Preferred for simple teleop UI button wiring.
 - Any `true` bitset value on this stream triggers sit.
 
-5. `E-Stop` (type: boolean-to-device / bitset true click)
+- `E-Stop` (type: boolean-to-device / bitset true click)
 - Triggers emergency stop behavior (safe power-off command).
 - Requires lease ownership.
 
-6. `Recover` (type: boolean-to-device / bitset true click)
+- `Recover` (type: boolean-to-device / bitset true click)
 - Triggers self-right recovery behavior.
 - Requires active teleop session and lease ownership.
 
-7. `Walk` (type: boolean-to-device / bitset true click)
+- `Walk` (type: boolean-to-device / bitset true click)
 - Selects walk locomotion mode.
 - Does not stand the robot.
 
-8. `Stairs` (type: boolean-to-device / bitset true click)
+- `Stairs` (type: boolean-to-device / bitset true click)
 - Selects stairs locomotion mode.
 - Does not stand the robot.
 
-9. `Crawl` (type: boolean-to-device / bitset true click)
+- `Crawl` (type: boolean-to-device / bitset true click)
 - Selects crawl locomotion mode.
 - Does not stand the robot.
 
-10. `Dock` (type: boolean-to-device / bitset true click)
+- `Dock` (type: boolean-to-device / bitset true click)
 - Triggers auto-docking command.
 - If `dockStationId` is `-1`, adapter auto-discovers dock ID only when exactly one dock ID is configured.
 
-11. `Reset Arm` (type: boolean-to-device / bitset true click)
+- `Reset Arm` (type: boolean-to-device / bitset true click)
 - Sends Spot arm to stowed/retracted pose.
 - Requires active teleop session and lease ownership.
 
 ## Telemetry Streams (Adapter -> Formant)
 
-1. `spot.hand.image` (type: image/video)
+- `spot.hand.image` (type: image/video)
 - Source camera: Spot arm camera (`hand_color_image`)
 - Configure module as camera/video view in teleop.
 - Auto-rotation is applied here when wrist orientation threshold is crossed.
 
-2. `spot.left.image` (type: image/video)
+- `spot.left.image` (type: image/video)
 - Source camera: `left_fisheye_image` (default configurable)
 
-3. `spot.right.image` (type: image/video)
+- `spot.right.image` (type: image/video)
 - Source camera: `right_fisheye_image` (default configurable)
 
-4. `spot.back.image` (type: image/video)
+- `spot.back.image` (type: image/video)
 - Source camera: `back_fisheye_image` (default configurable)
 
-5. `spot.status` (type: bitset, 0.2 Hz / every 5s)
+- `spot.status` (type: bitset, 0.2 Hz / every 5s)
 - Published keys:
 - `Has lease`
 - `Robot available`
@@ -79,127 +79,188 @@ Configure these streams in your Formant teleop view/device config.
 - `Teleop active`
 - `Docking`
 
-6. `spot.connection` (type: text/json, 0.2 Hz / every 5s)
+- `spot.connection` (type: text/json, 0.2 Hz / every 5s)
 - Spot connectivity health and reconnect telemetry.
 - Fields include `state`, `connected`, `degraded_non_estop`, `degraded_reason`,
   `reconnect_attempt`, `last_success_ms`, `last_attempt_ms`, and `error`.
 
-7. `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
+- `spot.localization` (type: text/json, 0.2 Hz / every 5s)
+- GraphNav localization status.
+- Fields: `localized`, `waypoint_id`, `error`.
+
+- `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
 - Key: `Can dock` (boolean)
 - Indicates whether robot is currently in a dockable state for the resolved dock ID.
 
-8. `spot.mode_state` (type: bitset, 0.2 Hz / every 5s)
+- `spot.mode_state` (type: bitset, 0.2 Hz / every 5s)
 - Published keys:
 - `Walk`
 - `Stairs`
 - `Crawl`
 
-9. `spot.robot_state.power` (type: text/json, 0.2 Hz / every 5s)
+- `spot.robot_state.power` (type: text/json, 0.2 Hz / every 5s)
 - Fields include motor power state, estop aggregate, and battery availability.
 
-10. `spot.robot_state.battery` (type: numeric, 0.2 Hz / every 5s)
+- `spot.robot_state.battery` (type: numeric, 0.2 Hz / every 5s)
 - Battery percentage in range 0-100 when available from robot state.
 
-11. `spot.robot_state.body_pitch_rad` (type: numeric, 0.2 Hz / every 5s)
+- `spot.robot_state.body_pitch_rad` (type: numeric, 0.2 Hz / every 5s)
 - Measured body pitch in radians (derived from `odom` -> `body` transform).
 
-12. `spot.faults.system` (type: text/json, 0.2 Hz / every 5s)
+- `spot.faults.system` (type: text/json, 0.2 Hz / every 5s)
 - Active system fault summary (`count`, list of `id`, `severity`, `message`).
 
-13. `spot.faults.behavior` (type: text/json, 0.2 Hz / every 5s)
+- `spot.faults.behavior` (type: text/json, 0.2 Hz / every 5s)
 - Active behavior fault summary.
 
-14. `spot.faults.service` (type: text/json, 0.2 Hz / every 5s)
+- `spot.faults.service` (type: text/json, 0.2 Hz / every 5s)
 - Active service fault summary.
 
-15. `spot.fault.events` (type: text, event-driven)
+- `spot.fault.events` (type: text, event-driven)
 - Simplified fault feed for operators.
 - Emits only on fault changes:
   - `FAULT OPEN ...`
   - `FAULT CHANGED ...`
   - `FAULT CLEARED ...`
 
-16. `spot.nav.feedback` (type: text/json, ~2 Hz while nav command active)
+- `spot.nav.feedback` (type: text/json, ~2 Hz while nav command active)
 - GraphNav feedback snapshot (`status`, `remaining_route_length_m`, route/blockage context).
 
-17. `spot.adapter.log` (type: text, 1 Hz batched)
+- `spot.adapter.log` (type: text, 1 Hz batched)
 - Buffered adapter-side operational log lines (command/recovery events).
 
-18. `spot.waypoints` (type: text, 1 Hz)
+- `spot.waypoints` (type: text, 1 Hz)
 - Newline-separated waypoint names for the currently loaded GraphNav map.
 - Names come from adapter aliases (`spot.waypoint.save/update`) and fall back to GraphNav labels.
 
-19. `spot.maps` (type: text, 0.2 Hz / every 5s)
+- `spot.waypoint.current` (type: text, 0.1 Hz / every 10s)
+- Current waypoint name when robot is localized within 1 ft of a saved waypoint.
+- Empty string when robot is not within 1 ft of a saved waypoint.
+- Internal proximity check runs every 1s.
+
+- `spot.maps` (type: text, 0.2 Hz / every 5s)
 - Newline-separated saved map IDs discovered in adapter map storage.
 
-20. `spot.map.progress` (type: text/json, 0.2 Hz / every 5s)
+- `spot.map.current` (type: text, 0.1 Hz / every 10s + on change)
+- Active/current map ID (`none` when unset).
+
+- `spot.map.default` (type: text, 0.1 Hz / every 10s + on change)
+- Default map ID (`none` when unset).
+
+- `spot.map.progress` (type: text/json, 0.2 Hz / every 5s)
 - Recording/map statistics summary from GraphNav recording status.
 
-21. `spot.map.progress.waypoints` (type: numeric, 0.2 Hz / every 5s)
+- `spot.map.progress.waypoints` (type: numeric, 0.2 Hz / every 5s)
 - Waypoint count in current loaded graph.
 
-22. `spot.map.progress.path_length_m` (type: numeric, 0.2 Hz / every 5s)
+- `spot.map.progress.path_length_m` (type: numeric, 0.2 Hz / every 5s)
 - Total recorded path length in meters.
 
-23. `spot.map.progress.fiducials` (type: numeric, 0.2 Hz / every 5s)
+- `spot.map.progress.fiducials` (type: numeric, 0.2 Hz / every 5s)
 - Count of visible fiducials in recording status.
 
 ## Commands (Formant -> Adapter)
 
-1. `spot.jetson.reboot` (command)
+- `spot.jetson.reboot` (command)
 - Reboots the Jetson host running this adapter.
 - Adapter sends command success response, then executes `systemctl reboot`.
 
-2. `spot.robot.reboot` (command)
+- `spot.robot.reboot` (command)
 - Requests Spot body safe power-cycle reboot via power service helper.
 - Command returns success/failure response based on SDK result.
 
-3. `spot.camera.calibrate` (command)
+- `spot.camera.calibrate` (command)
 - Starts Spot camera calibration routine via SpotCheck service.
-- Requires active teleop session with body lease (adapter will reject otherwise).
+- Does not require active teleop session; adapter acquires lease when needed.
 
-4. `spot.map.load` (command)
+- `spot.stand` (command)
+- Sends stand command.
+- Does not require active teleop session; adapter acquires lease when needed.
+
+- `spot.sit` (command)
+- Sends sit command.
+- Does not require active teleop session; adapter acquires lease when needed.
+
+- `spot.recover` (command)
+- Sends self-right command.
+- Does not require active teleop session; adapter acquires lease when needed.
+
+- `spot.dock` (command)
+- Runs autodock procedure.
+- Does not require active teleop session.
+
+- `spot.return_and_dock` (command)
+- Navigates to the saved dock waypoint for the active/default map, then runs autodock.
+- Does not require active teleop session.
+- Fails if no saved dock waypoint exists yet.
+- Dock waypoint is learned automatically after successful manual `spot.dock`.
+
+- `spot.rotate_left` (command)
+- Rotates Spot left in place by a requested angle.
+- Parameter text: `degrees=<float>`.
+- Does not require active teleop session; adapter acquires lease when needed.
+
+- `spot.rotate_right` (command)
+- Rotates Spot right in place by a requested angle.
+- Parameter text: `degrees=<float>`.
+- Does not require active teleop session; adapter acquires lease when needed.
+
+- `spot.reset_arm` (command)
+- Requests arm stow/reset.
+- Does not require active teleop session; adapter acquires lease when needed.
+
+- `spot.map.create` (command)
+- Creates a new empty map context, clears loaded GraphNav map, and sets it active.
+- Parameter text: `name=<id>` (also accepts `map_id=<id>`).
+- Rejects if the map already exists.
+
+- `spot.map.load` (command)
 - Loads a saved GraphNav map into Spot.
 - Parameter text: `map_id=<id>` or JSON like `{"map_id":"<id>"}`.
 
-5. `spot.map.set_default` (command)
+- `spot.map.set_default` (command)
 - Stores a default map ID in adapter state.
 - Parameter text: `map_id=<id>`.
 
-6. `spot.map.delete` (command)
+- `spot.map.delete` (command)
 - Deletes a saved map from adapter storage.
 - Parameter text: `map_id=<id>`.
 
-7. `spot.map.start_mapping` (command)
+- `spot.map.start_mapping` (command)
 - Starts GraphNav recording.
 
-8. `spot.map.stop_mapping` (command)
+- `spot.map.stop_mapping` (command)
 - Stops recording and persists current GraphNav map to adapter storage.
 
-9. `spot.waypoint.save` (command)
+- `spot.waypoint.save` (command)
 - Creates a GraphNav waypoint at current robot location and stores alias.
 - Parameter text: `name=<alias>`.
 - If mapping is not active, adapter performs a temporary start/create/stop recording cycle.
 
-10. `spot.waypoint.update` (command)
+- `spot.waypoint.update` (command)
 - Rebinds alias to a newly created GraphNav waypoint at current location.
 - Parameter text: `name=<alias>`.
 - If mapping is not active, adapter performs a temporary start/create/stop recording cycle.
 
-11. `spot.waypoint.delete` (command)
+- `spot.waypoint.delete` (command)
 - Deletes alias from adapter map state (does not delete underlying GraphNav waypoint object).
 - Parameter text: `name=<alias>`.
 
-12. `spot.waypoint.goto` (command)
+- `spot.waypoint.goto` (command)
 - Resolves alias (or existing GraphNav waypoint label) and sends NavigateTo command.
 - Parameter text: `name=<alias_or_label>`.
 
+Command response behavior:
+- Formant command responses are terminal; success/failure is returned when the action reaches completion.
+- Long-running commands (`spot.camera.calibrate`, `spot.waypoint.goto`, `spot.dock`,
+  `spot.return_and_dock`) keep the response pending until terminal success/failure.
+
 ## Recommended Teleop UI Layout
 
-1. Video panels subscribed to `spot.hand.image`, `spot.left.image`, `spot.right.image`, and `spot.back.image`.
-2. Left joystick and right joystick both driving `Joystick`.
-3. Two buttons in `Buttons` bitset: `Stand`, `Sit`.
-4. Or, use direct buttons publishing to streams `Stand`, `Sit`, `E-Stop`, `Recover`, `Walk`, `Stairs`, `Crawl`, `Reset Arm`, and `Dock`.
+- Video panels subscribed to `spot.hand.image`, `spot.left.image`, `spot.right.image`, and `spot.back.image`.
+- Left joystick and right joystick both driving `Joystick`.
+- Two buttons in `Buttons` bitset: `Stand`, `Sit`.
+- Or, use direct buttons publishing to streams `Stand`, `Sit`, `E-Stop`, `Recover`, `Walk`, `Stairs`, `Crawl`, `Reset Arm`, and `Dock`.
 
 ## Notes
 
@@ -208,6 +269,8 @@ Configure these streams in your Formant teleop view/device config.
 - While disconnected, robot actions are rejected and connection state is published to `spot.connection`.
 - Adapter applies soft non-E-Stop recovery gating and blocks motion/dock only for
   critical/unclearable faults or motor power error.
+- GraphNav command navigation prechecks localization and attempts fiducial relocalization once
+  before failing a command.
 - If teleop heartbeat stops, adapter sends zero velocity, stows arm, then releases lease.
 - Heartbeat timeout behavior is zero-velocity command only.
 - No auto-sit on heartbeat timeout.
