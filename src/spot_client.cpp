@@ -597,7 +597,10 @@ bool SpotClient::StartGraphRecording(std::string* out_created_waypoint_id) {
 bool SpotClient::StopGraphRecording() {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!EnsureGraphNavRecordingClient()) return false;
-  for (int attempt = 0; attempt < 8; ++attempt) {
+  constexpr int kRetryDelayMs = 300;
+  constexpr int kMaxStopWaitMs = 30000;
+  constexpr int kMaxAttempts = (kMaxStopWaitMs + kRetryDelayMs - 1) / kRetryDelayMs;
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
     ::bosdyn::api::graph_nav::StopRecordingRequest req;
     auto r = graph_nav_recording_client_->StopRecording(req);
     if (!r.status) {
@@ -609,8 +612,17 @@ bool SpotClient::StopGraphRecording() {
       return true;
     }
     if (status == ::bosdyn::api::graph_nav::StopRecordingResponse::STATUS_NOT_READY_YET) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
       continue;
+    }
+    if (status == ::bosdyn::api::graph_nav::StopRecordingResponse::STATUS_NOT_LOCALIZED_TO_END) {
+      auto record_status = graph_nav_recording_client_->GetRecordStatus();
+      if (record_status.status && !record_status.response.is_recording()) {
+        return true;
+      }
+      SetLastError("StopRecording failed status=" + std::to_string(static_cast<int>(status)) +
+                   " localized_id=" + r.response.error_waypoint_localized_id());
+      return false;
     }
     SetLastError("StopRecording failed status=" + std::to_string(static_cast<int>(status)));
     return false;

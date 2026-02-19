@@ -398,7 +398,7 @@ void Adapter::Run() {
                            "spot.reset_arm",
                            "spot.map.create", "spot.map.load", "spot.map.set_default", "spot.map.delete",
                            "spot.map.start_mapping", "spot.map.stop_mapping",
-                           "spot.waypoint.save", "spot.waypoint.update",
+                           "spot.waypoint.save",
                            "spot.waypoint.delete", "spot.waypoint.goto"},
                           [this](const v1::model::CommandRequest& request) { HandleCommand(request); });
   agent_.StartHeartbeatLoop(
@@ -741,6 +741,7 @@ void Adapter::LeaseRetainLoop() {
     if ((now - last_map_progress_pub_ms) >= periodic_publish_ms && SpotConnected()) {
       SpotClient::MappingStatus map_status;
       if (spot_.GetMappingStatus(&map_status)) {
+        map_recording_active_ = map_status.is_recording;
         QueueStatusText("spot.map.progress", mapping_status_to_json(map_status));
         QueueStatusNumeric("spot.map.progress.waypoints",
                            static_cast<double>(map_status.waypoint_count));
@@ -2683,14 +2684,13 @@ void Adapter::CommitDockWaypointCandidateOnSuccess() {
 
 std::string Adapter::BuildWaypointTextLocked() const {
   std::vector<std::string> names;
-  if (!active_map_id_.empty()) {
-    auto it = waypoint_aliases_by_map_.find(active_map_id_);
+  std::string map_id = active_map_id_;
+  if (map_id.empty()) map_id = default_map_id_;
+  if (!map_id.empty()) {
+    auto it = waypoint_aliases_by_map_.find(map_id);
     if (it != waypoint_aliases_by_map_.end()) {
       for (const auto& alias : it->second) names.push_back(alias.first);
     }
-  }
-  if (names.empty()) {
-    for (const auto& pair : loaded_waypoint_id_to_label_) names.push_back(pair.second);
   }
   std::sort(names.begin(), names.end());
   names.erase(std::unique(names.begin(), names.end()), names.end());
@@ -3085,6 +3085,14 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
 
   if (request.command() == "spot.map.start_mapping") {
     if (!EnsureLeaseForCommand("spot.map.start_mapping")) return false;
+    SpotClient::MappingStatus status;
+    if (spot_.GetMappingStatus(&status)) {
+      map_recording_active_ = status.is_recording;
+      if (status.is_recording) {
+        EmitLog("[graphnav] mapping already active");
+        return true;
+      }
+    }
     if (!spot_.StartGraphRecording()) {
       EmitLog(std::string("[graphnav] start_mapping failed: ") + spot_.LastError());
       return false;
@@ -3102,9 +3110,19 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
 
   if (request.command() == "spot.map.stop_mapping") {
     if (!EnsureLeaseForCommand("spot.map.stop_mapping")) return false;
-    if (!spot_.StopGraphRecording()) {
-      EmitLog(std::string("[graphnav] stop_mapping failed: ") + spot_.LastError());
-      return false;
+    bool already_stopped = false;
+    SpotClient::MappingStatus status;
+    if (spot_.GetMappingStatus(&status)) {
+      map_recording_active_ = status.is_recording;
+      already_stopped = !status.is_recording;
+    }
+    if (!already_stopped) {
+      if (!spot_.StopGraphRecording()) {
+        EmitLog(std::string("[graphnav] stop_mapping failed: ") + spot_.LastError());
+        return false;
+      }
+    } else {
+      EmitLog("[graphnav] stop_mapping: recording already stopped");
     }
     map_recording_active_ = false;
     std::string active_map;
@@ -3130,14 +3148,13 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
 bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
   std::string text;
   (void)ExtractCommandText(request, &text);
-  std::string name = ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"});
-  name = Trim(name);
-  if (name.empty()) {
-    EmitLog(std::string("[graphnav] ") + request.command() + " rejected: missing waypoint name");
-    return false;
-  }
+  std::string name = Trim(ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"}));
 
   if (request.command() == "spot.waypoint.delete") {
+    if (name.empty()) {
+      EmitLog("[graphnav] waypoint.delete rejected: missing waypoint name");
+      return false;
+    }
     bool had_active_map = true;
     bool removed = false;
     {
@@ -3178,11 +3195,22 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
     return true;
   }
 
-  if (request.command() == "spot.waypoint.save" || request.command() == "spot.waypoint.update") {
+  if (request.command() == "spot.waypoint.save") {
+    if (name.empty()) {
+      name = "saved-" + std::to_string(now_ms());
+      EmitLog(std::string("[graphnav] waypoint.save: auto-generated name=") + name);
+    }
+
     if (!EnsureLeaseForCommand(request.command())) return false;
+    bool robot_recording = map_recording_active_.load();
+    SpotClient::MappingStatus status;
+    if (spot_.GetMappingStatus(&status)) {
+      robot_recording = status.is_recording;
+      map_recording_active_ = status.is_recording;
+    }
     bool started_temp_recording = false;
     std::string waypoint_id;
-    if (!map_recording_active_) {
+    if (!robot_recording) {
       if (!spot_.StartGraphRecording(&waypoint_id)) {
         EmitLog(std::string("[graphnav] waypoint create failed: unable to start temporary recording: ") +
                 spot_.LastError());
@@ -3198,9 +3226,21 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
 
     if (started_temp_recording) {
       if (!spot_.StopGraphRecording()) {
-        EmitLog(std::string("[graphnav] waypoint create failed: temp stop recording failed: ") +
-                spot_.LastError());
-        return false;
+        SpotClient::MappingStatus post_stop_status;
+        if (spot_.GetMappingStatus(&post_stop_status)) {
+          map_recording_active_ = post_stop_status.is_recording;
+          if (!post_stop_status.is_recording) {
+            EmitLog("[graphnav] waypoint save: stop recording returned error but recording is now false");
+          } else {
+            EmitLog(std::string("[graphnav] waypoint create failed: temp stop recording failed: ") +
+                    spot_.LastError());
+            return false;
+          }
+        } else {
+          EmitLog(std::string("[graphnav] waypoint create failed: temp stop recording failed: ") +
+                  spot_.LastError());
+          return false;
+        }
       }
     }
     if (waypoint_id.empty()) {
