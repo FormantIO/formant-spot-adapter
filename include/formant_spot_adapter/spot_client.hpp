@@ -123,7 +123,7 @@ class SpotClient {
 
   bool GetImageJpeg(const std::string& source, std::string* out_bytes);
   bool ListImageSources(std::vector<ImageSourceInfo>* out_sources);
-  bool StartGraphRecording();
+  bool StartGraphRecording(std::string* out_created_waypoint_id = nullptr);
   bool StopGraphRecording();
   bool CreateGraphWaypoint(const std::string& waypoint_name, std::string* out_waypoint_id);
   bool DownloadCurrentGraph(::bosdyn::api::graph_nav::Graph* out_graph);

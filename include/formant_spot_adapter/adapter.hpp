@@ -3,6 +3,7 @@
 #include <atomic>
 #include <deque>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -36,7 +37,6 @@ class Adapter {
   bool ExecuteSitAction(bool require_teleop, bool auto_acquire_lease);
   bool ExecuteRecoverAction(bool require_teleop, bool auto_acquire_lease);
   bool ExecuteDockAction(bool require_teleop);
-  bool ExecuteReturnAndDockAction(bool require_teleop);
   bool ExecuteResetArmAction(bool require_teleop, bool auto_acquire_lease);
   bool ExecuteRotateCommand(const v1::model::CommandRequest& request, bool left);
   bool ExecuteQueuedCommand(const v1::model::CommandRequest& request);
@@ -101,7 +101,8 @@ class Adapter {
   void CommitDockWaypointCandidateOnSuccess();
   void ClearDockWaypointCandidateLocked();
   std::string BuildWaypointTextLocked() const;
-  std::string BuildMapsTextLocked() const;
+  std::string BuildMapsText(const std::string& active_map_id,
+                            const std::string& default_map_id) const;
   std::string ResolveWaypointNameForIdLocked(const std::string& waypoint_id) const;
   std::string BuildCurrentMapTextLocked() const;
   std::string BuildDefaultMapTextLocked() const;
@@ -233,6 +234,9 @@ class Adapter {
   std::atomic<bool> graphnav_navigation_active_{false};
   std::atomic<bool> nav_auto_recovered_{false};
   std::atomic<uint32_t> last_graph_nav_command_id_{0};
+  mutable std::mutex nav_state_mu_;
+
+  static constexpr size_t kMaxCommandQueueDepth = 10;
 };
 
 }  // namespace fsa

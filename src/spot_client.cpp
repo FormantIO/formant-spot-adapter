@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <thread>
 #include <unordered_set>
 
 #include "bosdyn/client/docking/docking_helpers.h"
@@ -104,6 +105,19 @@ std::string SpotClient::LastError() const {
 
 bool SpotClient::Connect(const std::string& host, const std::string& username, const std::string& password) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  body_lease_.Clear();
+  robot_command_client_ = nullptr;
+  lease_client_ = nullptr;
+  time_sync_endpoint_ = nullptr;
+  image_client_ = nullptr;
+  power_client_ = nullptr;
+  graph_nav_client_ = nullptr;
+  graph_nav_recording_client_ = nullptr;
+  spot_check_client_ = nullptr;
+  docking_client_ = nullptr;
+  robot_state_client_ = nullptr;
+  world_object_client_ = nullptr;
+  robot_.reset();
   sdk_ = ::bosdyn::client::CreateStandardSDK("formant-spot-adapter");
 
   auto robot_result = sdk_->CreateRobot(host);
@@ -287,6 +301,17 @@ bool SpotClient::RebootRobotBody() {
     }
     SetLastError(reboot_err);
     return false;
+  }
+  if (!had_lease && !body_lease_.resource().empty()) {
+    ::bosdyn::api::ReturnLeaseRequest req;
+    req.mutable_lease()->CopyFrom(body_lease_);
+    const auto ret = lease_client_->ReturnLease(req);
+    if (!ret.status) {
+      SetLastError("Reboot succeeded but return temporary lease failed: " + ret.status.DebugString());
+      body_lease_.Clear();
+      return false;
+    }
+    body_lease_.Clear();
   }
   return true;
 }
@@ -552,7 +577,7 @@ bool SpotClient::ListImageSources(std::vector<ImageSourceInfo>* out_sources) {
   return true;
 }
 
-bool SpotClient::StartGraphRecording() {
+bool SpotClient::StartGraphRecording(std::string* out_created_waypoint_id) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!EnsureGraphNavRecordingClient()) return false;
   ::bosdyn::api::graph_nav::StartRecordingRequest req;
@@ -565,23 +590,36 @@ bool SpotClient::StartGraphRecording() {
     SetLastError("StartRecording failed status=" + std::to_string(static_cast<int>(r.response.status())));
     return false;
   }
+  if (out_created_waypoint_id) *out_created_waypoint_id = r.response.created_waypoint().id();
   return true;
 }
 
 bool SpotClient::StopGraphRecording() {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!EnsureGraphNavRecordingClient()) return false;
-  ::bosdyn::api::graph_nav::StopRecordingRequest req;
-  auto r = graph_nav_recording_client_->StopRecording(req);
-  if (!r.status) {
-    SetLastError(r.status.DebugString());
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    ::bosdyn::api::graph_nav::StopRecordingRequest req;
+    auto r = graph_nav_recording_client_->StopRecording(req);
+    if (!r.status) {
+      SetLastError(r.status.DebugString());
+      return false;
+    }
+    const auto status = r.response.status();
+    if (status == ::bosdyn::api::graph_nav::StopRecordingResponse::STATUS_OK) {
+      return true;
+    }
+    if (status == ::bosdyn::api::graph_nav::StopRecordingResponse::STATUS_NOT_READY_YET) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      continue;
+    }
+    SetLastError("StopRecording failed status=" + std::to_string(static_cast<int>(status)));
     return false;
   }
-  if (r.response.status() != ::bosdyn::api::graph_nav::StopRecordingResponse::STATUS_OK) {
-    SetLastError("StopRecording failed status=" + std::to_string(static_cast<int>(r.response.status())));
-    return false;
-  }
-  return true;
+  SetLastError("StopRecording failed status=" +
+               std::to_string(static_cast<int>(
+                   ::bosdyn::api::graph_nav::StopRecordingResponse::STATUS_NOT_READY_YET)) +
+               " after retries");
+  return false;
 }
 
 bool SpotClient::CreateGraphWaypoint(const std::string& waypoint_name, std::string* out_waypoint_id) {
@@ -716,24 +754,53 @@ bool SpotClient::UploadGraphMap(const StoredMap& map_data) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!EnsureGraphNavClient()) return false;
 
-  ::bosdyn::api::graph_nav::UploadGraphRequest upload_req;
-  *upload_req.mutable_graph() = map_data.graph;
-  upload_req.set_replace_graph(true);
-  auto upload_result = graph_nav_client_->UploadGraph(upload_req);
-  if (!upload_result.status) {
-    SetLastError(upload_result.status.DebugString());
-    return false;
-  }
-  if (upload_result.response.status() != ::bosdyn::api::graph_nav::UploadGraphResponse::STATUS_OK) {
-    SetLastError("UploadGraph failed status=" +
-                 std::to_string(static_cast<int>(upload_result.response.status())));
-    return false;
+  auto upload_graph = [this](const ::bosdyn::api::graph_nav::Graph& graph,
+                             bool replace_graph,
+                             ::bosdyn::api::graph_nav::UploadGraphResponse* out_response) -> bool {
+    ::bosdyn::api::graph_nav::UploadGraphRequest upload_req;
+    *upload_req.mutable_graph() = graph;
+    upload_req.set_replace_graph(replace_graph);
+    auto upload_result = graph_nav_client_->UploadGraph(upload_req);
+    if (!upload_result.status) {
+      SetLastError(upload_result.status.DebugString());
+      return false;
+    }
+    if (upload_result.response.status() != ::bosdyn::api::graph_nav::UploadGraphResponse::STATUS_OK) {
+      SetLastError("UploadGraph failed status=" +
+                   std::to_string(static_cast<int>(upload_result.response.status())));
+      return false;
+    }
+    if (out_response) *out_response = upload_result.response;
+    return true;
+  };
+
+  ::bosdyn::api::graph_nav::UploadGraphResponse upload_response;
+  if (!upload_graph(map_data.graph, true, &upload_response)) return false;
+
+  if (!upload_response.replaced_graph()) {
+    auto clear_result = graph_nav_client_->ClearGraph();
+    if (!clear_result.status) {
+      SetLastError("UploadGraph fallback clear failed: " + clear_result.status.DebugString());
+      return false;
+    }
+    if (clear_result.response.status() != ::bosdyn::api::graph_nav::ClearGraphResponse::STATUS_OK &&
+        clear_result.response.status() != ::bosdyn::api::graph_nav::ClearGraphResponse::STATUS_UNKNOWN) {
+      SetLastError("UploadGraph fallback clear failed status=" +
+                   std::to_string(static_cast<int>(clear_result.response.status())));
+      return false;
+    }
+    if (!upload_graph(map_data.graph, false, nullptr)) return false;
   }
 
   for (auto snapshot : map_data.waypoint_snapshots) {
     auto up = graph_nav_client_->UploadWaypointSnapshot(snapshot);
     if (!up.status) {
       SetLastError(up.status.DebugString());
+      return false;
+    }
+    if (up.response.status() != ::bosdyn::api::graph_nav::UploadWaypointSnapshotResponse::STATUS_OK) {
+      SetLastError("UploadWaypointSnapshot failed status=" +
+                   std::to_string(static_cast<int>(up.response.status())));
       return false;
     }
   }

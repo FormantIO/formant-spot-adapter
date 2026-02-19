@@ -34,8 +34,6 @@ struct Config {
   std::string back_camera_source{"back_fisheye_image"};
   std::string back_camera_stream_name{"spot.back.image"};
   int camera_fps{30};
-  bool camera_auto_rotate{true};
-  double camera_rotate_wr1_threshold_rad{1.0};
   double twist_deadband{0.08};
   int teleop_idle_timeout_ms{300};
 

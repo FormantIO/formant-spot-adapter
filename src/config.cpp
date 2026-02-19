@@ -39,16 +39,6 @@ double getenv_double_or(const char* k, double d) {
   }
 }
 
-bool getenv_bool_or(const char* k, bool d) {
-  const char* v = std::getenv(k);
-  if (!v || !*v) return d;
-  std::string s(v);
-  for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-  if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
-  if (s == "0" || s == "false" || s == "no" || s == "off") return false;
-  return d;
-}
-
 std::string read_file_or_empty(const std::string& path) {
   std::ifstream ifs(path);
   if (!ifs) return "";
@@ -84,10 +74,6 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_back_camera_stream_name()) c->back_camera_stream_name = j.back_camera_stream_name().value();
 
   if (j.has_camera_fps()) c->camera_fps = j.camera_fps().value();
-  if (j.has_camera_auto_rotate()) c->camera_auto_rotate = j.camera_auto_rotate().value();
-  if (j.has_camera_rotate_wr1_threshold_rad()) {
-    c->camera_rotate_wr1_threshold_rad = j.camera_rotate_wr1_threshold_rad().value();
-  }
   if (j.has_twist_deadband()) c->twist_deadband = j.twist_deadband().value();
   if (j.has_teleop_idle_timeout_ms()) c->teleop_idle_timeout_ms = j.teleop_idle_timeout_ms().value();
   if (j.has_max_vx_mps()) c->max_vx_mps = j.max_vx_mps().value();
@@ -151,15 +137,6 @@ Config load_config_from_env() {
   c.back_camera_source = getenv_or("BACK_CAMERA_SOURCE", c.back_camera_source);
   c.back_camera_stream_name = getenv_or("BACK_CAMERA_STREAM_NAME", c.back_camera_stream_name);
   c.camera_fps = getenv_int_or("CAMERA_FPS", c.camera_fps);
-  c.camera_auto_rotate = getenv_bool_or("CAMERA_AUTO_ROTATE", c.camera_auto_rotate);
-  c.left_camera_source = getenv_or("LEFT_CAMERA_SOURCE", c.left_camera_source);
-  c.left_camera_stream_name = getenv_or("LEFT_CAMERA_STREAM_NAME", c.left_camera_stream_name);
-  c.right_camera_source = getenv_or("RIGHT_CAMERA_SOURCE", c.right_camera_source);
-  c.right_camera_stream_name = getenv_or("RIGHT_CAMERA_STREAM_NAME", c.right_camera_stream_name);
-  c.back_camera_source = getenv_or("BACK_CAMERA_SOURCE", c.back_camera_source);
-  c.back_camera_stream_name = getenv_or("BACK_CAMERA_STREAM_NAME", c.back_camera_stream_name);
-  c.camera_rotate_wr1_threshold_rad =
-      getenv_double_or("CAMERA_ROTATE_WR1_THRESHOLD_RAD", c.camera_rotate_wr1_threshold_rad);
   c.max_body_pitch_rad = getenv_double_or("MAX_BODY_PITCH_RAD", c.max_body_pitch_rad);
   c.twist_deadband = getenv_double_or("TWIST_DEADBAND", c.twist_deadband);
   c.teleop_idle_timeout_ms = getenv_int_or("TELEOP_IDLE_TIMEOUT_MS", c.teleop_idle_timeout_ms);
