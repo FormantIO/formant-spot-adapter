@@ -43,12 +43,14 @@ class Adapter {
   void CommandExecutionLoop();
   bool ExecuteCameraCalibrateCommand();
   bool ExecuteWaypointGotoCommand(const v1::model::CommandRequest& request);
+  bool ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest& request);
   bool ExecuteDockSequence(bool return_and_dock);
   bool WaitForGraphNavCommandResult(uint32_t command_id, long long timeout_ms);
   bool EnsureLocalizedForNavigation(const std::string& action_name);
   bool StartNavigateWithRecovery(const std::string& action_name,
                                  const std::string& waypoint_id,
-                                 uint32_t* out_command_id);
+                                 uint32_t* out_command_id,
+                                 bool straight = false);
   void HandleTwist(const v1::model::Twist& twist);
   void DockLoop();
   void ApplyDesiredArmMode(bool force = false);

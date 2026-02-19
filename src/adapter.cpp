@@ -399,7 +399,8 @@ void Adapter::Run() {
                            "spot.map.create", "spot.map.load", "spot.map.set_default", "spot.map.delete",
                            "spot.map.start_mapping", "spot.map.stop_mapping",
                            "spot.waypoint.save",
-                           "spot.waypoint.delete", "spot.waypoint.goto"},
+                           "spot.waypoint.delete", "spot.waypoint.goto",
+                           "spot.waypoint.goto_straight"},
                           [this](const v1::model::CommandRequest& request) { HandleCommand(request); });
   agent_.StartHeartbeatLoop(
       [this](const v1::agent::GetTeleopHeartbeatStreamResponse& hb) { HandleHeartbeat(hb); });
@@ -1531,14 +1532,18 @@ bool Adapter::EnsureLocalizedForNavigation(const std::string& action_name) {
 
 bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
                                         const std::string& waypoint_id,
-                                        uint32_t* out_command_id) {
+                                        uint32_t* out_command_id,
+                                        bool straight) {
   if (!EnsureLocalizedForNavigation(action_name)) return false;
 
   bool retried_localization = false;
   bool retried_recover = false;
   for (;;) {
     uint32_t command_id = 0;
-    if (spot_.NavigateToWaypoint(waypoint_id, cfg_.graphnav_command_timeout_sec, &command_id)) {
+    const bool nav_ok =
+        straight ? spot_.NavigateToWaypointStraight(waypoint_id, cfg_.graphnav_command_timeout_sec, &command_id)
+                 : spot_.NavigateToWaypoint(waypoint_id, cfg_.graphnav_command_timeout_sec, &command_id);
+    if (nav_ok) {
       if (out_command_id) *out_command_id = command_id;
       return true;
     }
@@ -1601,6 +1606,44 @@ bool Adapter::ExecuteWaypointGotoCommand(const v1::model::CommandRequest& reques
   graphnav_navigation_active_ = false;
   last_graph_nav_command_id_ = 0;
   if (ok) EmitLog(std::string("[graphnav] spot.waypoint.goto success name=") + name);
+  return ok;
+}
+
+bool Adapter::ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest& request) {
+  if (!EnsureLeaseForCommand("spot.waypoint.goto_straight")) return false;
+  std::string text;
+  (void)ExtractCommandText(request, &text);
+  std::string name = Trim(ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"}));
+  if (name.empty()) {
+    EmitLog("[graphnav] spot.waypoint.goto_straight rejected: missing waypoint name");
+    return false;
+  }
+
+  std::string waypoint_id;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (!ResolveWaypointNameLocked(name, &waypoint_id)) {
+      EmitLog(std::string("[graphnav] spot.waypoint.goto_straight failed: unresolved or ambiguous name=") + name);
+      return false;
+    }
+  }
+
+  uint32_t command_id = 0;
+  if (!StartNavigateWithRecovery("spot.waypoint.goto_straight", waypoint_id, &command_id, true)) return false;
+
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    nav_target_waypoint_id_ = waypoint_id;
+    nav_target_waypoint_name_ = name;
+  }
+  last_graph_nav_command_id_ = command_id;
+  graphnav_navigation_active_ = true;
+  nav_auto_recovered_ = false;
+  const bool ok = WaitForGraphNavCommandResult(
+      command_id, static_cast<long long>(std::max(30, cfg_.graphnav_command_timeout_sec)) * 1000LL + 30000LL);
+  graphnav_navigation_active_ = false;
+  last_graph_nav_command_id_ = 0;
+  if (ok) EmitLog(std::string("[graphnav] spot.waypoint.goto_straight success name=") + name);
   return ok;
 }
 
@@ -1726,6 +1769,7 @@ bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
   }
   if (command.rfind("spot.map.", 0) == 0) return HandleMapCommand(request);
   if (command == "spot.waypoint.goto") return ExecuteWaypointGotoCommand(request);
+  if (command == "spot.waypoint.goto_straight") return ExecuteWaypointGotoStraightCommand(request);
   if (command.rfind("spot.waypoint.", 0) == 0) return HandleWaypointCommand(request);
   return false;
 }
@@ -2771,16 +2815,11 @@ void Adapter::PublishWaypointsText(bool force) {
   const bool force_flag = force_waypoint_publish_.exchange(false);
   if (!force && !force_flag && (now - last_waypoint_pub_ms_.load()) < kWaypointPeriodicMs) return;
   std::string text;
-  bool changed = false;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
     text = BuildWaypointTextLocked();
-    changed = (text != last_waypoint_text_payload_);
-    if (changed) {
-      last_waypoint_text_payload_ = text;
-    }
+    last_waypoint_text_payload_ = text;
   }
-  if (!force && !force_flag && !changed) return;
   QueueStatusText(cfg_.waypoint_text_stream, text);
   last_waypoint_pub_ms_ = now;
 }
@@ -2800,13 +2839,10 @@ void Adapter::PublishMapsText(bool force) {
   }
 
   const std::string text = BuildMapsText(active_map_id, default_map_id);
-  bool changed = false;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
-    changed = (text != last_maps_text_payload_);
-    if (changed) last_maps_text_payload_ = text;
+    last_maps_text_payload_ = text;
   }
-  if (!force && !force_flag && !changed) return;
   QueueStatusText(cfg_.maps_text_stream, text);
   last_maps_pub_ms_ = now;
 }

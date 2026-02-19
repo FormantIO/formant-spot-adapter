@@ -940,6 +940,48 @@ bool SpotClient::NavigateToWaypoint(const std::string& waypoint_id, int command_
   return true;
 }
 
+bool SpotClient::NavigateToWaypointStraight(const std::string& waypoint_id, int command_timeout_sec,
+                                            uint32_t* out_command_id) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (waypoint_id.empty()) return false;
+  if (!EnsureGraphNavClient()) return false;
+  if (!EnsureTimeSync()) return false;
+
+  ::bosdyn::api::graph_nav::NavigateToRequest req;
+  req.set_destination_waypoint_id(waypoint_id);
+  const auto end_time =
+      time_sync_endpoint_->RobotTimestampFromLocal(std::chrono::system_clock::now() +
+                                                   std::chrono::seconds(std::max(5, command_timeout_sec)));
+  *req.mutable_end_time() = end_time;
+  auto clock_id = time_sync_endpoint_->GetClockIdentifier();
+  if (!clock_id.status) {
+    SetLastError(clock_id.status.DebugString());
+    return false;
+  }
+  req.set_clock_identifier(*clock_id.response);
+
+  auto* travel = req.mutable_travel_params();
+  travel->set_ignore_final_yaw(true);
+  travel->set_disable_directed_exploration(true);
+  travel->set_disable_alternate_route_finding(true);
+  travel->set_max_corridor_distance(5.0);
+  req.set_route_blocked_behavior(
+      ::bosdyn::api::graph_nav::RouteFollowingParams::ROUTE_BLOCKED_FAIL);
+
+  auto r = graph_nav_client_->NavigateTo(req);
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+  if (r.response.status() != ::bosdyn::api::graph_nav::NavigateToResponse::STATUS_OK) {
+    SetLastError("NavigateTo(straight) failed status=" +
+                 std::to_string(static_cast<int>(r.response.status())));
+    return false;
+  }
+  if (out_command_id) *out_command_id = r.response.command_id();
+  return true;
+}
+
 bool SpotClient::GetNavigationFeedback(uint32_t command_id, int* out_status) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (command_id == 0 || !out_status) return false;
