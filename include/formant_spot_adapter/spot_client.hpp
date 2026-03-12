@@ -77,6 +77,8 @@ class SpotClient {
 
   struct RobotStateSnapshot {
     std::string motor_power_state;
+    std::string shore_power_state;
+    std::string behavior_state;
     bool any_estopped{false};
     bool has_battery_pct{false};
     double battery_pct{0.0};

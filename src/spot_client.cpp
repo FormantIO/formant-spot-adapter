@@ -37,6 +37,34 @@ std::string motor_power_state_to_string(::bosdyn::api::PowerState::MotorPowerSta
   }
 }
 
+std::string shore_power_state_to_string(::bosdyn::api::PowerState::ShorePowerState state) {
+  switch (state) {
+    case ::bosdyn::api::PowerState::SHORE_POWER_STATE_ON:
+      return "on";
+    case ::bosdyn::api::PowerState::SHORE_POWER_STATE_OFF:
+      return "off";
+    case ::bosdyn::api::PowerState::SHORE_POWER_STATE_UNKNOWN:
+    default:
+      return "unknown";
+  }
+}
+
+std::string behavior_state_to_string(::bosdyn::api::BehaviorState::State state) {
+  switch (state) {
+    case ::bosdyn::api::BehaviorState::STATE_NOT_READY:
+      return "not_ready";
+    case ::bosdyn::api::BehaviorState::STATE_TRANSITION:
+      return "transition";
+    case ::bosdyn::api::BehaviorState::STATE_STANDING:
+      return "standing";
+    case ::bosdyn::api::BehaviorState::STATE_STEPPING:
+      return "stepping";
+    case ::bosdyn::api::BehaviorState::STATE_UNKNOWN:
+    default:
+      return "unknown";
+  }
+}
+
 std::string system_severity_to_string(::bosdyn::api::SystemFault::Severity severity) {
   switch (severity) {
     case ::bosdyn::api::SystemFault::SEVERITY_INFO:
@@ -426,6 +454,8 @@ bool SpotClient::GetRobotStateSnapshot(RobotStateSnapshot* out_snapshot) {
 
   RobotStateSnapshot snap;
   snap.motor_power_state = motor_power_state_to_string(robot_state.power_state().motor_power_state());
+  snap.shore_power_state = shore_power_state_to_string(robot_state.power_state().shore_power_state());
+  snap.behavior_state = behavior_state_to_string(robot_state.behavior_state().state());
 
   for (const auto& estop : robot_state.estop_states()) {
     if (estop.state() == ::bosdyn::api::EStopState::STATE_ESTOPPED) {

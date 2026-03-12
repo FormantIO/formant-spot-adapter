@@ -87,6 +87,52 @@ std::string fault_list_to_json(const std::vector<SpotClient::FaultInfo>& faults)
   return oss.str();
 }
 
+std::string camera_calibration_status_to_string(int status) {
+  using Resp = ::bosdyn::api::spot::CameraCalibrationFeedbackResponse;
+  const auto enum_value = static_cast<Resp::Status>(status);
+  const std::string name = Resp::Status_Name(enum_value);
+  return name.empty() ? std::string("STATUS_UNKNOWN") : name;
+}
+
+std::string to_lower_copy(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  for (unsigned char ch : in) {
+    out.push_back(static_cast<char>(std::tolower(ch)));
+  }
+  return out;
+}
+
+bool is_camera_server_init_fault(const SpotClient::FaultInfo& fault) {
+  if (fault.id != "camera_server") return false;
+  const std::string msg = to_lower_copy(fault.message);
+  return msg.find("failed to initialize") != std::string::npos ||
+         msg.find("enumerated usb2") != std::string::npos ||
+         msg.find("not sending") != std::string::npos ||
+         msg.find("stopped responding") != std::string::npos;
+}
+
+std::vector<std::string> camera_calibration_preflight_errors(const SpotClient::RobotStateSnapshot& snap) {
+  std::vector<std::string> errors;
+  if (snap.any_estopped) {
+    errors.emplace_back("an E-Stop is asserted");
+  }
+  if (snap.motor_power_state != "on") {
+    errors.emplace_back("motor power is not on");
+  }
+  if (snap.behavior_state != "standing") {
+    errors.emplace_back("robot is not standing");
+  }
+  if (snap.shore_power_state == "on") {
+    errors.emplace_back("robot is on shore power/docked");
+  }
+  for (const auto& fault : snap.system_faults) {
+    if (!is_camera_server_init_fault(fault)) continue;
+    errors.emplace_back("camera_server fault: " + fault.message);
+  }
+  return errors;
+}
+
 bool fault_requires_soft_recovery(const SpotClient::FaultInfo& fault) {
   return fault.severity == "critical" || fault.severity == "unclearable";
 }
@@ -136,6 +182,8 @@ bool fault_event_key_order_less(const std::string& a, const std::string& b) {
 std::string robot_state_to_json(const SpotClient::RobotStateSnapshot& s) {
   std::ostringstream oss;
   oss << "{\"motor_power_state\":\"" << json_escape(s.motor_power_state)
+      << "\",\"shore_power_state\":\"" << json_escape(s.shore_power_state)
+      << "\",\"behavior_state\":\"" << json_escape(s.behavior_state)
       << "\",\"any_estopped\":" << (s.any_estopped ? "true" : "false")
       << ",\"has_battery_pct\":" << (s.has_battery_pct ? "true" : "false")
       << ",\"has_body_pitch_rad\":" << (s.has_body_pitch_rad ? "true" : "false");
@@ -1451,6 +1499,22 @@ void Adapter::CommandExecutionLoop() {
 }
 
 bool Adapter::ExecuteCameraCalibrateCommand() {
+  SpotClient::RobotStateSnapshot snap;
+  if (!spot_.GetRobotStateSnapshot(&snap)) {
+    EmitLog(std::string("[command] spot.camera.calibrate preflight failed: ") + spot_.LastError());
+    return false;
+  }
+  const auto preflight_errors = camera_calibration_preflight_errors(snap);
+  if (!preflight_errors.empty()) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < preflight_errors.size(); ++i) {
+      if (i > 0) oss << "; ";
+      oss << preflight_errors[i];
+    }
+    EmitLog("[command] spot.camera.calibrate rejected: " + oss.str());
+    return false;
+  }
+
   if (!EnsureLeaseForCommand("spot.camera.calibrate")) return false;
   EmitLog("[command] spot.camera.calibrate requested");
   if (!spot_.StartCameraCalibration()) {
@@ -1459,7 +1523,7 @@ bool Adapter::ExecuteCameraCalibrateCommand() {
   }
 
   // Wait for terminal camera calibration feedback (1 Hz poll).
-  const long long deadline_ms = now_ms() + 180000;
+  const long long deadline_ms = now_ms() + 1200000;
   while (running_.load()) {
     if (now_ms() > deadline_ms) {
       EmitLog("[command] spot.camera.calibrate failed: timeout");
@@ -1479,7 +1543,9 @@ bool Adapter::ExecuteCameraCalibrateCommand() {
       EmitLog("[command] spot.camera.calibrate success");
       return true;
     }
-    EmitLog("[command] spot.camera.calibrate failed status=" + std::to_string(status));
+    EmitLog("[command] spot.camera.calibrate failed status=" + std::to_string(status) +
+            " (" + camera_calibration_status_to_string(status) + ")" +
+            " progress=" + std::to_string(progress));
     return false;
   }
   return false;

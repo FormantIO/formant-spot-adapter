@@ -220,6 +220,34 @@ Optional frame:
 BASE_FRAME=vision ./scripts/arm_state.sh
 ```
 
+## Camera Calibration Utility
+
+Inspect camera-calibration readiness and feedback:
+
+```bash
+./scripts/camera_calibration.sh status
+```
+
+Start camera calibration with the official Spot SDK path:
+
+```bash
+./scripts/camera_calibration.sh start
+```
+
+Cancel a running camera calibration:
+
+```bash
+./scripts/camera_calibration.sh cancel
+```
+
+The utility refuses to start by default if the robot is docked/on shore power, not standing,
+or has active `camera_server` init faults such as `failed to initialize` / `enumerated USB2`.
+Use `--force` only if you have verified the robot is in the correct physical setup.
+
+The adapter command path now uses the same basic preflight logic for `spot.camera.calibrate`:
+it rejects calibration when Spot is docked/on shore power, not standing, motor power is off,
+an E-Stop is active, or `camera_server` still has active init faults.
+
 ## Notes
 
 - Formant agent target default is `localhost:5501`.
