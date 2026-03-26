@@ -244,6 +244,70 @@ bool encode_jpeg(const cv::Mat& image, std::string* out_bytes) {
   return true;
 }
 
+bool prepare_jpeg_frame(const std::string& input_bytes,
+                        bool rotate_180,
+                        bool normalize_jpeg,
+                        std::string* out_bytes) {
+  if (!out_bytes) return false;
+  if (input_bytes.empty()) {
+    out_bytes->clear();
+    return false;
+  }
+  if (!rotate_180 && !normalize_jpeg) {
+    *out_bytes = input_bytes;
+    return true;
+  }
+  std::vector<uchar> compressed(input_bytes.begin(), input_bytes.end());
+  cv::Mat decoded = cv::imdecode(compressed, cv::IMREAD_COLOR);
+  if (decoded.empty()) return false;
+  if (rotate_180) {
+    cv::Mat rotated;
+    cv::rotate(decoded, rotated, cv::ROTATE_180);
+    return encode_jpeg(rotated, out_bytes);
+  }
+  return encode_jpeg(decoded, out_bytes);
+}
+
+void publish_cached_image_loop(FormantAgentClient* agent,
+                               const std::atomic<bool>* running,
+                               std::mutex* latest_mu,
+                               std::shared_ptr<std::string>* latest_jpg,
+                               const std::string& stream,
+                               int output_period_ms,
+                               int post_timeout_ms) {
+  if (!agent || !running || !latest_mu || !latest_jpg) return;
+  int post_backoff_ms = 0;
+  long long next_post_allowed_ms = 0;
+  const size_t phase_hash = std::hash<std::string>{}(stream);
+  const int phase_offset_ms = output_period_ms > 1
+                                  ? static_cast<int>(phase_hash % static_cast<size_t>(output_period_ms))
+                                  : 0;
+  auto next_tick = std::chrono::steady_clock::now() + std::chrono::milliseconds(phase_offset_ms);
+  while (running->load()) {
+    std::this_thread::sleep_until(next_tick);
+    next_tick += std::chrono::milliseconds(output_period_ms);
+    std::shared_ptr<std::string> frame;
+    {
+      std::lock_guard<std::mutex> lk(*latest_mu);
+      frame = *latest_jpg;
+    }
+    if (frame && !frame->empty()) {
+      const long long now = now_ms();
+      if (now >= next_post_allowed_ms) {
+        const bool ok = agent->PostImage(stream, "image/jpeg", *frame, post_timeout_ms);
+        if (ok) {
+          post_backoff_ms = 0;
+          next_post_allowed_ms = 0;
+        } else {
+          post_backoff_ms =
+              std::min(2000, std::max(100, post_backoff_ms == 0 ? 100 : post_backoff_ms * 2));
+          next_post_allowed_ms = now + post_backoff_ms;
+        }
+      }
+    }
+  }
+}
+
 void set_identity_transform(v1::model::Transform* transform) {
   if (!transform) return;
   transform->mutable_translation()->set_x(0.0);
@@ -608,6 +672,11 @@ bool Adapter::Init() {
               << " data_poll_hz=" << std::max(1, cfg_.localization_image_poll_hz)
               << " sdk_poll_cap_hz=5" << std::endl;
   }
+  std::cerr << "[camera] surround stream config: output_fps=" << std::max(1, cfg_.surround_camera_fps)
+            << " data_poll_hz=" << std::max(1, cfg_.surround_camera_poll_hz)
+            << " right_rotate_180=" << (cfg_.right_camera_rotate_180 ? "true" : "false")
+            << " normalize_jpeg=true"
+            << std::endl;
 
   lease_owned_ = false;
   heartbeat_seen_ = false;
@@ -681,17 +750,23 @@ void Adapter::Run() {
       [this](const v1::agent::GetTeleopHeartbeatStreamResponse& hb) { HandleHeartbeat(hb); });
 
   camera_threads_.clear();
-  auto start_camera = [this](const std::string& source, const std::string& stream, int fps) {
+  auto start_camera = [this](const std::string& source, const std::string& stream, int output_fps,
+                             int poll_hz, bool rotate_180, bool normalize_jpeg,
+                             int post_timeout_ms) {
     if (source.empty() || stream.empty()) return;
-    camera_threads_.emplace_back(&Adapter::CameraLoop, this, source, stream, fps);
+    camera_threads_.emplace_back(&Adapter::CameraLoop, this, source, stream, output_fps, poll_hz,
+                                 rotate_180, normalize_jpeg, post_timeout_ms);
   };
   const int hand_fps = std::max(1, cfg_.camera_fps);
-  // Keep surround cameras at very low rate to avoid Formant stream throttling.
-  const int side_fps = 1;
-  start_camera(cfg_.camera_source, cfg_.camera_stream_name, hand_fps);
-  start_camera(cfg_.left_camera_source, cfg_.left_camera_stream_name, side_fps);
-  start_camera(cfg_.right_camera_source, cfg_.right_camera_stream_name, side_fps);
-  start_camera(cfg_.back_camera_source, cfg_.back_camera_stream_name, side_fps);
+  const int surround_output_fps = std::max(1, cfg_.surround_camera_fps);
+  const int surround_poll_hz = std::max(1, cfg_.surround_camera_poll_hz);
+  start_camera(cfg_.camera_source, cfg_.camera_stream_name, hand_fps, hand_fps, false, false, 75);
+  start_camera(cfg_.left_camera_source, cfg_.left_camera_stream_name, surround_output_fps,
+               surround_poll_hz, false, true, 250);
+  start_camera(cfg_.right_camera_source, cfg_.right_camera_stream_name, surround_output_fps,
+               surround_poll_hz, cfg_.right_camera_rotate_180, true, 250);
+  start_camera(cfg_.back_camera_source, cfg_.back_camera_stream_name, surround_output_fps,
+               surround_poll_hz, false, true, 250);
   if (!cfg_.localization_image_stream_name.empty()) {
     localization_image_thread_ = std::thread(&Adapter::LocalizationImageLoop, this,
                                              cfg_.localization_image_stream_name,
@@ -865,49 +940,19 @@ void Adapter::Stop() {
   agent_.StopLoops();
 }
 
-void Adapter::CameraLoop(const std::string& source, const std::string& stream, int fps) {
-  int period_ms = std::max(1, 1000 / std::max(1, fps));
+void Adapter::CameraLoop(const std::string& source, const std::string& stream, int output_fps,
+                         int poll_hz, bool rotate_180, bool normalize_jpeg,
+                         int post_timeout_ms) {
+  const int output_period_ms = std::max(1, 1000 / std::max(1, output_fps));
+  const int poll_period_ms = std::max(1, 1000 / std::max(1, poll_hz));
   long long last_error_log_ms = 0;
-  const bool is_primary_teleop_stream = (stream == cfg_.camera_stream_name);
-  if (!is_primary_teleop_stream) {
-    // Left/right/back cameras are intentionally capped to 0.2 Hz (one frame every 5s).
-    period_ms = std::max(period_ms, 5000);
-  }
-  int failure_backoff_ms = period_ms;
+  int failure_backoff_ms = poll_period_ms;
   std::mutex latest_mu;
-  std::condition_variable latest_cv;
-  std::string latest_jpg;
-  uint64_t latest_seq = 0;
-  uint64_t sent_seq = 0;
+  std::shared_ptr<std::string> latest_jpg;
 
-  std::thread sender([this, &latest_mu, &latest_cv, &latest_jpg, &latest_seq, &sent_seq, &stream]() {
-    int post_backoff_ms = 0;
-    long long next_post_allowed_ms = 0;
-    while (running_) {
-      std::string frame;
-      {
-        std::unique_lock<std::mutex> lk(latest_mu);
-        latest_cv.wait_for(lk, std::chrono::milliseconds(50), [&]() {
-          return !running_ || latest_seq != sent_seq;
-        });
-        if (!running_ && latest_seq == sent_seq) break;
-        if (latest_seq == sent_seq) continue;
-        frame = latest_jpg;
-        sent_seq = latest_seq;
-      }
-      if (!frame.empty()) {
-        const long long now = now_ms();
-        if (now < next_post_allowed_ms) continue;
-        const bool ok = agent_.PostImage(stream, "image/jpeg", frame);
-        if (ok) {
-          post_backoff_ms = 0;
-          next_post_allowed_ms = 0;
-        } else {
-          post_backoff_ms = std::min(2000, std::max(100, post_backoff_ms == 0 ? 100 : post_backoff_ms * 2));
-          next_post_allowed_ms = now + post_backoff_ms;
-        }
-      }
-    }
+  std::thread sender([this, &latest_mu, &latest_jpg, &stream, output_period_ms, post_timeout_ms]() {
+    publish_cached_image_loop(&agent_, &running_, &latest_mu, &latest_jpg, stream,
+                              output_period_ms, post_timeout_ms);
   });
 
   while (running_) {
@@ -921,13 +966,26 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
     }
     std::string jpg;
     if (spot_.GetImageJpeg(source, &jpg)) {
-      failure_backoff_ms = period_ms;
-      {
+      std::string prepared_jpg;
+      const bool frame_ready =
+          prepare_jpeg_frame(jpg, rotate_180, normalize_jpeg, &prepared_jpg);
+      if (frame_ready) {
+        failure_backoff_ms = poll_period_ms;
+        auto frame = std::make_shared<std::string>();
+        frame->swap(prepared_jpg);
         std::lock_guard<std::mutex> lk(latest_mu);
-        latest_jpg.swap(jpg);
-        ++latest_seq;
+        latest_jpg = std::move(frame);
+      } else {
+        const long long now = now_ms();
+        if ((now - last_error_log_ms) >= 2000) {
+          std::cerr << "[camera] failed source=" << source
+                    << " stream=" << stream
+                    << " error=failed to prepare jpeg frame" << std::endl;
+          last_error_log_ms = now;
+        }
+        failure_backoff_ms =
+            std::min(2000, std::max(poll_period_ms, failure_backoff_ms * 2));
       }
-      latest_cv.notify_one();
     } else {
       const long long now = now_ms();
       if ((now - last_error_log_ms) >= 2000) {
@@ -936,11 +994,16 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
                   << " error=" << spot_.LastError() << std::endl;
         last_error_log_ms = now;
       }
-      failure_backoff_ms = std::min(2000, std::max(period_ms, failure_backoff_ms * 2));
+      failure_backoff_ms = std::min(2000, std::max(poll_period_ms, failure_backoff_ms * 2));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(failure_backoff_ms));
+    const int step_ms = 50;
+    int slept_ms = 0;
+    while (running_ && slept_ms < failure_backoff_ms) {
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(std::min(step_ms, failure_backoff_ms - slept_ms)));
+      slept_ms += step_ms;
+    }
   }
-  latest_cv.notify_all();
   if (sender.joinable()) sender.join();
 }
 
@@ -1243,32 +1306,8 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
   }
 
   std::thread sender([this, &latest_mu, &latest_jpg, &stream, output_period_ms]() {
-    int post_backoff_ms = 0;
-    long long next_post_allowed_ms = 0;
-    auto next_tick = std::chrono::steady_clock::now();
-    while (running_) {
-      next_tick += std::chrono::milliseconds(output_period_ms);
-      std::shared_ptr<std::string> frame;
-      {
-        std::lock_guard<std::mutex> lk(latest_mu);
-        frame = latest_jpg;
-      }
-      if (frame && !frame->empty()) {
-        const long long now = now_ms();
-        if (now >= next_post_allowed_ms) {
-          const bool ok = agent_.PostImage(stream, "image/jpeg", *frame);
-          if (ok) {
-            post_backoff_ms = 0;
-            next_post_allowed_ms = 0;
-          } else {
-            post_backoff_ms =
-                std::min(2000, std::max(100, post_backoff_ms == 0 ? 100 : post_backoff_ms * 2));
-            next_post_allowed_ms = now + post_backoff_ms;
-          }
-        }
-      }
-      std::this_thread::sleep_until(next_tick);
-    }
+    publish_cached_image_loop(&agent_, &running_, &latest_mu, &latest_jpg, stream,
+                              output_period_ms, 250);
   });
 
   bool have_live_frame = false;

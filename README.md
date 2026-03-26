@@ -83,6 +83,9 @@ Additional control channels (not streams):
   changes, then republishes the cached JPEG at a stable output FPS. For camera-like playback in
   Formant, the `spot.localization.image` stream also needs Formant-side video encoding/realtime
   stream configuration; otherwise the agent treats it as a throttled telemetry image stream.
+- `spot.left.image`, `spot.right.image`, and `spot.back.image` use the same cached-frame publish
+  pattern: the adapter polls Spot at a lower configured rate, then republishes the latest JPEG at a
+  stable output FPS. The right camera is rotated 180 degrees by default.
 - If lease is already held, adapter attempts takeover (`TakeLease`) to recover from stale owners.
 - On teleop inactivity: sends zero velocity, stows arm, then returns lease unless GraphNav nav is active.
 - Heartbeat timeout behavior is zero-velocity only (no auto-sit).

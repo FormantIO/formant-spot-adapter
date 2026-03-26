@@ -31,7 +31,8 @@ void FormantAgentClient::SleepWithBackoff(int attempt) const {
   }
 }
 
-bool FormantAgentClient::PostImage(const std::string& stream, const std::string& content_type, const std::string& bytes) {
+bool FormantAgentClient::PostImage(const std::string& stream, const std::string& content_type,
+                                   const std::string& bytes, int timeout_ms) {
   v1::model::Datapoint dp;
   dp.set_stream(stream);
   dp.set_timestamp(NowMs());
@@ -39,13 +40,15 @@ bool FormantAgentClient::PostImage(const std::string& stream, const std::string&
   dp.mutable_image()->set_raw(bytes);
 
   grpc::ClientContext ctx;
-  // Keep image post deadline very short so stale teleop frames are dropped aggressively.
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(75));
+  const int clamped_timeout_ms = std::max(25, timeout_ms);
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::milliseconds(clamped_timeout_ms));
   v1::agent::PostDataResponse resp;
   auto s = stub_->PostData(&ctx, dp, &resp);
   if (!s.ok()) {
     std::cerr << "[formant] PostImage failed stream=" << stream
               << " target=" << target_
+              << " timeout_ms=" << clamped_timeout_ms
               << " grpc_code=" << static_cast<int>(s.error_code())
               << " msg=" << s.error_message() << std::endl;
   }

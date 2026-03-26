@@ -29,6 +29,16 @@ int getenv_int_or(const char* k, int d) {
   }
 }
 
+bool getenv_bool_or(const char* k, bool d) {
+  const char* v = std::getenv(k);
+  if (!v || !*v) return d;
+  std::string value(v);
+  for (char& ch : value) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
+  if (value == "0" || value == "false" || value == "no" || value == "off") return false;
+  return d;
+}
+
 double getenv_double_or(const char* k, double d) {
   const char* v = std::getenv(k);
   if (!v || !*v) return d;
@@ -77,6 +87,13 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   }
 
   if (j.has_camera_fps()) c->camera_fps = j.camera_fps().value();
+  if (j.has_surround_camera_fps()) c->surround_camera_fps = j.surround_camera_fps().value();
+  if (j.has_surround_camera_poll_hz()) {
+    c->surround_camera_poll_hz = j.surround_camera_poll_hz().value();
+  }
+  if (j.has_right_camera_rotate_180()) {
+    c->right_camera_rotate_180 = j.right_camera_rotate_180().value();
+  }
   if (j.has_localization_image_fps()) c->localization_image_fps = j.localization_image_fps().value();
   if (j.has_localization_image_poll_hz()) {
     c->localization_image_poll_hz = j.localization_image_poll_hz().value();
@@ -144,6 +161,11 @@ Config load_config_from_env() {
   c.back_camera_source = getenv_or("BACK_CAMERA_SOURCE", c.back_camera_source);
   c.back_camera_stream_name = getenv_or("BACK_CAMERA_STREAM_NAME", c.back_camera_stream_name);
   c.camera_fps = getenv_int_or("CAMERA_FPS", c.camera_fps);
+  c.surround_camera_fps = getenv_int_or("SURROUND_CAMERA_FPS", c.surround_camera_fps);
+  c.surround_camera_poll_hz =
+      getenv_int_or("SURROUND_CAMERA_POLL_HZ", c.surround_camera_poll_hz);
+  c.right_camera_rotate_180 =
+      getenv_bool_or("RIGHT_CAMERA_ROTATE_180", c.right_camera_rotate_180);
   c.localization_image_stream_name =
       getenv_or("LOCALIZATION_IMAGE_STREAM_NAME", c.localization_image_stream_name);
   c.localization_image_fps = getenv_int_or("LOCALIZATION_IMAGE_FPS", c.localization_image_fps);

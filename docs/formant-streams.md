@@ -63,12 +63,16 @@ Configure these streams in your Formant teleop view/device config.
 
 - `spot.left.image` (type: image/video)
 - Source camera: `left_fisheye_image` (default configurable)
+- Adapter republishes the latest cached JPEG at the configured surround-camera output FPS.
 
 - `spot.right.image` (type: image/video)
 - Source camera: `right_fisheye_image` (default configurable)
+- Adapter republishes the latest cached JPEG at the configured surround-camera output FPS.
+- Rotated 180 degrees by default to correct the current Spot right-camera orientation.
 
 - `spot.back.image` (type: image/video)
 - Source camera: `back_fisheye_image` (default configurable)
+- Adapter republishes the latest cached JPEG at the configured surround-camera output FPS.
 
 - `spot.status` (type: bitset, 0.2 Hz / every 5s)
 - Published keys:

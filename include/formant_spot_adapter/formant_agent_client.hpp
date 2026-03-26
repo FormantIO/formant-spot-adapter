@@ -20,7 +20,8 @@ class FormantAgentClient {
  public:
   explicit FormantAgentClient(const std::string& target);
 
-  bool PostImage(const std::string& stream, const std::string& content_type, const std::string& bytes);
+  bool PostImage(const std::string& stream, const std::string& content_type,
+                 const std::string& bytes, int timeout_ms = 75);
   bool PostNumeric(const std::string& stream, double value);
   bool PostText(const std::string& stream, const std::string& value);
   bool PostLocalization(const std::string& stream, const v1::model::Localization& localization);

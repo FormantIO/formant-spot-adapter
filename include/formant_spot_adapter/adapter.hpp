@@ -25,7 +25,8 @@ class Adapter {
   void Stop();
 
  private:
-  void CameraLoop(const std::string& source, const std::string& stream, int fps);
+  void CameraLoop(const std::string& source, const std::string& stream, int output_fps,
+                  int poll_hz, bool rotate_180, bool normalize_jpeg, int post_timeout_ms);
   void LocalizationImageLoop(const std::string& stream, int fps, int poll_hz);
   void LeaseRetainLoop();
   void HandleTeleop(const v1::model::ControlDatapoint& dp);

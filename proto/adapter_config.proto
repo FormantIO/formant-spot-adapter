@@ -60,4 +60,7 @@ message AdapterConfig {
   google.protobuf.StringValue localization_image_stream_name = 54;
   google.protobuf.Int32Value localization_image_fps = 55;
   google.protobuf.Int32Value localization_image_poll_hz = 56;
+  google.protobuf.Int32Value surround_camera_fps = 57;
+  google.protobuf.Int32Value surround_camera_poll_hz = 58;
+  google.protobuf.BoolValue right_camera_rotate_180 = 59;
 }
