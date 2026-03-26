@@ -268,42 +268,80 @@ bool prepare_jpeg_frame(const std::string& input_bytes,
   return encode_jpeg(decoded, out_bytes);
 }
 
+struct CachedImageState {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::shared_ptr<std::string> latest_jpg;
+  uint64_t version = 0;
+};
+
+void update_cached_image(CachedImageState* state, std::shared_ptr<std::string> frame) {
+  if (!state) return;
+  {
+    std::lock_guard<std::mutex> lk(state->mu);
+    state->latest_jpg = std::move(frame);
+    ++state->version;
+  }
+  state->cv.notify_one();
+}
+
 void publish_cached_image_loop(FormantAgentClient* agent,
                                const std::atomic<bool>* running,
-                               std::mutex* latest_mu,
-                               std::shared_ptr<std::string>* latest_jpg,
+                               CachedImageState* state,
                                const std::string& stream,
                                int output_period_ms,
                                int post_timeout_ms) {
-  if (!agent || !running || !latest_mu || !latest_jpg) return;
+  if (!agent || !running || !state) return;
   int post_backoff_ms = 0;
   long long next_post_allowed_ms = 0;
-  const size_t phase_hash = std::hash<std::string>{}(stream);
-  const int phase_offset_ms = output_period_ms > 1
-                                  ? static_cast<int>(phase_hash % static_cast<size_t>(output_period_ms))
-                                  : 0;
-  auto next_tick = std::chrono::steady_clock::now() + std::chrono::milliseconds(phase_offset_ms);
+  long long next_keepalive_ms = now_ms();
+  uint64_t last_published_version = 0;
   while (running->load()) {
-    std::this_thread::sleep_until(next_tick);
-    next_tick += std::chrono::milliseconds(output_period_ms);
     std::shared_ptr<std::string> frame;
+    uint64_t version = 0;
     {
-      std::lock_guard<std::mutex> lk(*latest_mu);
-      frame = *latest_jpg;
-    }
-    if (frame && !frame->empty()) {
-      const long long now = now_ms();
-      if (now >= next_post_allowed_ms) {
-        const bool ok = agent->PostImage(stream, "image/jpeg", *frame, post_timeout_ms);
-        if (ok) {
-          post_backoff_ms = 0;
-          next_post_allowed_ms = 0;
+      std::unique_lock<std::mutex> lk(state->mu);
+      for (;;) {
+        frame = state->latest_jpg;
+        version = state->version;
+        const long long now = now_ms();
+        const bool has_frame = frame && !frame->empty();
+        const bool has_new_frame = has_frame && version != last_published_version;
+        const bool can_post = now >= next_post_allowed_ms;
+        const bool keepalive_due = has_frame && now >= next_keepalive_ms;
+        if ((has_new_frame && can_post) || (keepalive_due && can_post)) break;
+        if (!running->load()) return;
+
+        long long wait_until_ms = 0;
+        if (has_new_frame && !can_post) {
+          wait_until_ms = next_post_allowed_ms;
+        } else if (has_frame) {
+          wait_until_ms = next_keepalive_ms;
+          if (!can_post) wait_until_ms = std::min(wait_until_ms, next_post_allowed_ms);
+        }
+
+        if (wait_until_ms > 0) {
+          const long long wait_ms = std::max<long long>(1, wait_until_ms - now);
+          state->cv.wait_for(lk, std::chrono::milliseconds(std::min<long long>(100, wait_ms)));
         } else {
-          post_backoff_ms =
-              std::min(2000, std::max(100, post_backoff_ms == 0 ? 100 : post_backoff_ms * 2));
-          next_post_allowed_ms = now + post_backoff_ms;
+          state->cv.wait_for(lk, std::chrono::milliseconds(100));
         }
       }
+    }
+
+    if (!frame || frame->empty()) continue;
+
+    const long long now = now_ms();
+    const bool ok = agent->PostImage(stream, "image/jpeg", *frame, post_timeout_ms);
+    if (ok) {
+      post_backoff_ms = 0;
+      next_post_allowed_ms = 0;
+      next_keepalive_ms = now + output_period_ms;
+      last_published_version = version;
+    } else {
+      post_backoff_ms =
+          std::min(2000, std::max(100, post_backoff_ms == 0 ? 100 : post_backoff_ms * 2));
+      next_post_allowed_ms = now + post_backoff_ms;
     }
   }
 }
@@ -947,11 +985,10 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
   const int poll_period_ms = std::max(1, 1000 / std::max(1, poll_hz));
   long long last_error_log_ms = 0;
   int failure_backoff_ms = poll_period_ms;
-  std::mutex latest_mu;
-  std::shared_ptr<std::string> latest_jpg;
+  CachedImageState cached_image;
 
-  std::thread sender([this, &latest_mu, &latest_jpg, &stream, output_period_ms, post_timeout_ms]() {
-    publish_cached_image_loop(&agent_, &running_, &latest_mu, &latest_jpg, stream,
+  std::thread sender([this, &cached_image, &stream, output_period_ms, post_timeout_ms]() {
+    publish_cached_image_loop(&agent_, &running_, &cached_image, stream,
                               output_period_ms, post_timeout_ms);
   });
 
@@ -973,8 +1010,7 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
         failure_backoff_ms = poll_period_ms;
         auto frame = std::make_shared<std::string>();
         frame->swap(prepared_jpg);
-        std::lock_guard<std::mutex> lk(latest_mu);
-        latest_jpg = std::move(frame);
+        update_cached_image(&cached_image, std::move(frame));
       } else {
         const long long now = now_ms();
         if ((now - last_error_log_ms) >= 2000) {
@@ -1010,8 +1046,7 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
 void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll_hz) {
   const int output_period_ms = std::max(1, 1000 / std::max(1, fps));
   const int poll_period_ms = std::max(200, 1000 / std::max(1, poll_hz));
-  std::mutex latest_mu;
-  std::shared_ptr<std::string> latest_jpg;
+  CachedImageState cached_image;
 
   auto build_frame = [fps, poll_hz](const SpotClient::LocalizationMapSnapshot* snapshot,
                                     const std::string& active_map_id,
@@ -1301,13 +1336,11 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
     auto initial = std::make_shared<std::string>();
     build_frame(nullptr, "", "", "Waiting for live localization",
                 "Waiting for the first GraphNav occupancy patch.", initial.get());
-    std::lock_guard<std::mutex> lk(latest_mu);
-    latest_jpg = std::move(initial);
+    update_cached_image(&cached_image, std::move(initial));
   }
 
-  std::thread sender([this, &latest_mu, &latest_jpg, &stream, output_period_ms]() {
-    publish_cached_image_loop(&agent_, &running_, &latest_mu, &latest_jpg, stream,
-                              output_period_ms, 250);
+  std::thread sender([this, &cached_image, &stream, output_period_ms]() {
+    publish_cached_image_loop(&agent_, &running_, &cached_image, stream, output_period_ms, 250);
   });
 
   bool have_live_frame = false;
@@ -1357,8 +1390,7 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
       auto rendered = std::make_shared<std::string>();
       if (build_frame(use_snapshot ? &snapshot : nullptr, active_map_id, waypoint_label,
                       status_title, status_detail, rendered.get())) {
-        std::lock_guard<std::mutex> lk(latest_mu);
-        latest_jpg = std::move(rendered);
+        update_cached_image(&cached_image, std::move(rendered));
       }
     }
 
