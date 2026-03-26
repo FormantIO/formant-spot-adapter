@@ -23,6 +23,7 @@ class FormantAgentClient {
   bool PostImage(const std::string& stream, const std::string& content_type, const std::string& bytes);
   bool PostNumeric(const std::string& stream, double value);
   bool PostText(const std::string& stream, const std::string& value);
+  bool PostLocalization(const std::string& stream, const v1::model::Localization& localization);
   bool PostBitset(const std::string& stream, const std::vector<std::pair<std::string, bool>>& bits);
   bool SendCommandResponse(const std::string& request_id, bool success);
 

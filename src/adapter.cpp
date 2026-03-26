@@ -73,6 +73,58 @@ std::string json_escape(const std::string& in) {
   return out;
 }
 
+constexpr char kGraphNavLocalizationVizStream[] = "spot.localization.graphnav";
+
+void set_identity_transform(v1::model::Transform* transform) {
+  if (!transform) return;
+  transform->mutable_translation()->set_x(0.0);
+  transform->mutable_translation()->set_y(0.0);
+  transform->mutable_translation()->set_z(0.0);
+  transform->mutable_rotation()->set_x(0.0);
+  transform->mutable_rotation()->set_y(0.0);
+  transform->mutable_rotation()->set_z(0.0);
+  transform->mutable_rotation()->set_w(1.0);
+}
+
+void set_transform_from_pose3d(const SpotClient::Pose3D& pose, v1::model::Transform* transform) {
+  if (!transform) return;
+  transform->mutable_translation()->set_x(pose.x);
+  transform->mutable_translation()->set_y(pose.y);
+  transform->mutable_translation()->set_z(pose.z);
+  transform->mutable_rotation()->set_x(pose.qx);
+  transform->mutable_rotation()->set_y(pose.qy);
+  transform->mutable_rotation()->set_z(pose.qz);
+  transform->mutable_rotation()->set_w(pose.qw);
+}
+
+v1::model::Localization build_formant_localization(
+    const SpotClient::LocalizationMapSnapshot& snapshot) {
+  v1::model::Localization localization;
+
+  auto* odometry = localization.mutable_odometry();
+  set_transform_from_pose3d(snapshot.seed_tform_body, odometry->mutable_pose());
+  set_identity_transform(odometry->mutable_world_to_local());
+  odometry->mutable_twist()->mutable_linear()->set_x(0.0);
+  odometry->mutable_twist()->mutable_linear()->set_y(0.0);
+  odometry->mutable_twist()->mutable_linear()->set_z(0.0);
+  odometry->mutable_twist()->mutable_angular()->set_x(0.0);
+  odometry->mutable_twist()->mutable_angular()->set_y(0.0);
+  odometry->mutable_twist()->mutable_angular()->set_z(0.0);
+
+  auto* map = localization.mutable_map();
+  map->set_uuid(snapshot.waypoint_id + ":" + snapshot.map.map_type);
+  map->set_resolution(snapshot.map.resolution_m);
+  map->set_width(static_cast<uint32_t>(snapshot.map.width));
+  map->set_height(static_cast<uint32_t>(snapshot.map.height));
+  set_identity_transform(map->mutable_origin());
+  set_transform_from_pose3d(snapshot.map.seed_tform_grid, map->mutable_world_to_local());
+  for (int32_t cell : snapshot.map.occupancy) {
+    map->mutable_occupancy_grid()->add_data(cell);
+  }
+
+  return localization;
+}
+
 std::string fault_list_to_json(const std::vector<SpotClient::FaultInfo>& faults) {
   std::ostringstream oss;
   oss << "{\"count\":" << faults.size() << ",\"faults\":[";
@@ -720,6 +772,7 @@ void Adapter::LeaseRetainLoop() {
   long long last_robot_diag_pub_ms = 0;
   long long last_map_progress_pub_ms = 0;
   long long last_localization_pub_ms = 0;
+  long long last_localization_viz_pub_ms = 0;
   while (running_) {
     const long long now = now_ms();
     MaybeRestoreActiveMap(now);
@@ -832,6 +885,18 @@ void Adapter::LeaseRetainLoop() {
           << ",\"error\":\"" << json_escape(error) << "\"}";
       QueueStatusText("spot.localization", oss.str());
       last_localization_pub_ms = now;
+    }
+
+    if ((now - last_localization_viz_pub_ms) >= periodic_publish_ms && SpotConnected()) {
+      SpotClient::LocalizationMapSnapshot localization_map;
+      if (spot_.GetLocalizationMapSnapshot(&localization_map) &&
+          localization_map.localized &&
+          localization_map.has_seed_tform_body &&
+          localization_map.has_map) {
+        (void)agent_.PostLocalization(kGraphNavLocalizationVizStream,
+                                      build_formant_localization(localization_map));
+      }
+      last_localization_viz_pub_ms = now;
     }
 
     PollCurrentWaypointAtStatus(now);

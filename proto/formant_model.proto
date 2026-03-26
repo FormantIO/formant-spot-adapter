@@ -15,9 +15,50 @@ message Vector3 {
   double z = 3;
 }
 
+message Quaternion {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double w = 4;
+}
+
+message Transform {
+  Vector3 translation = 1;
+  Quaternion rotation = 2;
+}
+
 message Twist {
   Vector3 linear = 1;
   Vector3 angular = 2;
+}
+
+message OccupancyGrid {
+  repeated int32 data = 1;
+}
+
+message Map {
+  double resolution = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  Transform origin = 4;
+  Transform world_to_local = 5;
+  oneof data {
+    OccupancyGrid occupancy_grid = 6;
+    string url = 7;
+    bytes raw = 8;
+  }
+  string uuid = 9;
+}
+
+message Odometry {
+  Transform pose = 1;
+  Twist twist = 2;
+  Transform world_to_local = 3;
+}
+
+message Localization {
+  Odometry odometry = 1;
+  Map map = 2;
 }
 
 message Image {
@@ -37,6 +78,8 @@ message Datapoint {
     Numeric numeric = 5;
     Bitset bitset = 7;
     Image image = 9;
+    Localization localization = 12;
+    Map map = 21;
   }
 }
 

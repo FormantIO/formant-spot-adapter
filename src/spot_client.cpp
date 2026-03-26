@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
+#include <cstring>
 #include <thread>
 #include <unordered_set>
 
@@ -117,6 +119,262 @@ std::string behavior_status_to_string(::bosdyn::api::BehaviorFault::Status statu
     default:
       return "unknown";
   }
+}
+
+std::string lowercase_ascii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return value;
+}
+
+void fill_pose3d(const ::bosdyn::api::SE3Pose& pose, SpotClient::Pose3D* out_pose) {
+  if (!out_pose) return;
+  out_pose->x = pose.position().x();
+  out_pose->y = pose.position().y();
+  out_pose->z = pose.position().z();
+  out_pose->qx = pose.rotation().x();
+  out_pose->qy = pose.rotation().y();
+  out_pose->qz = pose.rotation().z();
+  out_pose->qw = pose.rotation().w();
+}
+
+int local_grid_cell_width_bytes(::bosdyn::api::LocalGrid::CellFormat format) {
+  switch (format) {
+    case ::bosdyn::api::LocalGrid::CELL_FORMAT_FLOAT32:
+      return 4;
+    case ::bosdyn::api::LocalGrid::CELL_FORMAT_FLOAT64:
+      return 8;
+    case ::bosdyn::api::LocalGrid::CELL_FORMAT_INT8:
+    case ::bosdyn::api::LocalGrid::CELL_FORMAT_UINT8:
+      return 1;
+    case ::bosdyn::api::LocalGrid::CELL_FORMAT_INT16:
+    case ::bosdyn::api::LocalGrid::CELL_FORMAT_UINT16:
+      return 2;
+    case ::bosdyn::api::LocalGrid::CELL_FORMAT_UNKNOWN:
+    default:
+      return 0;
+  }
+}
+
+template <typename T>
+double read_local_grid_scalar(const std::string& bytes, size_t offset) {
+  T value{};
+  std::memcpy(&value, bytes.data() + offset, sizeof(T));
+  return static_cast<double>(value);
+}
+
+bool decode_local_grid_cells(const ::bosdyn::api::LocalGrid& grid,
+                             std::vector<double>* out_values,
+                             std::vector<uint8_t>* out_unknown_mask,
+                             std::string* out_error) {
+  if (!out_values || !out_unknown_mask) return false;
+  const int width = grid.extent().num_cells_x();
+  const int height = grid.extent().num_cells_y();
+  if (width <= 0 || height <= 0) {
+    if (out_error) *out_error = "local grid extent is empty";
+    return false;
+  }
+  const size_t cell_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+  const int cell_width = local_grid_cell_width_bytes(grid.cell_format());
+  if (cell_width <= 0) {
+    if (out_error) *out_error = "unsupported local grid cell format";
+    return false;
+  }
+  if ((grid.data().size() % cell_width) != 0) {
+    if (out_error) *out_error = "local grid byte payload is not aligned to cell width";
+    return false;
+  }
+
+  auto decode_scalar = [&grid](const std::string& bytes, size_t offset) -> double {
+    switch (grid.cell_format()) {
+      case ::bosdyn::api::LocalGrid::CELL_FORMAT_FLOAT32:
+        return read_local_grid_scalar<float>(bytes, offset);
+      case ::bosdyn::api::LocalGrid::CELL_FORMAT_FLOAT64:
+        return read_local_grid_scalar<double>(bytes, offset);
+      case ::bosdyn::api::LocalGrid::CELL_FORMAT_INT8:
+        return read_local_grid_scalar<int8_t>(bytes, offset);
+      case ::bosdyn::api::LocalGrid::CELL_FORMAT_UINT8:
+        return read_local_grid_scalar<uint8_t>(bytes, offset);
+      case ::bosdyn::api::LocalGrid::CELL_FORMAT_INT16:
+        return read_local_grid_scalar<int16_t>(bytes, offset);
+      case ::bosdyn::api::LocalGrid::CELL_FORMAT_UINT16:
+        return read_local_grid_scalar<uint16_t>(bytes, offset);
+      case ::bosdyn::api::LocalGrid::CELL_FORMAT_UNKNOWN:
+      default:
+        return 0.0;
+    }
+  };
+
+  std::vector<double> base_values;
+  base_values.reserve(grid.data().size() / static_cast<size_t>(cell_width));
+  for (size_t offset = 0; offset < grid.data().size(); offset += static_cast<size_t>(cell_width)) {
+    base_values.push_back(decode_scalar(grid.data(), offset));
+  }
+
+  const double scale = (grid.cell_value_scale() == 0.0) ? 1.0 : grid.cell_value_scale();
+  const double offset = grid.cell_value_offset();
+  auto apply_scale_and_offset = [scale, offset](double raw_value) {
+    return raw_value * scale + offset;
+  };
+
+  std::vector<double> decoded_values;
+  decoded_values.reserve(cell_count);
+  if (grid.encoding() == ::bosdyn::api::LocalGrid::ENCODING_RAW) {
+    if (base_values.size() < cell_count) {
+      if (out_error) *out_error = "local grid payload is shorter than declared extent";
+      return false;
+    }
+    for (size_t i = 0; i < cell_count; ++i) {
+      decoded_values.push_back(apply_scale_and_offset(base_values[i]));
+    }
+  } else if (grid.encoding() == ::bosdyn::api::LocalGrid::ENCODING_RLE) {
+    if (base_values.size() != static_cast<size_t>(grid.rle_counts_size())) {
+      if (out_error) *out_error = "local grid RLE counts do not match encoded value count";
+      return false;
+    }
+    for (size_t i = 0; i < base_values.size(); ++i) {
+      const int repeat = grid.rle_counts(static_cast<int>(i));
+      if (repeat < 0) {
+        if (out_error) *out_error = "local grid RLE count is negative";
+        return false;
+      }
+      for (int j = 0; j < repeat; ++j) {
+        decoded_values.push_back(apply_scale_and_offset(base_values[i]));
+      }
+    }
+    if (decoded_values.size() != cell_count) {
+      if (out_error) *out_error = "local grid RLE expansion did not match declared extent";
+      return false;
+    }
+  } else {
+    if (out_error) *out_error = "unsupported local grid encoding";
+    return false;
+  }
+
+  std::vector<uint8_t> unknown_mask(cell_count, 0);
+  if (!grid.unknown_cells().empty()) {
+    if (grid.unknown_cells().size() < static_cast<int>(cell_count)) {
+      if (out_error) *out_error = "local grid unknown mask is shorter than declared extent";
+      return false;
+    }
+    for (size_t i = 0; i < cell_count; ++i) {
+      unknown_mask[i] = static_cast<uint8_t>(grid.unknown_cells()[static_cast<int>(i)] != 0);
+    }
+  }
+
+  *out_values = std::move(decoded_values);
+  *out_unknown_mask = std::move(unknown_mask);
+  return true;
+}
+
+bool local_grid_has_matching_layout(const ::bosdyn::api::LocalGrid& a,
+                                    const ::bosdyn::api::LocalGrid& b) {
+  return a.extent().num_cells_x() == b.extent().num_cells_x() &&
+         a.extent().num_cells_y() == b.extent().num_cells_y() &&
+         std::fabs(a.extent().cell_size() - b.extent().cell_size()) < 1e-9;
+}
+
+bool build_occupancy_grid_from_live_data(
+    const ::bosdyn::api::graph_nav::Localization& localization,
+    const google::protobuf::RepeatedPtrField<::bosdyn::api::LocalGrid>& local_grids,
+    SpotClient::OccupancyGridMapSnapshot* out_map,
+    std::string* out_error) {
+  if (!out_map) return false;
+  if (!localization.has_seed_tform_body()) {
+    if (out_error) *out_error = "localization missing seed_tform_body";
+    return false;
+  }
+
+  const ::bosdyn::api::LocalGrid* no_step_grid = nullptr;
+  const ::bosdyn::api::LocalGrid* obstacle_distance_grid = nullptr;
+  const ::bosdyn::api::LocalGrid* terrain_valid_grid = nullptr;
+  const ::bosdyn::api::LocalGrid* terrain_grid = nullptr;
+  for (const auto& grid : local_grids) {
+    const std::string label = lowercase_ascii(grid.local_grid_type_name() + " " +
+                                              grid.frame_name_local_grid_data());
+    if (!no_step_grid && label.find("no_step") != std::string::npos) {
+      no_step_grid = &grid;
+    } else if (!obstacle_distance_grid &&
+               label.find("obstacle_distance") != std::string::npos) {
+      obstacle_distance_grid = &grid;
+    } else if (!terrain_valid_grid &&
+               label.find("terrain_valid") != std::string::npos) {
+      terrain_valid_grid = &grid;
+    } else if (!terrain_grid && label.find("terrain") != std::string::npos &&
+               label.find("terrain_valid") == std::string::npos &&
+               label.find("terrain_intensity") == std::string::npos) {
+      terrain_grid = &grid;
+    }
+  }
+
+  const ::bosdyn::api::LocalGrid* primary_grid = no_step_grid;
+  if (!primary_grid) primary_grid = obstacle_distance_grid;
+  if (!primary_grid) primary_grid = terrain_valid_grid;
+  if (!primary_grid) primary_grid = terrain_grid;
+  if (!primary_grid) {
+    if (out_error) *out_error = "no supported local grid was returned";
+    return false;
+  }
+
+  std::vector<double> primary_values;
+  std::vector<uint8_t> primary_unknown;
+  if (!decode_local_grid_cells(*primary_grid, &primary_values, &primary_unknown, out_error)) {
+    return false;
+  }
+
+  std::vector<double> valid_values;
+  std::vector<uint8_t> valid_unknown;
+  const bool have_valid_grid = terrain_valid_grid != nullptr &&
+                               local_grid_has_matching_layout(*primary_grid, *terrain_valid_grid) &&
+                               decode_local_grid_cells(*terrain_valid_grid, &valid_values,
+                                                       &valid_unknown, out_error);
+
+  const size_t cell_count = primary_values.size();
+  std::vector<int32_t> occupancy(cell_count, -1);
+  const bool use_no_step = primary_grid == no_step_grid;
+  const bool use_obstacle_distance = primary_grid == obstacle_distance_grid;
+  for (size_t i = 0; i < cell_count; ++i) {
+    bool unknown = primary_unknown[i] != 0;
+    if (have_valid_grid && !unknown) {
+      if (valid_unknown[i] != 0 || valid_values[i] <= 0.0) unknown = true;
+    }
+    if (unknown) {
+      occupancy[i] = -1;
+      continue;
+    }
+    if (use_no_step) {
+      occupancy[i] = primary_values[i] > 0.0 ? 100 : 0;
+    } else if (use_obstacle_distance) {
+      occupancy[i] = primary_values[i] <= 0.0 ? 100 : 0;
+    } else {
+      occupancy[i] = 0;
+    }
+  }
+
+  ::bosdyn::api::SE3Pose body_tform_grid;
+  if (!::bosdyn::api::get_a_tform_b(primary_grid->transforms_snapshot(),
+                                    ::bosdyn::api::kBodyFrame,
+                                    primary_grid->frame_name_local_grid_data(),
+                                    &body_tform_grid)) {
+    if (out_error) {
+      *out_error = "failed to resolve body->local_grid transform for frame '" +
+                   primary_grid->frame_name_local_grid_data() + "'";
+    }
+    return false;
+  }
+
+  SpotClient::OccupancyGridMapSnapshot map_snapshot;
+  map_snapshot.map_type = primary_grid->local_grid_type_name().empty()
+                              ? primary_grid->frame_name_local_grid_data()
+                              : primary_grid->local_grid_type_name();
+  map_snapshot.resolution_m = primary_grid->extent().cell_size();
+  map_snapshot.width = primary_grid->extent().num_cells_x();
+  map_snapshot.height = primary_grid->extent().num_cells_y();
+  fill_pose3d(localization.seed_tform_body() * body_tform_grid,
+              &map_snapshot.seed_tform_grid);
+  map_snapshot.occupancy = std::move(occupancy);
+  *out_map = std::move(map_snapshot);
+  return true;
 }
 
 }  // namespace
@@ -933,6 +1191,57 @@ bool SpotClient::GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot) {
     snapshot.waypoint_tform_body_y = localization.waypoint_tform_body().position().y();
     snapshot.waypoint_tform_body_z = localization.waypoint_tform_body().position().z();
   }
+  if (localization.has_seed_tform_body()) {
+    snapshot.has_seed_tform_body = true;
+    snapshot.seed_tform_body_x = localization.seed_tform_body().position().x();
+    snapshot.seed_tform_body_y = localization.seed_tform_body().position().y();
+    snapshot.seed_tform_body_z = localization.seed_tform_body().position().z();
+    snapshot.seed_tform_body_qx = localization.seed_tform_body().rotation().x();
+    snapshot.seed_tform_body_qy = localization.seed_tform_body().rotation().y();
+    snapshot.seed_tform_body_qz = localization.seed_tform_body().rotation().z();
+    snapshot.seed_tform_body_qw = localization.seed_tform_body().rotation().w();
+  }
+  *out_snapshot = std::move(snapshot);
+  return true;
+}
+
+bool SpotClient::GetLocalizationMapSnapshot(LocalizationMapSnapshot* out_snapshot) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!out_snapshot) return false;
+  if (!EnsureGraphNavClient()) return false;
+
+  ::bosdyn::api::graph_nav::GetLocalizationStateRequest req;
+  req.set_request_live_terrain_maps(true);
+  auto r = graph_nav_client_->GetLocalizationState(req);
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+
+  const auto& localization = r.response.localization();
+  if (localization.waypoint_id().empty()) {
+    SetLastError("GetLocalizationState returned empty waypoint_id");
+    return false;
+  }
+
+  LocalizationMapSnapshot snapshot;
+  snapshot.localized = true;
+  snapshot.waypoint_id = localization.waypoint_id();
+  if (localization.has_waypoint_tform_body()) {
+    snapshot.has_waypoint_tform_body = true;
+    fill_pose3d(localization.waypoint_tform_body(), &snapshot.waypoint_tform_body);
+  }
+  if (localization.has_seed_tform_body()) {
+    snapshot.has_seed_tform_body = true;
+    fill_pose3d(localization.seed_tform_body(), &snapshot.seed_tform_body);
+  }
+
+  std::string map_error;
+  if (build_occupancy_grid_from_live_data(localization, r.response.live_data().robot_local_grids(),
+                                          &snapshot.map, &map_error)) {
+    snapshot.has_map = true;
+  }
+
   *out_snapshot = std::move(snapshot);
   return true;
 }

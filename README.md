@@ -48,6 +48,7 @@ Additional control channels (not streams):
 | `spot.status` | Bitset | `Has lease`, `Robot available`, `Robot degraded`, `Teleop running`, `Teleop active`, `Docking` |
 | `spot.connection` | Text (JSON) | Spot connection health (`state`, `connected`, `degraded_non_estop`, `degraded_reason`, reconnect/attempt timestamps, last error) |
 | `spot.localization` | Text (JSON) | GraphNav localization status (`localized`, `waypoint_id`, `error`) |
+| `spot.localization.graphnav` | Localization | Formant typed localization stream with a live occupancy-grid patch in the GraphNav seed frame; intended for the Formant localization viewer |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |
 | `spot.waypoints` | Text | Newline-separated waypoint names for the active map |
@@ -72,6 +73,10 @@ Additional control channels (not streams):
 - While Spot is unavailable, robot actions are rejected and availability is published on `spot.connection`.
 - Adapter applies soft non-E-Stop recovery gating: teleop motion/dock commands are blocked only for critical/unclearable robot faults or motor power error.
 - For GraphNav nav commands, adapter prechecks localization and attempts fiducial relocalization before failing.
+- `spot.localization.graphnav` is a live local terrain/occupancy patch around the robot, not a
+  stitched full-site map. See
+  [`docs/formant-localization-map-analysis.md`](/home/walter/shin-spot-adapter/docs/formant-localization-map-analysis.md)
+  for the implementation notes and next steps.
 - If lease is already held, adapter attempts takeover (`TakeLease`) to recover from stale owners.
 - On teleop inactivity: sends zero velocity, stows arm, then returns lease unless GraphNav nav is active.
 - Heartbeat timeout behavior is zero-velocity only (no auto-sit).

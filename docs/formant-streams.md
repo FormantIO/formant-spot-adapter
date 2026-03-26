@@ -88,6 +88,12 @@ Configure these streams in your Formant teleop view/device config.
 - GraphNav localization status.
 - Fields: `localized`, `waypoint_id`, `error`.
 
+- `spot.localization.graphnav` (type: localization, 0.2 Hz / every 5s)
+- Typed Formant localization stream for the 3D/localization viewer.
+- Publishes GraphNav `seed_tform_body` plus a live occupancy-grid patch derived from
+  Spot live terrain maps.
+- Current implementation is a local patch around the robot, not a stitched global map.
+
 - `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
 - Key: `Can dock` (boolean)
 - Indicates whether robot is currently in a dockable state for the resolved dock ID.

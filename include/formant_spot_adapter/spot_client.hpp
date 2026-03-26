@@ -96,6 +96,44 @@ class SpotClient {
     double waypoint_tform_body_x{0.0};
     double waypoint_tform_body_y{0.0};
     double waypoint_tform_body_z{0.0};
+    bool has_seed_tform_body{false};
+    double seed_tform_body_x{0.0};
+    double seed_tform_body_y{0.0};
+    double seed_tform_body_z{0.0};
+    double seed_tform_body_qx{0.0};
+    double seed_tform_body_qy{0.0};
+    double seed_tform_body_qz{0.0};
+    double seed_tform_body_qw{1.0};
+  };
+
+  struct Pose3D {
+    double x{0.0};
+    double y{0.0};
+    double z{0.0};
+    double qx{0.0};
+    double qy{0.0};
+    double qz{0.0};
+    double qw{1.0};
+  };
+
+  struct OccupancyGridMapSnapshot {
+    std::string map_type;
+    double resolution_m{0.0};
+    int width{0};
+    int height{0};
+    Pose3D seed_tform_grid;
+    std::vector<int32_t> occupancy;
+  };
+
+  struct LocalizationMapSnapshot {
+    bool localized{false};
+    std::string waypoint_id;
+    bool has_waypoint_tform_body{false};
+    Pose3D waypoint_tform_body;
+    bool has_seed_tform_body{false};
+    Pose3D seed_tform_body;
+    bool has_map{false};
+    OccupancyGridMapSnapshot map;
   };
 
   SpotClient() = default;
@@ -136,6 +174,7 @@ class SpotClient {
   bool SetLocalizationFiducial();
   bool GetLocalizationWaypointId(std::string* out_waypoint_id);
   bool GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot);
+  bool GetLocalizationMapSnapshot(LocalizationMapSnapshot* out_snapshot);
   bool NavigateToWaypoint(const std::string& waypoint_id, int command_timeout_sec,
                           uint32_t* out_command_id = nullptr);
   bool NavigateToWaypointStraight(const std::string& waypoint_id, int command_timeout_sec,

@@ -92,6 +92,27 @@ bool FormantAgentClient::PostText(const std::string& stream, const std::string& 
   return s.ok();
 }
 
+bool FormantAgentClient::PostLocalization(const std::string& stream,
+                                          const v1::model::Localization& localization) {
+  std::lock_guard<std::mutex> lk(post_mu_);
+  v1::model::Datapoint dp;
+  dp.set_stream(stream);
+  dp.set_timestamp(NowMs());
+  *dp.mutable_localization() = localization;
+
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(1000));
+  v1::agent::PostDataResponse resp;
+  auto s = stub_->PostData(&ctx, dp, &resp);
+  if (!s.ok()) {
+    std::cerr << "[formant] PostLocalization failed stream=" << stream
+              << " target=" << target_
+              << " grpc_code=" << static_cast<int>(s.error_code())
+              << " msg=" << s.error_message() << std::endl;
+  }
+  return s.ok();
+}
+
 bool FormantAgentClient::PostBitset(const std::string& stream, const std::vector<std::pair<std::string, bool>>& bits) {
   std::lock_guard<std::mutex> lk(post_mu_);
   v1::model::Datapoint dp;

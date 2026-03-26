@@ -55,6 +55,7 @@ All commands are namespaced `spot.*`.
 - `spot.map.progress.waypoints` (numeric)
 - `spot.map.progress.path_length_m` (numeric)
 - `spot.map.progress.fiducials` (numeric)
+- `spot.localization.graphnav` (typed Formant localization stream with live occupancy grid)
 - `spot.nav.feedback` (json text with GraphNav navigation feedback state)
 - `spot.robot_state.body_pitch_rad` (numeric)
 
