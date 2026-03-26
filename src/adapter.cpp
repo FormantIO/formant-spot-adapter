@@ -83,9 +83,6 @@ constexpr char kGraphNavLocalizationVizStream[] = "spot.localization.graphnav";
 
 constexpr int kLocalizationImageWidth = 1280;
 constexpr int kLocalizationImageHeight = 720;
-constexpr int kLocalizationImageOuterPadding = 16;
-constexpr int kLocalizationImagePanelGap = 16;
-constexpr double kPi = 3.14159265358979323846;
 
 struct Quaterniond {
   double x{0.0};
@@ -215,24 +212,6 @@ void fill_rect_alpha(cv::Mat* image, const cv::Rect& rect, const cv::Scalar& col
   cv::Mat roi = (*image)(bounded);
   cv::Mat overlay(roi.size(), roi.type(), color);
   cv::addWeighted(overlay, alpha, roi, 1.0 - alpha, 0.0, roi);
-}
-
-void draw_chip(cv::Mat* image,
-               const cv::Point& origin,
-               const std::string& text,
-               const cv::Scalar& bg,
-               const cv::Scalar& fg) {
-  if (!image || text.empty()) return;
-  int baseline = 0;
-  const double font_scale = 0.55;
-  const int thickness = 1;
-  const cv::Size text_size =
-      cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, font_scale, thickness, &baseline);
-  const cv::Rect rect(origin.x, origin.y, text_size.width + 18, text_size.height + 14);
-  fill_rect_alpha(image, rect, bg, 0.96);
-  cv::rectangle(*image, rect, bg, 1, cv::LINE_AA);
-  cv::putText(*image, text, cv::Point(rect.x + 9, rect.y + rect.height - 6),
-              cv::FONT_HERSHEY_SIMPLEX, font_scale, fg, thickness, cv::LINE_AA);
 }
 
 bool encode_jpeg(const cv::Mat& image, std::string* out_bytes) {
@@ -1048,71 +1027,37 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
   const int poll_period_ms = std::max(200, 1000 / std::max(1, poll_hz));
   CachedImageState cached_image;
 
-  auto build_frame = [fps, poll_hz](const SpotClient::LocalizationMapSnapshot* snapshot,
-                                    const std::string& active_map_id,
-                                    const std::string& waypoint_label,
-                                    const std::string& status_title,
-                                    const std::string& status_detail,
-                                    std::string* out_jpg) -> bool {
+  auto build_frame = [](const SpotClient::LocalizationMapSnapshot* snapshot,
+                        const std::string& status_title,
+                        const std::string& status_detail,
+                        std::string* out_jpg) -> bool {
     if (!out_jpg) return false;
 
-    const cv::Scalar canvas_bg(20, 18, 16);
-    const cv::Scalar panel_bg(31, 34, 40);
-    const cv::Scalar panel_border(62, 70, 82);
-    const cv::Scalar text_primary(236, 238, 242);
-    const cv::Scalar text_secondary(168, 176, 188);
-    const cv::Scalar accent_cyan(232, 196, 77);
-    const cv::Scalar accent_green(109, 201, 77);
-    const cv::Scalar accent_orange(77, 164, 255);
-    const cv::Scalar map_unknown(45, 44, 42);
-    const cv::Scalar map_free(92, 100, 110);
-    const cv::Scalar map_occupied(58, 142, 244);
-    const cv::Scalar robot_fill(202, 240, 255);
-    const cv::Scalar robot_outline(255, 255, 255);
-
-    cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, canvas_bg);
-    const int left_panel_width = 784;
-    const int right_panel_width =
-        kLocalizationImageWidth - left_panel_width - (2 * kLocalizationImageOuterPadding) -
-        kLocalizationImagePanelGap;
-    const cv::Rect left_panel(kLocalizationImageOuterPadding, kLocalizationImageOuterPadding,
-                              left_panel_width,
-                              kLocalizationImageHeight - (2 * kLocalizationImageOuterPadding));
-    const cv::Rect right_panel(left_panel.x + left_panel.width + kLocalizationImagePanelGap,
-                               kLocalizationImageOuterPadding, right_panel_width,
-                               left_panel.height);
-    fill_rect_alpha(&canvas, left_panel, panel_bg, 0.96);
-    fill_rect_alpha(&canvas, right_panel, panel_bg, 0.96);
-    cv::rectangle(canvas, left_panel, panel_border, 1, cv::LINE_AA);
-    cv::rectangle(canvas, right_panel, panel_border, 1, cv::LINE_AA);
-
-    const cv::Rect map_view(left_panel.x + 24, left_panel.y + 24, left_panel.width - 48,
-                            left_panel.height - 48);
-    fill_rect_alpha(&canvas, map_view, cv::Scalar(18, 22, 26), 1.0);
-    cv::rectangle(canvas, map_view, cv::Scalar(50, 58, 68), 1, cv::LINE_AA);
+    const cv::Scalar canvas_bg(16, 24, 34);
+    const cv::Scalar grid_minor(34, 47, 62);
+    const cv::Scalar grid_major(46, 64, 84);
+    const cv::Scalar text_primary(236, 240, 245);
+    const cv::Scalar text_secondary(154, 172, 190);
+    const cv::Scalar map_unknown(24, 33, 44);
+    const cv::Scalar map_free(73, 88, 105);
+    const cv::Scalar map_occupied(176, 193, 208);
+    const cv::Scalar map_occupied_edge(222, 232, 240);
+    const cv::Scalar waypoint_blue(224, 164, 72);
+    const cv::Scalar robot_fill(48, 190, 245);
+    const cv::Scalar robot_outline(18, 25, 34);
 
     const bool has_live_map = snapshot && snapshot->localized && snapshot->has_seed_tform_body &&
                               snapshot->has_map && snapshot->map.width > 0 &&
                               snapshot->map.height > 0 && snapshot->map.resolution_m > 0.0;
 
-    double span_x_m = 0.0;
-    double span_y_m = 0.0;
-    double yaw_deg = 0.0;
-    std::string display_waypoint = waypoint_label;
-
+    cv::Mat canvas;
     if (has_live_map) {
       const int grid_width = snapshot->map.width;
       const int grid_height = snapshot->map.height;
-      const int scale_px =
-          std::max(1, std::min(map_view.width / std::max(1, grid_width),
-                               map_view.height / std::max(1, grid_height)));
-      const int scaled_width = grid_width * scale_px;
-      const int scaled_height = grid_height * scale_px;
-      const cv::Rect draw_rect(map_view.x + (map_view.width - scaled_width) / 2,
-                               map_view.y + (map_view.height - scaled_height) / 2, scaled_width,
-                               scaled_height);
+      canvas = cv::Mat(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, map_unknown);
 
       cv::Mat grid_image(grid_height, grid_width, CV_8UC3, map_unknown);
+      cv::Mat occupied_mask(grid_height, grid_width, CV_8UC1, cv::Scalar(0));
       for (int y = 0; y < grid_height; ++y) {
         for (int x = 0; x < grid_width; ++x) {
           const size_t idx = static_cast<size_t>(x) +
@@ -1128,6 +1073,7 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
             *px = cv::Vec3b(static_cast<uchar>(map_occupied[0]),
                             static_cast<uchar>(map_occupied[1]),
                             static_cast<uchar>(map_occupied[2]));
+            occupied_mask.at<uchar>(draw_y, x) = 255;
           } else {
             *px = cv::Vec3b(static_cast<uchar>(map_free[0]),
                             static_cast<uchar>(map_free[1]),
@@ -1136,34 +1082,86 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
         }
       }
 
-      cv::Mat scaled_grid;
-      cv::resize(grid_image, scaled_grid, cv::Size(scaled_width, scaled_height), 0.0, 0.0,
-                 cv::INTER_NEAREST);
-      if (scale_px >= 3) {
-        const cv::Scalar grid_line(74, 80, 88);
-        for (int x = 0; x <= grid_width; x += 10) {
-          const int line_x = std::min(scaled_width - 1, x * scale_px);
-          cv::line(scaled_grid, cv::Point(line_x, 0), cv::Point(line_x, scaled_height - 1),
-                   grid_line, 1, cv::LINE_8);
-        }
-        for (int y = 0; y <= grid_height; y += 10) {
-          const int line_y = std::min(scaled_height - 1, y * scale_px);
-          cv::line(scaled_grid, cv::Point(0, line_y), cv::Point(scaled_width - 1, line_y),
-                   grid_line, 1, cv::LINE_8);
-        }
-      }
-      scaled_grid.copyTo(canvas(draw_rect));
-
       const SpotClient::Pose3D grid_tform_body =
           compose_pose(inverse_pose(snapshot->map.seed_tform_grid), snapshot->seed_tform_body);
       const double yaw_rad = quaternion_yaw_rad(pose_quaternion(grid_tform_body));
-      yaw_deg = yaw_rad * 180.0 / kPi;
+      const double body_grid_x = grid_tform_body.x / snapshot->map.resolution_m;
+      const double body_grid_y_img =
+          static_cast<double>(grid_height) - (grid_tform_body.y / snapshot->map.resolution_m);
+
+      const double output_aspect =
+          static_cast<double>(kLocalizationImageWidth) / static_cast<double>(kLocalizationImageHeight);
+      double crop_width = static_cast<double>(grid_width);
+      double crop_height = static_cast<double>(grid_height);
+      if ((crop_width / crop_height) > output_aspect) {
+        crop_width = crop_height * output_aspect;
+      } else {
+        crop_height = crop_width / output_aspect;
+      }
+      crop_width = std::max(1.0, std::min(crop_width, static_cast<double>(grid_width)));
+      crop_height = std::max(1.0, std::min(crop_height, static_cast<double>(grid_height)));
+
+      double crop_x = body_grid_x - (crop_width / 2.0);
+      double crop_y = body_grid_y_img - (crop_height / 2.0);
+      crop_x = std::max(0.0, std::min(crop_x, static_cast<double>(grid_width) - crop_width));
+      crop_y = std::max(0.0, std::min(crop_y, static_cast<double>(grid_height) - crop_height));
+
+      const int crop_x0 = std::max(0, std::min(grid_width - 1, static_cast<int>(std::floor(crop_x))));
+      const int crop_y0 = std::max(0, std::min(grid_height - 1, static_cast<int>(std::floor(crop_y))));
+      const int crop_x1 = std::max(crop_x0 + 1,
+                                   std::min(grid_width, static_cast<int>(std::ceil(crop_x + crop_width))));
+      const int crop_y1 = std::max(crop_y0 + 1,
+                                   std::min(grid_height, static_cast<int>(std::ceil(crop_y + crop_height))));
+      const cv::Rect crop_rect(crop_x0, crop_y0, crop_x1 - crop_x0, crop_y1 - crop_y0);
+
+      const double x_scale = static_cast<double>(canvas.cols) / std::max(1, crop_rect.width);
+      const double y_scale = static_cast<double>(canvas.rows) / std::max(1, crop_rect.height);
+
+      cv::Mat cropped_grid = grid_image(crop_rect);
+      cv::Mat scaled_grid;
+      cv::resize(cropped_grid, scaled_grid, canvas.size(), 0.0, 0.0, cv::INTER_NEAREST);
+      if (std::min(x_scale, y_scale) >= 3.0) {
+        const cv::Scalar grid_line(74, 80, 88);
+        const int start_grid_x = std::max(0, static_cast<int>(std::floor(crop_x / 10.0)) * 10);
+        const int end_grid_x = std::min(grid_width, static_cast<int>(std::ceil((crop_x + crop_width) / 10.0)) * 10);
+        for (int x = start_grid_x; x <= end_grid_x; x += 10) {
+          const int line_x = std::min(canvas.cols - 1, std::max(0, cvRound((x - crop_x) * x_scale)));
+          cv::line(scaled_grid, cv::Point(line_x, 0), cv::Point(line_x, canvas.rows - 1), grid_line,
+                   1, cv::LINE_8);
+        }
+        const int start_grid_y = std::max(0, static_cast<int>(std::floor(crop_y / 10.0)) * 10);
+        const int end_grid_y =
+            std::min(grid_height, static_cast<int>(std::ceil((crop_y + crop_height) / 10.0)) * 10);
+        for (int y = start_grid_y; y <= end_grid_y; y += 10) {
+          const int line_y = std::min(canvas.rows - 1, std::max(0, cvRound((y - crop_y) * y_scale)));
+          cv::line(scaled_grid, cv::Point(0, line_y), cv::Point(canvas.cols - 1, line_y), grid_line,
+                   1, cv::LINE_8);
+        }
+      }
+      scaled_grid.copyTo(canvas);
+      for (int x = 0; x <= canvas.cols; x += 96) {
+        cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1), grid_major, 1, cv::LINE_AA);
+      }
+      for (int y = 0; y <= canvas.rows; y += 96) {
+        cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y), grid_major, 1, cv::LINE_AA);
+      }
+
+      cv::Mat cropped_mask = occupied_mask(crop_rect);
+      cv::Mat scaled_mask;
+      cv::resize(cropped_mask, scaled_mask, canvas.size(), 0.0, 0.0, cv::INTER_NEAREST);
+      std::vector<std::vector<cv::Point>> contours;
+      cv::findContours(scaled_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+      for (const auto& contour : contours) {
+        if (contour.size() < 3) continue;
+        cv::polylines(canvas, contour, true, map_occupied_edge, 1, cv::LINE_AA);
+      }
 
       auto local_to_pixel = [&](double local_x_m, double local_y_m) {
-        const double pixel_x = static_cast<double>(draw_rect.x) +
-                               (local_x_m / snapshot->map.resolution_m) * scale_px;
-        const double pixel_y = static_cast<double>(draw_rect.y + draw_rect.height) -
-                               (local_y_m / snapshot->map.resolution_m) * scale_px;
+        const double pixel_x =
+            ((local_x_m / snapshot->map.resolution_m) - crop_x) * x_scale;
+        const double pixel_y =
+            ((static_cast<double>(grid_height) - (local_y_m / snapshot->map.resolution_m)) - crop_y) *
+            y_scale;
         return cv::Point(cvRound(pixel_x), cvRound(pixel_y));
       };
 
@@ -1182,151 +1180,96 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
         footprint_pixels.push_back(local_to_pixel(px, py));
       }
 
+      cv::Mat overlay = canvas.clone();
+      cv::circle(overlay, local_to_pixel(body_x, body_y),
+                 std::max(10, cvRound(std::max(x_scale, y_scale) * 4.0)),
+                 robot_fill, cv::FILLED, cv::LINE_AA);
+      cv::addWeighted(overlay, 0.18, canvas, 0.82, 0.0, canvas);
       cv::fillConvexPoly(canvas, footprint_pixels, robot_fill, cv::LINE_AA);
       cv::polylines(canvas, footprint_pixels, true, robot_outline, 2, cv::LINE_AA);
       const cv::Point body_center = local_to_pixel(body_x, body_y);
-      const cv::Point arrow_tip =
-          local_to_pixel(body_x + c * 0.7, body_y + s * 0.7);
-      cv::circle(canvas, body_center, 5, accent_cyan, cv::FILLED, cv::LINE_AA);
-      cv::arrowedLine(canvas, body_center, arrow_tip, accent_green, 2, cv::LINE_AA, 0, 0.28);
+      const cv::Point arrow_tip = local_to_pixel(body_x + c * 0.8, body_y + s * 0.8);
+      cv::circle(canvas, body_center, 4, robot_outline, cv::FILLED, cv::LINE_AA);
+      cv::arrowedLine(canvas, body_center, arrow_tip, robot_outline, 3, cv::LINE_AA, 0, 0.28);
 
-      span_x_m = snapshot->map.width * snapshot->map.resolution_m;
-      span_y_m = snapshot->map.height * snapshot->map.resolution_m;
+      if (snapshot->has_waypoint_tform_body) {
+        const SpotClient::Pose3D seed_tform_waypoint =
+            compose_pose(snapshot->seed_tform_body, inverse_pose(snapshot->waypoint_tform_body));
+        const SpotClient::Pose3D grid_tform_waypoint =
+            compose_pose(inverse_pose(snapshot->map.seed_tform_grid), seed_tform_waypoint);
+        const cv::Point waypoint_pt = local_to_pixel(grid_tform_waypoint.x, grid_tform_waypoint.y);
+        cv::Mat waypoint_overlay = canvas.clone();
+        cv::circle(waypoint_overlay, waypoint_pt,
+                   std::max(10, cvRound(std::max(x_scale, y_scale) * 3.0)), waypoint_blue,
+                   cv::FILLED, cv::LINE_AA);
+        cv::addWeighted(waypoint_overlay, 0.12, canvas, 0.88, 0.0, canvas);
+        cv::circle(canvas, waypoint_pt,
+                   std::max(6, cvRound(std::max(x_scale, y_scale) * 2.0)),
+                   cv::Scalar(255, 255, 255), 2,
+                   cv::LINE_AA);
+        cv::circle(canvas, waypoint_pt, 3, waypoint_blue, cv::FILLED, cv::LINE_AA);
+        cv::line(canvas, cv::Point(waypoint_pt.x - 10, waypoint_pt.y),
+                 cv::Point(waypoint_pt.x + 10, waypoint_pt.y), waypoint_blue, 1, cv::LINE_AA);
+        cv::line(canvas, cv::Point(waypoint_pt.x, waypoint_pt.y - 10),
+                 cv::Point(waypoint_pt.x, waypoint_pt.y + 10), waypoint_blue, 1, cv::LINE_AA);
+      }
+
+      const double span_x_m = snapshot->map.width * snapshot->map.resolution_m;
       double scale_bar_m = 1.0;
       if (span_x_m >= 8.0) scale_bar_m = 2.0;
       if (span_x_m >= 16.0) scale_bar_m = 5.0;
       const int scale_bar_px =
-          std::max(1, cvRound((scale_bar_m / snapshot->map.resolution_m) * scale_px));
-      const cv::Point scale_start(draw_rect.x + 18, draw_rect.y + draw_rect.height - 20);
+          std::max(1, cvRound((scale_bar_m / snapshot->map.resolution_m) * x_scale));
+      const cv::Point scale_start(16, std::max(24, canvas.rows - 20));
       const cv::Point scale_end(scale_start.x + scale_bar_px, scale_start.y);
+      cv::line(canvas, cv::Point(scale_start.x, scale_start.y + 1),
+               cv::Point(scale_end.x, scale_end.y + 1), robot_outline, 5, cv::LINE_AA);
       cv::line(canvas, scale_start, scale_end, text_primary, 3, cv::LINE_AA);
       cv::line(canvas, cv::Point(scale_start.x, scale_start.y - 5),
                cv::Point(scale_start.x, scale_start.y + 5), text_primary, 2, cv::LINE_AA);
       cv::line(canvas, cv::Point(scale_end.x, scale_end.y - 5),
                cv::Point(scale_end.x, scale_end.y + 5), text_primary, 2, cv::LINE_AA);
       cv::putText(canvas, format_decimal(scale_bar_m, scale_bar_m >= 5.0 ? 0 : 1) + " m",
-                  cv::Point(scale_start.x, scale_start.y - 10), cv::FONT_HERSHEY_SIMPLEX, 0.48,
+                  cv::Point(scale_end.x + 13, scale_start.y + 6), cv::FONT_HERSHEY_SIMPLEX, 0.48,
+                  robot_outline, 2, cv::LINE_AA);
+      cv::putText(canvas, format_decimal(scale_bar_m, scale_bar_m >= 5.0 ? 0 : 1) + " m",
+                  cv::Point(scale_end.x + 12, scale_start.y + 5), cv::FONT_HERSHEY_SIMPLEX, 0.48,
                   text_primary, 1, cv::LINE_AA);
-
-      draw_chip(&canvas, cv::Point(draw_rect.x + 12, draw_rect.y + 12), "LOCAL PATCH",
-                cv::Scalar(70, 52, 23), text_primary);
-      draw_chip(&canvas, cv::Point(draw_rect.x + 156, draw_rect.y + 12), "LOCALIZED",
-                cv::Scalar(44, 92, 40), text_primary);
-      draw_chip(&canvas, cv::Point(draw_rect.x + draw_rect.width - 146, draw_rect.y + 12),
-                shorten_identifier(snapshot->map.map_type, 16), cv::Scalar(58, 74, 98),
-                text_primary);
-
-      if (display_waypoint.empty()) {
-        display_waypoint = shorten_identifier(snapshot->waypoint_id, 20);
-      }
     } else {
-      for (int offset = -map_view.height; offset < map_view.width; offset += 48) {
-        cv::line(canvas, cv::Point(map_view.x + std::max(0, offset), map_view.y),
-                 cv::Point(map_view.x + std::min(map_view.width, map_view.height + offset),
-                           map_view.y + map_view.height),
-                 cv::Scalar(42, 46, 54), 1, cv::LINE_AA);
+      canvas = cv::Mat(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, canvas_bg);
+      for (int x = 0; x <= canvas.cols; x += 80) {
+        cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1),
+                 (x % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
       }
+      for (int y = 0; y <= canvas.rows; y += 80) {
+        cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y),
+                 (y % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
+      }
+      const cv::Point center(canvas.cols / 2, canvas.rows / 2);
+      cv::circle(canvas, center, 54, cv::Scalar(48, 68, 88), 1, cv::LINE_AA);
+      cv::circle(canvas, center, 108, cv::Scalar(40, 58, 76), 1, cv::LINE_AA);
+      cv::line(canvas, cv::Point(center.x - 18, center.y), cv::Point(center.x + 18, center.y),
+               cv::Scalar(78, 104, 132), 1, cv::LINE_AA);
+      cv::line(canvas, cv::Point(center.x, center.y - 18), cv::Point(center.x, center.y + 18),
+               cv::Scalar(78, 104, 132), 1, cv::LINE_AA);
+
       const std::string title = status_title.empty() ? "Waiting for live localization" : status_title;
       int baseline = 0;
       const cv::Size title_size =
-          cv::getTextSize(title, cv::FONT_HERSHEY_SIMPLEX, 0.95, 2, &baseline);
-      const cv::Point title_pt(map_view.x + (map_view.width - title_size.width) / 2,
-                               map_view.y + map_view.height / 2 - 20);
-      cv::putText(canvas, title, title_pt, cv::FONT_HERSHEY_SIMPLEX, 0.95, text_primary, 2,
+          cv::getTextSize(title, cv::FONT_HERSHEY_SIMPLEX, 0.9, 2, &baseline);
+      const cv::Point title_pt((canvas.cols - title_size.width) / 2, (canvas.rows / 2) + 18);
+      cv::putText(canvas, title, title_pt, cv::FONT_HERSHEY_SIMPLEX, 0.9, text_primary, 2,
                   cv::LINE_AA);
-      int detail_y = title_pt.y + 36;
+      int detail_y = title_pt.y + 34;
       for (const auto& line : wrap_text(status_detail.empty() ? "Waiting for the first GraphNav occupancy patch."
                                                               : status_detail,
-                                        42)) {
+                                        46)) {
         cv::putText(canvas, line,
-                    cv::Point(map_view.x + 52, detail_y), cv::FONT_HERSHEY_SIMPLEX, 0.58,
+                    cv::Point(std::max(32, (canvas.cols - 960) / 2), detail_y),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.56,
                     text_secondary, 1, cv::LINE_AA);
         detail_y += 26;
       }
-      draw_chip(&canvas, cv::Point(map_view.x + 16, map_view.y + 16), "WAITING",
-                cv::Scalar(46, 63, 92), text_primary);
-    }
-
-    int y = right_panel.y + 42;
-    cv::putText(canvas, "GraphNav Local Grid", cv::Point(right_panel.x + 24, y),
-                cv::FONT_HERSHEY_SIMPLEX, 0.88, text_primary, 2, cv::LINE_AA);
-    y += 34;
-    cv::putText(canvas, "Rendered localization overlay for Formant", cv::Point(right_panel.x + 24, y),
-                cv::FONT_HERSHEY_SIMPLEX, 0.53, text_secondary, 1, cv::LINE_AA);
-    y += 26;
-    draw_chip(&canvas, cv::Point(right_panel.x + 24, y), has_live_map ? "LIVE" : "HOLD",
-              has_live_map ? cv::Scalar(44, 92, 40) : cv::Scalar(46, 63, 92), text_primary);
-    draw_chip(&canvas, cv::Point(right_panel.x + 104, y),
-              std::to_string(std::max(1, fps)) + " FPS OUT", cv::Scalar(70, 52, 23),
-              text_primary);
-    draw_chip(&canvas, cv::Point(right_panel.x + 232, y),
-              std::to_string(std::max(1, poll_hz)) + " HZ DATA", cv::Scalar(58, 74, 98),
-              text_primary);
-    y += 58;
-
-    auto draw_section_title = [&](const std::string& title) {
-      cv::putText(canvas, title, cv::Point(right_panel.x + 24, y), cv::FONT_HERSHEY_SIMPLEX,
-                  0.56, accent_cyan, 1, cv::LINE_AA);
-      y += 20;
-    };
-    auto draw_info_row = [&](const std::string& label, const std::string& value) {
-      cv::putText(canvas, label, cv::Point(right_panel.x + 24, y), cv::FONT_HERSHEY_SIMPLEX, 0.48,
-                  text_secondary, 1, cv::LINE_AA);
-      y += 18;
-      cv::putText(canvas, value.empty() ? "n/a" : value, cv::Point(right_panel.x + 24, y),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.58, text_primary, 1, cv::LINE_AA);
-      y += 28;
-    };
-
-    draw_section_title("Context");
-    draw_info_row("Active map", active_map_id.empty() ? "none" : active_map_id);
-    draw_info_row("Current waypoint", display_waypoint.empty() ? shorten_identifier(
-                                                         has_live_map ? snapshot->waypoint_id : "", 28)
-                                                               : display_waypoint);
-    draw_info_row("Raw waypoint id",
-                  has_live_map ? shorten_identifier(snapshot->waypoint_id, 28) : "n/a");
-
-    draw_section_title("Patch");
-    draw_info_row("Grid type",
-                  has_live_map ? snapshot->map.map_type : shorten_identifier(status_title, 28));
-    draw_info_row("Resolution",
-                  has_live_map ? (format_decimal(snapshot->map.resolution_m, 3) + " m/cell")
-                               : "waiting");
-    draw_info_row("Extent",
-                  has_live_map ? (format_decimal(span_x_m, 2) + " m x " + format_decimal(span_y_m, 2) +
-                                  " m")
-                               : "waiting");
-
-    draw_section_title("Robot");
-    draw_info_row("Seed pose",
-                  has_live_map ? ("x=" + format_decimal(snapshot->seed_tform_body.x, 2) + ", y=" +
-                                  format_decimal(snapshot->seed_tform_body.y, 2))
-                               : "waiting");
-    draw_info_row("Heading",
-                  has_live_map ? (format_decimal(yaw_deg, 1) + " deg") : "waiting");
-
-    draw_section_title("Legend");
-    const int legend_x = right_panel.x + 24;
-    auto draw_legend = [&](const cv::Scalar& color, const std::string& label) {
-      cv::rectangle(canvas, cv::Rect(legend_x, y - 12, 16, 16), color, cv::FILLED, cv::LINE_AA);
-      cv::rectangle(canvas, cv::Rect(legend_x, y - 12, 16, 16), panel_border, 1, cv::LINE_AA);
-      cv::putText(canvas, label, cv::Point(legend_x + 28, y + 1), cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                  text_primary, 1, cv::LINE_AA);
-      y += 26;
-    };
-    draw_legend(map_occupied, "Occupied / no-step");
-    draw_legend(map_free, "Traversable");
-    draw_legend(map_unknown, "Unknown");
-    draw_legend(robot_fill, "Robot footprint");
-
-    const std::string footer =
-        has_live_map ? "This is a live local terrain patch around the robot, not a stitched global map."
-                     : "The stream keeps a rendered placeholder live while waiting for GraphNav occupancy data.";
-    y += 6;
-    for (const auto& line : wrap_text(footer, 38)) {
-      cv::putText(canvas, line, cv::Point(right_panel.x + 24, y), cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                  text_secondary, 1, cv::LINE_AA);
-      y += 22;
     }
 
     return encode_jpeg(canvas, out_jpg);
@@ -1334,7 +1277,7 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
 
   {
     auto initial = std::make_shared<std::string>();
-    build_frame(nullptr, "", "", "Waiting for live localization",
+    build_frame(nullptr, "Waiting for live localization",
                 "Waiting for the first GraphNav occupancy patch.", initial.get());
     update_cached_image(&cached_image, std::move(initial));
   }
@@ -1377,19 +1320,9 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
     const bool should_refresh =
         use_snapshot || !have_live_frame || failure_count >= std::max(2, std::max(1, poll_hz) * 2);
     if (should_refresh) {
-      std::string active_map_id;
-      std::string waypoint_label;
-      {
-        std::lock_guard<std::mutex> lk(map_mu_);
-        active_map_id = active_map_id_;
-        if (use_snapshot) {
-          waypoint_label = ResolveWaypointNameForIdLocked(snapshot.waypoint_id);
-        }
-      }
-
       auto rendered = std::make_shared<std::string>();
-      if (build_frame(use_snapshot ? &snapshot : nullptr, active_map_id, waypoint_label,
-                      status_title, status_detail, rendered.get())) {
+      if (build_frame(use_snapshot ? &snapshot : nullptr, status_title, status_detail,
+                      rendered.get())) {
         update_cached_image(&cached_image, std::move(rendered));
       }
     }
