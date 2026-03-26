@@ -467,6 +467,18 @@ bool SpotClient::AcquireBodyLease() {
   return true;
 }
 
+bool SpotClient::TryAcquireBodyLeaseNoTakeover() {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!lease_client_) return false;
+  auto r = lease_client_->AcquireLease("body");
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+  body_lease_ = r.response.lease();
+  return true;
+}
+
 bool SpotClient::RetainLease() {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!lease_client_) return false;

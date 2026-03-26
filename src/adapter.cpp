@@ -1160,7 +1160,7 @@ void Adapter::ConnectionLoop() {
 }
 
 void Adapter::MaybeRestoreActiveMap(long long now) {
-  if (!lease_owned_.load()) return;
+  if (!SpotConnected()) return;
   if (now < next_map_restore_attempt_ms_.load()) return;
 
   std::string restore_map_id;
@@ -1170,17 +1170,38 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
   }
   if (restore_map_id.empty()) return;
 
+  bool temporary_lease = false;
+  if (!lease_owned_.load()) {
+    if (!spot_.TryAcquireBodyLeaseNoTakeover()) {
+      EmitLog(std::string("[graphnav] deferred restore waiting for lease map_id=") +
+              restore_map_id + " error=" + spot_.LastError());
+      next_map_restore_attempt_ms_ = now + 5000;
+      return;
+    }
+    temporary_lease = true;
+  }
+
   SpotClient::StoredMap map_data;
   if (!LoadMapFromDisk(restore_map_id, &map_data)) {
     EmitLog(std::string("[graphnav] deferred restore failed reading map_id=") + restore_map_id);
+    if (temporary_lease) (void)spot_.ReturnBodyLease();
     next_map_restore_attempt_ms_ = now + 5000;
     return;
   }
   if (!spot_.UploadGraphMap(map_data)) {
     EmitLog(std::string("[graphnav] deferred restore upload failed map_id=") + restore_map_id +
             " error=" + spot_.LastError());
+    if (temporary_lease) (void)spot_.ReturnBodyLease();
     next_map_restore_attempt_ms_ = now + 5000;
     return;
+  }
+  if (!spot_.SetLocalizationFiducial()) {
+    EmitLog(std::string("[graphnav] deferred restore localization warning map_id=") +
+            restore_map_id + " error=" + spot_.LastError());
+  }
+  if (temporary_lease && !spot_.ReturnBodyLease()) {
+    EmitLog(std::string("[graphnav] deferred restore warning returning temporary lease map_id=") +
+            restore_map_id + " error=" + spot_.LastError());
   }
 
   {

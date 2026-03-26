@@ -141,6 +141,7 @@ class SpotClient {
   bool Connect(const std::string& host, const std::string& username, const std::string& password);
 
   bool AcquireBodyLease();
+  bool TryAcquireBodyLeaseNoTakeover();
   bool RetainLease();
   bool ReturnBodyLease();
 
