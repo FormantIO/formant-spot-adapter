@@ -94,6 +94,16 @@ Configure these streams in your Formant teleop view/device config.
   Spot live terrain maps.
 - Current implementation is a local patch around the robot, not a stitched global map.
 
+- `spot.localization.image` (type: image/jpeg, default 15 FPS output / 2 Hz Spot refresh)
+- Rendered 16:9 visualization of the GraphNav local occupancy patch for straightforward image/video
+  viewing in Formant.
+- Includes occupancy overlay, robot footprint, heading arrow, scale bar, current waypoint/map
+  labels, and a status HUD.
+- The adapter renders only when the Spot localization patch updates, then republishes the cached
+  JPEG at the configured output FPS.
+- To behave like a camera/video stream instead of a throttled telemetry image, configure
+  `spot.localization.image` in Formant with video encoding enabled or add it as a realtime stream.
+
 - `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
 - Key: `Can dock` (boolean)
 - Indicates whether robot is currently in a dockable state for the resolved dock ID.

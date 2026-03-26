@@ -72,8 +72,15 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_right_camera_stream_name()) c->right_camera_stream_name = j.right_camera_stream_name().value();
   if (j.has_back_camera_source()) c->back_camera_source = j.back_camera_source().value();
   if (j.has_back_camera_stream_name()) c->back_camera_stream_name = j.back_camera_stream_name().value();
+  if (j.has_localization_image_stream_name()) {
+    c->localization_image_stream_name = j.localization_image_stream_name().value();
+  }
 
   if (j.has_camera_fps()) c->camera_fps = j.camera_fps().value();
+  if (j.has_localization_image_fps()) c->localization_image_fps = j.localization_image_fps().value();
+  if (j.has_localization_image_poll_hz()) {
+    c->localization_image_poll_hz = j.localization_image_poll_hz().value();
+  }
   if (j.has_twist_deadband()) c->twist_deadband = j.twist_deadband().value();
   if (j.has_teleop_idle_timeout_ms()) c->teleop_idle_timeout_ms = j.teleop_idle_timeout_ms().value();
   if (j.has_max_vx_mps()) c->max_vx_mps = j.max_vx_mps().value();
@@ -137,6 +144,11 @@ Config load_config_from_env() {
   c.back_camera_source = getenv_or("BACK_CAMERA_SOURCE", c.back_camera_source);
   c.back_camera_stream_name = getenv_or("BACK_CAMERA_STREAM_NAME", c.back_camera_stream_name);
   c.camera_fps = getenv_int_or("CAMERA_FPS", c.camera_fps);
+  c.localization_image_stream_name =
+      getenv_or("LOCALIZATION_IMAGE_STREAM_NAME", c.localization_image_stream_name);
+  c.localization_image_fps = getenv_int_or("LOCALIZATION_IMAGE_FPS", c.localization_image_fps);
+  c.localization_image_poll_hz =
+      getenv_int_or("LOCALIZATION_IMAGE_POLL_HZ", c.localization_image_poll_hz);
   c.max_body_pitch_rad = getenv_double_or("MAX_BODY_PITCH_RAD", c.max_body_pitch_rad);
   c.twist_deadband = getenv_double_or("TWIST_DEADBAND", c.twist_deadband);
   c.teleop_idle_timeout_ms = getenv_int_or("TELEOP_IDLE_TIMEOUT_MS", c.teleop_idle_timeout_ms);

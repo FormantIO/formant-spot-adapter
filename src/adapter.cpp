@@ -1,6 +1,7 @@
 #include "formant_spot_adapter/adapter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cctype>
@@ -9,9 +10,14 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include "bosdyn/api/graph_nav/graph_nav.pb.h"
 
@@ -74,6 +80,169 @@ std::string json_escape(const std::string& in) {
 }
 
 constexpr char kGraphNavLocalizationVizStream[] = "spot.localization.graphnav";
+
+constexpr int kLocalizationImageWidth = 1280;
+constexpr int kLocalizationImageHeight = 720;
+constexpr int kLocalizationImageOuterPadding = 16;
+constexpr int kLocalizationImagePanelGap = 16;
+constexpr double kPi = 3.14159265358979323846;
+
+struct Quaterniond {
+  double x{0.0};
+  double y{0.0};
+  double z{0.0};
+  double w{1.0};
+};
+
+struct Vec3d {
+  double x{0.0};
+  double y{0.0};
+  double z{0.0};
+};
+
+Quaterniond normalize_quaternion(Quaterniond q) {
+  const double norm =
+      std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+  if (norm <= 1e-9) return Quaterniond{};
+  q.x /= norm;
+  q.y /= norm;
+  q.z /= norm;
+  q.w /= norm;
+  return q;
+}
+
+Quaterniond pose_quaternion(const SpotClient::Pose3D& pose) {
+  return normalize_quaternion(Quaterniond{pose.qx, pose.qy, pose.qz, pose.qw});
+}
+
+Quaterniond quaternion_conjugate(const Quaterniond& q) {
+  return Quaterniond{-q.x, -q.y, -q.z, q.w};
+}
+
+Quaterniond quaternion_multiply(const Quaterniond& a, const Quaterniond& b) {
+  return Quaterniond{
+      a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+      a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+      a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+      a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+Vec3d rotate_vector(const Quaterniond& q, const Vec3d& v) {
+  const Quaterniond qn = normalize_quaternion(q);
+  const Quaterniond p{v.x, v.y, v.z, 0.0};
+  const Quaterniond rotated =
+      quaternion_multiply(quaternion_multiply(qn, p), quaternion_conjugate(qn));
+  return Vec3d{rotated.x, rotated.y, rotated.z};
+}
+
+SpotClient::Pose3D inverse_pose(const SpotClient::Pose3D& pose) {
+  const Quaterniond q_inv = quaternion_conjugate(pose_quaternion(pose));
+  const Vec3d t_inv = rotate_vector(q_inv, Vec3d{-pose.x, -pose.y, -pose.z});
+  SpotClient::Pose3D out;
+  out.x = t_inv.x;
+  out.y = t_inv.y;
+  out.z = t_inv.z;
+  out.qx = q_inv.x;
+  out.qy = q_inv.y;
+  out.qz = q_inv.z;
+  out.qw = q_inv.w;
+  return out;
+}
+
+SpotClient::Pose3D compose_pose(const SpotClient::Pose3D& a, const SpotClient::Pose3D& b) {
+  const Quaterniond qa = pose_quaternion(a);
+  const Vec3d rotated_b = rotate_vector(qa, Vec3d{b.x, b.y, b.z});
+  const Quaterniond q = normalize_quaternion(quaternion_multiply(qa, pose_quaternion(b)));
+  SpotClient::Pose3D out;
+  out.x = a.x + rotated_b.x;
+  out.y = a.y + rotated_b.y;
+  out.z = a.z + rotated_b.z;
+  out.qx = q.x;
+  out.qy = q.y;
+  out.qz = q.z;
+  out.qw = q.w;
+  return out;
+}
+
+double quaternion_yaw_rad(const Quaterniond& q) {
+  const Quaterniond qn = normalize_quaternion(q);
+  const double siny_cosp = 2.0 * (qn.w * qn.z + qn.x * qn.y);
+  const double cosy_cosp = 1.0 - 2.0 * (qn.y * qn.y + qn.z * qn.z);
+  return std::atan2(siny_cosp, cosy_cosp);
+}
+
+std::string shorten_identifier(const std::string& value, size_t limit = 20) {
+  if (value.size() <= limit) return value;
+  if (limit < 8) return value.substr(0, limit);
+  const size_t head = limit / 2 - 1;
+  const size_t tail = limit - head - 3;
+  return value.substr(0, head) + "..." + value.substr(value.size() - tail);
+}
+
+std::string format_decimal(double value, int precision = 2) {
+  std::ostringstream oss;
+  oss.setf(std::ios::fixed);
+  oss.precision(precision);
+  oss << value;
+  return oss.str();
+}
+
+std::vector<std::string> wrap_text(const std::string& text, size_t max_chars) {
+  std::vector<std::string> lines;
+  if (text.empty() || max_chars == 0) return lines;
+  std::istringstream iss(text);
+  std::string word;
+  std::string line;
+  while (iss >> word) {
+    if (line.empty()) {
+      line = word;
+    } else if (line.size() + 1 + word.size() <= max_chars) {
+      line += " " + word;
+    } else {
+      lines.push_back(line);
+      line = word;
+    }
+  }
+  if (!line.empty()) lines.push_back(line);
+  if (lines.empty()) lines.push_back(text.substr(0, max_chars));
+  return lines;
+}
+
+void fill_rect_alpha(cv::Mat* image, const cv::Rect& rect, const cv::Scalar& color, double alpha) {
+  if (!image || image->empty()) return;
+  const cv::Rect bounded = rect & cv::Rect(0, 0, image->cols, image->rows);
+  if (bounded.width <= 0 || bounded.height <= 0) return;
+  cv::Mat roi = (*image)(bounded);
+  cv::Mat overlay(roi.size(), roi.type(), color);
+  cv::addWeighted(overlay, alpha, roi, 1.0 - alpha, 0.0, roi);
+}
+
+void draw_chip(cv::Mat* image,
+               const cv::Point& origin,
+               const std::string& text,
+               const cv::Scalar& bg,
+               const cv::Scalar& fg) {
+  if (!image || text.empty()) return;
+  int baseline = 0;
+  const double font_scale = 0.55;
+  const int thickness = 1;
+  const cv::Size text_size =
+      cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, font_scale, thickness, &baseline);
+  const cv::Rect rect(origin.x, origin.y, text_size.width + 18, text_size.height + 14);
+  fill_rect_alpha(image, rect, bg, 0.96);
+  cv::rectangle(*image, rect, bg, 1, cv::LINE_AA);
+  cv::putText(*image, text, cv::Point(rect.x + 9, rect.y + rect.height - 6),
+              cv::FONT_HERSHEY_SIMPLEX, font_scale, fg, thickness, cv::LINE_AA);
+}
+
+bool encode_jpeg(const cv::Mat& image, std::string* out_bytes) {
+  if (!out_bytes || image.empty()) return false;
+  std::vector<uchar> encoded;
+  const std::vector<int> params{cv::IMWRITE_JPEG_QUALITY, 88};
+  if (!cv::imencode(".jpg", image, encoded, params)) return false;
+  out_bytes->assign(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+  return true;
+}
 
 void set_identity_transform(v1::model::Transform* transform) {
   if (!transform) return;
@@ -433,6 +602,12 @@ bool Adapter::Init() {
   } else {
     std::cerr << "[camera] failed to list image sources: " << spot_.LastError() << std::endl;
   }
+  if (!cfg_.localization_image_stream_name.empty()) {
+    std::cerr << "[localization-image] stream config: stream=" << cfg_.localization_image_stream_name
+              << " output_fps=" << std::max(1, cfg_.localization_image_fps)
+              << " data_poll_hz=" << std::max(1, cfg_.localization_image_poll_hz)
+              << " sdk_poll_cap_hz=5" << std::endl;
+  }
 
   lease_owned_ = false;
   heartbeat_seen_ = false;
@@ -517,6 +692,12 @@ void Adapter::Run() {
   start_camera(cfg_.left_camera_source, cfg_.left_camera_stream_name, side_fps);
   start_camera(cfg_.right_camera_source, cfg_.right_camera_stream_name, side_fps);
   start_camera(cfg_.back_camera_source, cfg_.back_camera_stream_name, side_fps);
+  if (!cfg_.localization_image_stream_name.empty()) {
+    localization_image_thread_ = std::thread(&Adapter::LocalizationImageLoop, this,
+                                             cfg_.localization_image_stream_name,
+                                             std::max(1, cfg_.localization_image_fps),
+                                             std::max(1, cfg_.localization_image_poll_hz));
+  }
   lease_thread_ = std::thread(&Adapter::LeaseRetainLoop, this);
   dock_thread_ = std::thread(&Adapter::DockLoop, this);
   connection_thread_ = std::thread(&Adapter::ConnectionLoop, this);
@@ -664,6 +845,7 @@ void Adapter::Run() {
     if (t.joinable()) t.join();
   }
   camera_threads_.clear();
+  if (localization_image_thread_.joinable()) localization_image_thread_.join();
   if (lease_thread_.joinable()) lease_thread_.join();
   if (dock_thread_.joinable()) dock_thread_.join();
   if (connection_thread_.joinable()) connection_thread_.join();
@@ -759,6 +941,397 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
     std::this_thread::sleep_for(std::chrono::milliseconds(failure_backoff_ms));
   }
   latest_cv.notify_all();
+  if (sender.joinable()) sender.join();
+}
+
+void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll_hz) {
+  const int output_period_ms = std::max(1, 1000 / std::max(1, fps));
+  const int poll_period_ms = std::max(200, 1000 / std::max(1, poll_hz));
+  std::mutex latest_mu;
+  std::shared_ptr<std::string> latest_jpg;
+
+  auto build_frame = [fps, poll_hz](const SpotClient::LocalizationMapSnapshot* snapshot,
+                                    const std::string& active_map_id,
+                                    const std::string& waypoint_label,
+                                    const std::string& status_title,
+                                    const std::string& status_detail,
+                                    std::string* out_jpg) -> bool {
+    if (!out_jpg) return false;
+
+    const cv::Scalar canvas_bg(20, 18, 16);
+    const cv::Scalar panel_bg(31, 34, 40);
+    const cv::Scalar panel_border(62, 70, 82);
+    const cv::Scalar text_primary(236, 238, 242);
+    const cv::Scalar text_secondary(168, 176, 188);
+    const cv::Scalar accent_cyan(232, 196, 77);
+    const cv::Scalar accent_green(109, 201, 77);
+    const cv::Scalar accent_orange(77, 164, 255);
+    const cv::Scalar map_unknown(45, 44, 42);
+    const cv::Scalar map_free(92, 100, 110);
+    const cv::Scalar map_occupied(58, 142, 244);
+    const cv::Scalar robot_fill(202, 240, 255);
+    const cv::Scalar robot_outline(255, 255, 255);
+
+    cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, canvas_bg);
+    const int left_panel_width = 784;
+    const int right_panel_width =
+        kLocalizationImageWidth - left_panel_width - (2 * kLocalizationImageOuterPadding) -
+        kLocalizationImagePanelGap;
+    const cv::Rect left_panel(kLocalizationImageOuterPadding, kLocalizationImageOuterPadding,
+                              left_panel_width,
+                              kLocalizationImageHeight - (2 * kLocalizationImageOuterPadding));
+    const cv::Rect right_panel(left_panel.x + left_panel.width + kLocalizationImagePanelGap,
+                               kLocalizationImageOuterPadding, right_panel_width,
+                               left_panel.height);
+    fill_rect_alpha(&canvas, left_panel, panel_bg, 0.96);
+    fill_rect_alpha(&canvas, right_panel, panel_bg, 0.96);
+    cv::rectangle(canvas, left_panel, panel_border, 1, cv::LINE_AA);
+    cv::rectangle(canvas, right_panel, panel_border, 1, cv::LINE_AA);
+
+    const cv::Rect map_view(left_panel.x + 24, left_panel.y + 24, left_panel.width - 48,
+                            left_panel.height - 48);
+    fill_rect_alpha(&canvas, map_view, cv::Scalar(18, 22, 26), 1.0);
+    cv::rectangle(canvas, map_view, cv::Scalar(50, 58, 68), 1, cv::LINE_AA);
+
+    const bool has_live_map = snapshot && snapshot->localized && snapshot->has_seed_tform_body &&
+                              snapshot->has_map && snapshot->map.width > 0 &&
+                              snapshot->map.height > 0 && snapshot->map.resolution_m > 0.0;
+
+    double span_x_m = 0.0;
+    double span_y_m = 0.0;
+    double yaw_deg = 0.0;
+    std::string display_waypoint = waypoint_label;
+
+    if (has_live_map) {
+      const int grid_width = snapshot->map.width;
+      const int grid_height = snapshot->map.height;
+      const int scale_px =
+          std::max(1, std::min(map_view.width / std::max(1, grid_width),
+                               map_view.height / std::max(1, grid_height)));
+      const int scaled_width = grid_width * scale_px;
+      const int scaled_height = grid_height * scale_px;
+      const cv::Rect draw_rect(map_view.x + (map_view.width - scaled_width) / 2,
+                               map_view.y + (map_view.height - scaled_height) / 2, scaled_width,
+                               scaled_height);
+
+      cv::Mat grid_image(grid_height, grid_width, CV_8UC3, map_unknown);
+      for (int y = 0; y < grid_height; ++y) {
+        for (int x = 0; x < grid_width; ++x) {
+          const size_t idx = static_cast<size_t>(x) +
+                             static_cast<size_t>(grid_width) * static_cast<size_t>(y);
+          const int draw_y = grid_height - 1 - y;
+          const int32_t value = snapshot->map.occupancy[idx];
+          cv::Vec3b* px = &grid_image.at<cv::Vec3b>(draw_y, x);
+          if (value < 0) {
+            *px = cv::Vec3b(static_cast<uchar>(map_unknown[0]),
+                            static_cast<uchar>(map_unknown[1]),
+                            static_cast<uchar>(map_unknown[2]));
+          } else if (value >= 50) {
+            *px = cv::Vec3b(static_cast<uchar>(map_occupied[0]),
+                            static_cast<uchar>(map_occupied[1]),
+                            static_cast<uchar>(map_occupied[2]));
+          } else {
+            *px = cv::Vec3b(static_cast<uchar>(map_free[0]),
+                            static_cast<uchar>(map_free[1]),
+                            static_cast<uchar>(map_free[2]));
+          }
+        }
+      }
+
+      cv::Mat scaled_grid;
+      cv::resize(grid_image, scaled_grid, cv::Size(scaled_width, scaled_height), 0.0, 0.0,
+                 cv::INTER_NEAREST);
+      if (scale_px >= 3) {
+        const cv::Scalar grid_line(74, 80, 88);
+        for (int x = 0; x <= grid_width; x += 10) {
+          const int line_x = std::min(scaled_width - 1, x * scale_px);
+          cv::line(scaled_grid, cv::Point(line_x, 0), cv::Point(line_x, scaled_height - 1),
+                   grid_line, 1, cv::LINE_8);
+        }
+        for (int y = 0; y <= grid_height; y += 10) {
+          const int line_y = std::min(scaled_height - 1, y * scale_px);
+          cv::line(scaled_grid, cv::Point(0, line_y), cv::Point(scaled_width - 1, line_y),
+                   grid_line, 1, cv::LINE_8);
+        }
+      }
+      scaled_grid.copyTo(canvas(draw_rect));
+
+      const SpotClient::Pose3D grid_tform_body =
+          compose_pose(inverse_pose(snapshot->map.seed_tform_grid), snapshot->seed_tform_body);
+      const double yaw_rad = quaternion_yaw_rad(pose_quaternion(grid_tform_body));
+      yaw_deg = yaw_rad * 180.0 / kPi;
+
+      auto local_to_pixel = [&](double local_x_m, double local_y_m) {
+        const double pixel_x = static_cast<double>(draw_rect.x) +
+                               (local_x_m / snapshot->map.resolution_m) * scale_px;
+        const double pixel_y = static_cast<double>(draw_rect.y + draw_rect.height) -
+                               (local_y_m / snapshot->map.resolution_m) * scale_px;
+        return cv::Point(cvRound(pixel_x), cvRound(pixel_y));
+      };
+
+      const double body_x = grid_tform_body.x;
+      const double body_y = grid_tform_body.y;
+      const double c = std::cos(yaw_rad);
+      const double s = std::sin(yaw_rad);
+      const std::array<cv::Point2d, 4> footprint_local = {
+          cv::Point2d(0.45, 0.25), cv::Point2d(0.45, -0.25), cv::Point2d(-0.45, -0.25),
+          cv::Point2d(-0.45, 0.25)};
+      std::vector<cv::Point> footprint_pixels;
+      footprint_pixels.reserve(footprint_local.size());
+      for (const auto& corner : footprint_local) {
+        const double px = body_x + c * corner.x - s * corner.y;
+        const double py = body_y + s * corner.x + c * corner.y;
+        footprint_pixels.push_back(local_to_pixel(px, py));
+      }
+
+      cv::fillConvexPoly(canvas, footprint_pixels, robot_fill, cv::LINE_AA);
+      cv::polylines(canvas, footprint_pixels, true, robot_outline, 2, cv::LINE_AA);
+      const cv::Point body_center = local_to_pixel(body_x, body_y);
+      const cv::Point arrow_tip =
+          local_to_pixel(body_x + c * 0.7, body_y + s * 0.7);
+      cv::circle(canvas, body_center, 5, accent_cyan, cv::FILLED, cv::LINE_AA);
+      cv::arrowedLine(canvas, body_center, arrow_tip, accent_green, 2, cv::LINE_AA, 0, 0.28);
+
+      span_x_m = snapshot->map.width * snapshot->map.resolution_m;
+      span_y_m = snapshot->map.height * snapshot->map.resolution_m;
+      double scale_bar_m = 1.0;
+      if (span_x_m >= 8.0) scale_bar_m = 2.0;
+      if (span_x_m >= 16.0) scale_bar_m = 5.0;
+      const int scale_bar_px =
+          std::max(1, cvRound((scale_bar_m / snapshot->map.resolution_m) * scale_px));
+      const cv::Point scale_start(draw_rect.x + 18, draw_rect.y + draw_rect.height - 20);
+      const cv::Point scale_end(scale_start.x + scale_bar_px, scale_start.y);
+      cv::line(canvas, scale_start, scale_end, text_primary, 3, cv::LINE_AA);
+      cv::line(canvas, cv::Point(scale_start.x, scale_start.y - 5),
+               cv::Point(scale_start.x, scale_start.y + 5), text_primary, 2, cv::LINE_AA);
+      cv::line(canvas, cv::Point(scale_end.x, scale_end.y - 5),
+               cv::Point(scale_end.x, scale_end.y + 5), text_primary, 2, cv::LINE_AA);
+      cv::putText(canvas, format_decimal(scale_bar_m, scale_bar_m >= 5.0 ? 0 : 1) + " m",
+                  cv::Point(scale_start.x, scale_start.y - 10), cv::FONT_HERSHEY_SIMPLEX, 0.48,
+                  text_primary, 1, cv::LINE_AA);
+
+      draw_chip(&canvas, cv::Point(draw_rect.x + 12, draw_rect.y + 12), "LOCAL PATCH",
+                cv::Scalar(70, 52, 23), text_primary);
+      draw_chip(&canvas, cv::Point(draw_rect.x + 156, draw_rect.y + 12), "LOCALIZED",
+                cv::Scalar(44, 92, 40), text_primary);
+      draw_chip(&canvas, cv::Point(draw_rect.x + draw_rect.width - 146, draw_rect.y + 12),
+                shorten_identifier(snapshot->map.map_type, 16), cv::Scalar(58, 74, 98),
+                text_primary);
+
+      if (display_waypoint.empty()) {
+        display_waypoint = shorten_identifier(snapshot->waypoint_id, 20);
+      }
+    } else {
+      for (int offset = -map_view.height; offset < map_view.width; offset += 48) {
+        cv::line(canvas, cv::Point(map_view.x + std::max(0, offset), map_view.y),
+                 cv::Point(map_view.x + std::min(map_view.width, map_view.height + offset),
+                           map_view.y + map_view.height),
+                 cv::Scalar(42, 46, 54), 1, cv::LINE_AA);
+      }
+      const std::string title = status_title.empty() ? "Waiting for live localization" : status_title;
+      int baseline = 0;
+      const cv::Size title_size =
+          cv::getTextSize(title, cv::FONT_HERSHEY_SIMPLEX, 0.95, 2, &baseline);
+      const cv::Point title_pt(map_view.x + (map_view.width - title_size.width) / 2,
+                               map_view.y + map_view.height / 2 - 20);
+      cv::putText(canvas, title, title_pt, cv::FONT_HERSHEY_SIMPLEX, 0.95, text_primary, 2,
+                  cv::LINE_AA);
+      int detail_y = title_pt.y + 36;
+      for (const auto& line : wrap_text(status_detail.empty() ? "Waiting for the first GraphNav occupancy patch."
+                                                              : status_detail,
+                                        42)) {
+        cv::putText(canvas, line,
+                    cv::Point(map_view.x + 52, detail_y), cv::FONT_HERSHEY_SIMPLEX, 0.58,
+                    text_secondary, 1, cv::LINE_AA);
+        detail_y += 26;
+      }
+      draw_chip(&canvas, cv::Point(map_view.x + 16, map_view.y + 16), "WAITING",
+                cv::Scalar(46, 63, 92), text_primary);
+    }
+
+    int y = right_panel.y + 42;
+    cv::putText(canvas, "GraphNav Local Grid", cv::Point(right_panel.x + 24, y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.88, text_primary, 2, cv::LINE_AA);
+    y += 34;
+    cv::putText(canvas, "Rendered localization overlay for Formant", cv::Point(right_panel.x + 24, y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.53, text_secondary, 1, cv::LINE_AA);
+    y += 26;
+    draw_chip(&canvas, cv::Point(right_panel.x + 24, y), has_live_map ? "LIVE" : "HOLD",
+              has_live_map ? cv::Scalar(44, 92, 40) : cv::Scalar(46, 63, 92), text_primary);
+    draw_chip(&canvas, cv::Point(right_panel.x + 104, y),
+              std::to_string(std::max(1, fps)) + " FPS OUT", cv::Scalar(70, 52, 23),
+              text_primary);
+    draw_chip(&canvas, cv::Point(right_panel.x + 232, y),
+              std::to_string(std::max(1, poll_hz)) + " HZ DATA", cv::Scalar(58, 74, 98),
+              text_primary);
+    y += 58;
+
+    auto draw_section_title = [&](const std::string& title) {
+      cv::putText(canvas, title, cv::Point(right_panel.x + 24, y), cv::FONT_HERSHEY_SIMPLEX,
+                  0.56, accent_cyan, 1, cv::LINE_AA);
+      y += 20;
+    };
+    auto draw_info_row = [&](const std::string& label, const std::string& value) {
+      cv::putText(canvas, label, cv::Point(right_panel.x + 24, y), cv::FONT_HERSHEY_SIMPLEX, 0.48,
+                  text_secondary, 1, cv::LINE_AA);
+      y += 18;
+      cv::putText(canvas, value.empty() ? "n/a" : value, cv::Point(right_panel.x + 24, y),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.58, text_primary, 1, cv::LINE_AA);
+      y += 28;
+    };
+
+    draw_section_title("Context");
+    draw_info_row("Active map", active_map_id.empty() ? "none" : active_map_id);
+    draw_info_row("Current waypoint", display_waypoint.empty() ? shorten_identifier(
+                                                         has_live_map ? snapshot->waypoint_id : "", 28)
+                                                               : display_waypoint);
+    draw_info_row("Raw waypoint id",
+                  has_live_map ? shorten_identifier(snapshot->waypoint_id, 28) : "n/a");
+
+    draw_section_title("Patch");
+    draw_info_row("Grid type",
+                  has_live_map ? snapshot->map.map_type : shorten_identifier(status_title, 28));
+    draw_info_row("Resolution",
+                  has_live_map ? (format_decimal(snapshot->map.resolution_m, 3) + " m/cell")
+                               : "waiting");
+    draw_info_row("Extent",
+                  has_live_map ? (format_decimal(span_x_m, 2) + " m x " + format_decimal(span_y_m, 2) +
+                                  " m")
+                               : "waiting");
+
+    draw_section_title("Robot");
+    draw_info_row("Seed pose",
+                  has_live_map ? ("x=" + format_decimal(snapshot->seed_tform_body.x, 2) + ", y=" +
+                                  format_decimal(snapshot->seed_tform_body.y, 2))
+                               : "waiting");
+    draw_info_row("Heading",
+                  has_live_map ? (format_decimal(yaw_deg, 1) + " deg") : "waiting");
+
+    draw_section_title("Legend");
+    const int legend_x = right_panel.x + 24;
+    auto draw_legend = [&](const cv::Scalar& color, const std::string& label) {
+      cv::rectangle(canvas, cv::Rect(legend_x, y - 12, 16, 16), color, cv::FILLED, cv::LINE_AA);
+      cv::rectangle(canvas, cv::Rect(legend_x, y - 12, 16, 16), panel_border, 1, cv::LINE_AA);
+      cv::putText(canvas, label, cv::Point(legend_x + 28, y + 1), cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                  text_primary, 1, cv::LINE_AA);
+      y += 26;
+    };
+    draw_legend(map_occupied, "Occupied / no-step");
+    draw_legend(map_free, "Traversable");
+    draw_legend(map_unknown, "Unknown");
+    draw_legend(robot_fill, "Robot footprint");
+
+    const std::string footer =
+        has_live_map ? "This is a live local terrain patch around the robot, not a stitched global map."
+                     : "The stream keeps a rendered placeholder live while waiting for GraphNav occupancy data.";
+    y += 6;
+    for (const auto& line : wrap_text(footer, 38)) {
+      cv::putText(canvas, line, cv::Point(right_panel.x + 24, y), cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                  text_secondary, 1, cv::LINE_AA);
+      y += 22;
+    }
+
+    return encode_jpeg(canvas, out_jpg);
+  };
+
+  {
+    auto initial = std::make_shared<std::string>();
+    build_frame(nullptr, "", "", "Waiting for live localization",
+                "Waiting for the first GraphNav occupancy patch.", initial.get());
+    std::lock_guard<std::mutex> lk(latest_mu);
+    latest_jpg = std::move(initial);
+  }
+
+  std::thread sender([this, &latest_mu, &latest_jpg, &stream, output_period_ms]() {
+    int post_backoff_ms = 0;
+    long long next_post_allowed_ms = 0;
+    auto next_tick = std::chrono::steady_clock::now();
+    while (running_) {
+      next_tick += std::chrono::milliseconds(output_period_ms);
+      std::shared_ptr<std::string> frame;
+      {
+        std::lock_guard<std::mutex> lk(latest_mu);
+        frame = latest_jpg;
+      }
+      if (frame && !frame->empty()) {
+        const long long now = now_ms();
+        if (now >= next_post_allowed_ms) {
+          const bool ok = agent_.PostImage(stream, "image/jpeg", *frame);
+          if (ok) {
+            post_backoff_ms = 0;
+            next_post_allowed_ms = 0;
+          } else {
+            post_backoff_ms =
+                std::min(2000, std::max(100, post_backoff_ms == 0 ? 100 : post_backoff_ms * 2));
+            next_post_allowed_ms = now + post_backoff_ms;
+          }
+        }
+      }
+      std::this_thread::sleep_until(next_tick);
+    }
+  });
+
+  bool have_live_frame = false;
+  int failure_count = 0;
+  while (running_) {
+    SpotClient::LocalizationMapSnapshot snapshot;
+    bool use_snapshot = false;
+    std::string status_title = "Waiting for live localization";
+    std::string status_detail = "Waiting for the first GraphNav occupancy patch.";
+
+    if (!SpotConnected()) {
+      ++failure_count;
+      status_title = "Spot disconnected";
+      status_detail = "Waiting for robot connection before requesting GraphNav localization.";
+    } else if (!spot_.GetLocalizationMapSnapshot(&snapshot)) {
+      ++failure_count;
+      status_title = "Localization fetch failed";
+      status_detail = shorten_identifier(spot_.LastError(), 120);
+    } else if (!snapshot.localized || !snapshot.has_seed_tform_body) {
+      ++failure_count;
+      status_title = "Robot not localized";
+      status_detail = "GraphNav returned a waypoint without a seed-frame body pose.";
+    } else if (!snapshot.has_map) {
+      ++failure_count;
+      status_title = "Live terrain map unavailable";
+      status_detail =
+          "GraphNav localization succeeded, but no supported local grid was returned yet.";
+    } else {
+      use_snapshot = true;
+      have_live_frame = true;
+      failure_count = 0;
+    }
+
+    const bool should_refresh =
+        use_snapshot || !have_live_frame || failure_count >= std::max(2, std::max(1, poll_hz) * 2);
+    if (should_refresh) {
+      std::string active_map_id;
+      std::string waypoint_label;
+      {
+        std::lock_guard<std::mutex> lk(map_mu_);
+        active_map_id = active_map_id_;
+        if (use_snapshot) {
+          waypoint_label = ResolveWaypointNameForIdLocked(snapshot.waypoint_id);
+        }
+      }
+
+      auto rendered = std::make_shared<std::string>();
+      if (build_frame(use_snapshot ? &snapshot : nullptr, active_map_id, waypoint_label,
+                      status_title, status_detail, rendered.get())) {
+        std::lock_guard<std::mutex> lk(latest_mu);
+        latest_jpg = std::move(rendered);
+      }
+    }
+
+    const int step_ms = 50;
+    int slept_ms = 0;
+    while (running_ && slept_ms < poll_period_ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(
+          std::min(step_ms, poll_period_ms - slept_ms)));
+      slept_ms += step_ms;
+    }
+  }
+
   if (sender.joinable()) sender.join();
 }
 

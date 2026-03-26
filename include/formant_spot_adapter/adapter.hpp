@@ -26,6 +26,7 @@ class Adapter {
 
  private:
   void CameraLoop(const std::string& source, const std::string& stream, int fps);
+  void LocalizationImageLoop(const std::string& stream, int fps, int poll_hz);
   void LeaseRetainLoop();
   void HandleTeleop(const v1::model::ControlDatapoint& dp);
   void HandleHeartbeat(const v1::agent::GetTeleopHeartbeatStreamResponse& hb);
@@ -146,6 +147,7 @@ class Adapter {
   std::string last_logged_control_stream_;
 
   std::vector<std::thread> camera_threads_;
+  std::thread localization_image_thread_;
   std::thread lease_thread_;
   std::thread dock_thread_;
   std::thread connection_thread_;

@@ -4,5 +4,8 @@
   "graphnavStoreDir": "data/graphnav",
   "waypointTextStream": "spot.waypoints",
   "mapsTextStream": "spot.maps",
+  "localizationImageStreamName": "spot.localization.image",
+  "localizationImageFps": 15,
+  "localizationImagePollHz": 2,
   "graphnavCommandTimeoutSec": 60
 }

@@ -34,6 +34,9 @@ struct Config {
   std::string back_camera_source{"back_fisheye_image"};
   std::string back_camera_stream_name{"spot.back.image"};
   int camera_fps{30};
+  std::string localization_image_stream_name{"spot.localization.image"};
+  int localization_image_fps{15};
+  int localization_image_poll_hz{2};
   double twist_deadband{0.08};
   int teleop_idle_timeout_ms{300};
 

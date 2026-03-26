@@ -49,6 +49,7 @@ Additional control channels (not streams):
 | `spot.connection` | Text (JSON) | Spot connection health (`state`, `connected`, `degraded_non_estop`, `degraded_reason`, reconnect/attempt timestamps, last error) |
 | `spot.localization` | Text (JSON) | GraphNav localization status (`localized`, `waypoint_id`, `error`) |
 | `spot.localization.graphnav` | Localization | Formant typed localization stream with a live occupancy-grid patch in the GraphNav seed frame; intended for the Formant localization viewer |
+| `spot.localization.image` | Image (JPEG) | Rendered GraphNav occupancy/localization overlay image, published at stable output FPS from cached frames for easy inspection or video-style viewing |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |
 | `spot.waypoints` | Text | Newline-separated waypoint names for the active map |
@@ -77,6 +78,11 @@ Additional control channels (not streams):
   stitched full-site map. See
   [`docs/formant-localization-map-analysis.md`](/home/walter/shin-spot-adapter/docs/formant-localization-map-analysis.md)
   for the implementation notes and next steps.
+- `spot.localization.image` is a rendered 16:9 visualization of the same local patch with a robot
+  footprint, heading arrow, scale bar, and status HUD. The adapter renders only when the Spot data
+  changes, then republishes the cached JPEG at a stable output FPS. For camera-like playback in
+  Formant, the `spot.localization.image` stream also needs Formant-side video encoding/realtime
+  stream configuration; otherwise the agent treats it as a throttled telemetry image stream.
 - If lease is already held, adapter attempts takeover (`TakeLease`) to recover from stale owners.
 - On teleop inactivity: sends zero velocity, stows arm, then returns lease unless GraphNav nav is active.
 - Heartbeat timeout behavior is zero-velocity only (no auto-sit).

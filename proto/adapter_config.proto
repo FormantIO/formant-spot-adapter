@@ -57,4 +57,7 @@ message AdapterConfig {
   google.protobuf.StringValue waypoint_text_stream = 51;
   google.protobuf.Int32Value graphnav_command_timeout_sec = 52;
   google.protobuf.StringValue maps_text_stream = 53;
+  google.protobuf.StringValue localization_image_stream_name = 54;
+  google.protobuf.Int32Value localization_image_fps = 55;
+  google.protobuf.Int32Value localization_image_poll_hz = 56;
 }
