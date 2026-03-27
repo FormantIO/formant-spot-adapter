@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package v1.model;
+
+option go_package = "github.com/FormantIO/genproto/go/v1/model";
+
+message Event {
+  int64 timestamp = 1;
+  int64 end_timestamp = 8;
+  string message = 2;
+  string stream_name = 3;
+  string stream_type = 4;
+  bool notification_enabled = 5;
+  Severity severity = 9;
+  string id = 10;
+  string type = 11;
+  string event_trigger_id = 12;
+  map<string, string> tags = 6;
+  reserved 7;
+}
+
+enum Severity {
+  INFO = 0;
+  WARNING = 1;
+  ERROR = 2;
+  CRITICAL = 3;
+}
+
+message AgentEventConfiguration {
+  repeated AgentEventTrigger event_triggers = 1;
+  repeated AgentEventTrigger stateful_event_triggers = 3;
+  int64 last_updated = 2;
+}
+
+message AgentEventTrigger {
+  string id = 1;
+  string stream = 2;
+  int64 interval = 3;
+  Condition condition = 4;
+  Condition exitCondition = 5;
+  bool isStatefulTrigger = 6;
+  StatefulTriggerConfiguration statefulTriggerConfiguration = 7;
+  string message = 8;
+  string messageFormat = 11;
+  string severity = 9;
+  bool notification_enabled = 10;
+}
+
+message Condition {
+  string stream = 1;
+  oneof condition {
+    PresenceEventTriggerCondition presence = 2;
+    ThresholdEventTriggerCondition threshold = 3;
+    RegexEventTriggerCondition regex = 4;
+    BitsetEventTriggerCondition bitset = 5;
+    BatteryEventTriggerCondition battery = 6;
+    NumericSetEventTriggerCondition numeric = 7;
+    JsonEventTriggerCondition json = 8;
+    AutoresolveEventTriggerCondition autoresolve = 9;
+  }
+}
+
+message PresenceEventTriggerCondition {
+}
+
+message AutoresolveEventTriggerCondition {
+}
+
+message ThresholdEventTriggerCondition {
+  double value = 1;
+  ThresholdOperator operator = 2;
+}
+
+message NumericCondition {
+  string label = 1;
+  ThresholdEventTriggerCondition condition = 2;
+}
+
+message NumericSetEventTriggerCondition {
+  repeated NumericCondition conditions = 1;
+  ConditionOperator operator = 2;
+}
+
+enum BatteryField {
+  Charge = 0;
+  Current = 1;
+  Percentage = 2;
+  Voltage = 3;
+}
+
+message BatteryCondition {
+  BatteryField field = 1;
+  ThresholdEventTriggerCondition condition = 2;
+  ConditionOperator operator = 3;
+}
+
+message BatteryEventTriggerCondition {
+  repeated BatteryCondition conditions = 1;
+  ConditionOperator operator = 2;
+}
+
+message RegexEventTriggerCondition {
+  string value = 1;
+}
+
+message BitsetEventTriggerCondition {
+  repeated BitsetCondition bit_conditions = 1;
+  ConditionOperator operator = 2;
+}
+
+message BitsetCondition {
+  string key = 1;
+  bool true = 2;
+  bool false = 3;
+}
+
+message JsonEventTriggerCondition {
+  string jqQuery = 1; 
+}
+
+enum ThresholdOperator {
+  LT = 0;
+  LTE = 1;
+  GT = 2;
+  GTE = 3;
+  EQ = 4;
+  NEQ = 5;
+}
+
+enum ConditionOperator {
+  ANY = 0;
+  ALL = 1;
+}
+
+message StatefulTriggerConfiguration {
+  bool emitOnEnteringState = 1;
+  bool emitOnLeavingState = 2;
+}

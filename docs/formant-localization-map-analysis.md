@@ -4,9 +4,11 @@
 
 - Formant already supports typed localization uploads with an occupancy grid in
   `Localization.map.occupancy_grid`.
-- This adapter previously could not send that type because
-  [`proto/formant_model.proto`](../proto/formant_model.proto)
-  only exposed text/numeric/image payloads.
+- This adapter previously could not send that type because its older local
+  Formant proto snapshot only exposed text/numeric/image payloads. The repo now
+  vendors the public upstream Formant protos under
+  [`proto/protos/model/v1/datapoint.proto`](../proto/protos/model/v1/datapoint.proto)
+  and [`proto/protos/model/v1/navigation.proto`](../proto/protos/model/v1/navigation.proto).
 - Spot already exposes map-related data in the local SDK checkout:
   - `GetLocalizationState(... request_live_terrain_maps=true)` returns live
     `WaypointSnapshot.robot_local_grids`.
@@ -20,7 +22,7 @@
 ## What Is Implemented Here
 
 - Added typed Formant `Localization`, `Map`, `OccupancyGrid`, `Transform`, and
-  `Odometry` messages to the local proto model.
+  `Odometry` messages through the vendored upstream Formant proto model.
 - Added `FormantAgentClient::PostLocalization(...)`.
 - Added `SpotClient::GetLocalizationMapSnapshot(...)`, which:
   - requests GraphNav localization plus live terrain maps,

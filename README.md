@@ -171,6 +171,12 @@ default the setup is pinned to Spot C++ SDK `v5.1.0`. If a local archive such
 as `bosdyn/spot-cpp-sdk-5.1.0.zip` is present, the setup uses it; otherwise it
 clones the pinned upstream tag from Boston Dynamics.
 
+The Formant protobuf definitions used by this adapter are already vendored in
+`proto/protos/`, so no additional Formant dependency fetch is required during
+setup or build. Maintainers can refresh that vendored snapshot with
+`./scripts/sync_formant_protos.sh` when intentionally updating to a newer
+public Formant proto revision.
+
 2. Run directly once to materialize local config files:
 
 ```bash
@@ -306,5 +312,10 @@ an E-Stop is active, or `camera_server` still has active init faults.
   `FORCE_REINSTALL_SPOT_SDK=1` or point `SPOT_CPP_SDK_DIR` at a different SDK path.
 - If you already have a local SDK checkout, point the build at it with
   `SPOT_CPP_SDK_DIR=/path/to/spot-cpp-sdk ./scripts/build.sh`.
+- Formant protos are vendored from the public `FormantIO/formant` repo at the
+  pinned commit recorded in [`proto/formant_vendor.lock`](proto/formant_vendor.lock),
+  so users do not need any extra setup step for them.
+- Maintainers can refresh the vendored Formant proto set with
+  `./scripts/sync_formant_protos.sh [ref]`.
 - For UI examples, see `docs/formant-streams.md`.
 - For detailed implementation history/behavior notes, see `docs/graphnav-teleop-implementation-notes.md`.

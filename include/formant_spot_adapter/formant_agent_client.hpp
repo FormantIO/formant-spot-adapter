@@ -10,9 +10,11 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include "formant_agent.pb.h"
-#include "formant_agent.grpc.pb.h"
-#include "formant_model.pb.h"
+#include "protos/agent/v1/agent.pb.h"
+#include "protos/agent/v1/agent.grpc.pb.h"
+#include "protos/model/v1/commands.pb.h"
+#include "protos/model/v1/datapoint.pb.h"
+#include "protos/model/v1/navigation.pb.h"
 
 namespace fsa {
 

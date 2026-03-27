@@ -42,27 +42,49 @@ add_subdirectory(${SPOT_CPP_SDK_DIR}/cpp ${CMAKE_BINARY_DIR}/spot_cpp_sdk_build 
 
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
+set(FORMANT_PROTO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/proto)
 set(PROTO_FILES
-  ${CMAKE_CURRENT_SOURCE_DIR}/proto/formant_model.proto
-  ${CMAKE_CURRENT_SOURCE_DIR}/proto/formant_agent.proto
-  ${CMAKE_CURRENT_SOURCE_DIR}/proto/adapter_config.proto
+  ${FORMANT_PROTO_ROOT}/protos/agent/v1/agent.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/commands.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/config.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/datapoint.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/event.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/file.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/health.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/intervention.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/math.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/media.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/navigation.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/ros.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/text.proto
+  ${FORMANT_PROTO_ROOT}/protos/model/v1/views.proto
+  ${FORMANT_PROTO_ROOT}/adapter_config.proto
 )
 
 set(GENERATED_SRCS)
 set(GENERATED_HDRS)
 
 foreach(PROTO ${PROTO_FILES})
-  get_filename_component(PROTO_NAME ${PROTO} NAME_WE)
+  file(RELATIVE_PATH PROTO_REL ${FORMANT_PROTO_ROOT} ${PROTO})
+  get_filename_component(PROTO_DIR ${PROTO_REL} DIRECTORY)
+  get_filename_component(PROTO_NAME ${PROTO_REL} NAME_WE)
 
-  set(PB_CC ${CMAKE_CURRENT_BINARY_DIR}/generated/${PROTO_NAME}.pb.cc)
-  set(PB_H  ${CMAKE_CURRENT_BINARY_DIR}/generated/${PROTO_NAME}.pb.h)
-  set(GRPC_CC ${CMAKE_CURRENT_BINARY_DIR}/generated/${PROTO_NAME}.grpc.pb.cc)
-  set(GRPC_H  ${CMAKE_CURRENT_BINARY_DIR}/generated/${PROTO_NAME}.grpc.pb.h)
+  if(PROTO_DIR)
+    set(GENERATED_PROTO_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/${PROTO_DIR})
+  else()
+    set(GENERATED_PROTO_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+  endif()
+
+  set(PB_CC ${GENERATED_PROTO_DIR}/${PROTO_NAME}.pb.cc)
+  set(PB_H  ${GENERATED_PROTO_DIR}/${PROTO_NAME}.pb.h)
+  set(GRPC_CC ${GENERATED_PROTO_DIR}/${PROTO_NAME}.grpc.pb.cc)
+  set(GRPC_H  ${GENERATED_PROTO_DIR}/${PROTO_NAME}.grpc.pb.h)
 
   add_custom_command(
     OUTPUT ${PB_CC} ${PB_H}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_PROTO_DIR}
     COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-    ARGS --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+    ARGS --proto_path=${FORMANT_PROTO_ROOT}
          --cpp_out=${CMAKE_CURRENT_BINARY_DIR}/generated
          ${PROTO}
     DEPENDS ${PROTO}
@@ -70,8 +92,9 @@ foreach(PROTO ${PROTO_FILES})
 
   add_custom_command(
     OUTPUT ${GRPC_CC} ${GRPC_H}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_PROTO_DIR}
     COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-    ARGS --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+    ARGS --proto_path=${FORMANT_PROTO_ROOT}
          --grpc_out=${CMAKE_CURRENT_BINARY_DIR}/generated
          --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN_EXECUTABLE}
          ${PROTO}
