@@ -98,6 +98,20 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_localization_image_poll_hz()) {
     c->localization_image_poll_hz = j.localization_image_poll_hz().value();
   }
+  if (j.has_graphnav_global_localization_stream()) {
+    c->graphnav_global_localization_stream = j.graphnav_global_localization_stream().value();
+  }
+  if (j.has_graphnav_map_stream()) c->graphnav_map_stream = j.graphnav_map_stream().value();
+  if (j.has_graphnav_metadata_stream()) {
+    c->graphnav_metadata_stream = j.graphnav_metadata_stream().value();
+  }
+  if (j.has_graphnav_map_image_stream_name()) {
+    c->graphnav_map_image_stream_name = j.graphnav_map_image_stream_name().value();
+  }
+  if (j.has_graphnav_map_image_fps()) c->graphnav_map_image_fps = j.graphnav_map_image_fps().value();
+  if (j.has_graphnav_map_image_poll_hz()) {
+    c->graphnav_map_image_poll_hz = j.graphnav_map_image_poll_hz().value();
+  }
   if (j.has_twist_deadband()) c->twist_deadband = j.twist_deadband().value();
   if (j.has_teleop_idle_timeout_ms()) c->teleop_idle_timeout_ms = j.teleop_idle_timeout_ms().value();
   if (j.has_max_vx_mps()) c->max_vx_mps = j.max_vx_mps().value();
@@ -171,6 +185,17 @@ Config load_config_from_env() {
   c.localization_image_fps = getenv_int_or("LOCALIZATION_IMAGE_FPS", c.localization_image_fps);
   c.localization_image_poll_hz =
       getenv_int_or("LOCALIZATION_IMAGE_POLL_HZ", c.localization_image_poll_hz);
+  c.graphnav_global_localization_stream =
+      getenv_or("GRAPHNAV_GLOBAL_LOCALIZATION_STREAM", c.graphnav_global_localization_stream);
+  c.graphnav_map_stream = getenv_or("GRAPHNAV_MAP_STREAM", c.graphnav_map_stream);
+  c.graphnav_metadata_stream =
+      getenv_or("GRAPHNAV_METADATA_STREAM", c.graphnav_metadata_stream);
+  c.graphnav_map_image_stream_name =
+      getenv_or("GRAPHNAV_MAP_IMAGE_STREAM_NAME", c.graphnav_map_image_stream_name);
+  c.graphnav_map_image_fps =
+      getenv_int_or("GRAPHNAV_MAP_IMAGE_FPS", c.graphnav_map_image_fps);
+  c.graphnav_map_image_poll_hz =
+      getenv_int_or("GRAPHNAV_MAP_IMAGE_POLL_HZ", c.graphnav_map_image_poll_hz);
   c.max_body_pitch_rad = getenv_double_or("MAX_BODY_PITCH_RAD", c.max_body_pitch_rad);
   c.twist_deadband = getenv_double_or("TWIST_DEADBAND", c.twist_deadband);
   c.teleop_idle_timeout_ms = getenv_int_or("TELEOP_IDLE_TIMEOUT_MS", c.teleop_idle_timeout_ms);

@@ -347,12 +347,42 @@ void set_transform_from_pose3d(const SpotClient::Pose3D& pose, v1::model::Transf
   transform->mutable_rotation()->set_w(pose.qw);
 }
 
+SpotClient::Pose3D pose3d_from_localization_snapshot(
+    const SpotClient::LocalizationSnapshot& snapshot) {
+  SpotClient::Pose3D pose;
+  pose.x = snapshot.seed_tform_body_x;
+  pose.y = snapshot.seed_tform_body_y;
+  pose.z = snapshot.seed_tform_body_z;
+  pose.qx = snapshot.seed_tform_body_qx;
+  pose.qy = snapshot.seed_tform_body_qy;
+  pose.qz = snapshot.seed_tform_body_qz;
+  pose.qw = snapshot.seed_tform_body_qw;
+  return pose;
+}
+
+v1::model::Map build_formant_map(const SpotClient::OccupancyGridMapSnapshot& map_snapshot,
+                                 const std::string& uuid) {
+  v1::model::Map map;
+  map.set_uuid(uuid);
+  map.set_resolution(map_snapshot.resolution_m);
+  map.set_width(static_cast<uint32_t>(std::max(0, map_snapshot.width)));
+  map.set_height(static_cast<uint32_t>(std::max(0, map_snapshot.height)));
+  set_identity_transform(map.mutable_origin());
+  set_transform_from_pose3d(map_snapshot.seed_tform_grid, map.mutable_world_to_local());
+  for (int32_t cell : map_snapshot.occupancy) {
+    map.mutable_occupancy_grid()->add_data(cell);
+  }
+  return map;
+}
+
 v1::model::Localization build_formant_localization(
-    const SpotClient::LocalizationMapSnapshot& snapshot) {
+    const SpotClient::Pose3D& seed_tform_body,
+    const SpotClient::OccupancyGridMapSnapshot& map_snapshot,
+    const std::string& uuid) {
   v1::model::Localization localization;
 
   auto* odometry = localization.mutable_odometry();
-  set_transform_from_pose3d(snapshot.seed_tform_body, odometry->mutable_pose());
+  set_transform_from_pose3d(seed_tform_body, odometry->mutable_pose());
   set_identity_transform(odometry->mutable_world_to_local());
   odometry->mutable_twist()->mutable_linear()->set_x(0.0);
   odometry->mutable_twist()->mutable_linear()->set_y(0.0);
@@ -361,18 +391,255 @@ v1::model::Localization build_formant_localization(
   odometry->mutable_twist()->mutable_angular()->set_y(0.0);
   odometry->mutable_twist()->mutable_angular()->set_z(0.0);
 
-  auto* map = localization.mutable_map();
-  map->set_uuid(snapshot.waypoint_id + ":" + snapshot.map.map_type);
-  map->set_resolution(snapshot.map.resolution_m);
-  map->set_width(static_cast<uint32_t>(snapshot.map.width));
-  map->set_height(static_cast<uint32_t>(snapshot.map.height));
-  set_identity_transform(map->mutable_origin());
-  set_transform_from_pose3d(snapshot.map.seed_tform_grid, map->mutable_world_to_local());
-  for (int32_t cell : snapshot.map.occupancy) {
-    map->mutable_occupancy_grid()->add_data(cell);
+  *localization.mutable_map() = build_formant_map(map_snapshot, uuid);
+  return localization;
+}
+
+v1::model::Localization build_formant_localization(
+    const SpotClient::LocalizationMapSnapshot& snapshot) {
+  return build_formant_localization(snapshot.seed_tform_body, snapshot.map,
+                                    snapshot.waypoint_id + ":" + snapshot.map.map_type);
+}
+
+uint64_t fnv1a64(const std::string& data) {
+  uint64_t hash = 1469598103934665603ULL;
+  for (unsigned char ch : data) {
+    hash ^= static_cast<uint64_t>(ch);
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+uint64_t fnv1a64_append(uint64_t hash, const std::string& data) {
+  for (unsigned char ch : data) {
+    hash ^= static_cast<uint64_t>(ch);
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+std::string hex_u64(uint64_t value) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string out(16, '0');
+  for (int i = 15; i >= 0; --i) {
+    out[static_cast<size_t>(i)] = kHex[value & 0x0fULL];
+    value >>= 4U;
+  }
+  return out;
+}
+
+std::string build_graphnav_map_uuid(const std::string& map_id,
+                                    const SpotClient::StoredMap& map_data) {
+  std::string graph_bytes;
+  (void)map_data.graph.SerializeToString(&graph_bytes);
+  uint64_t hash = fnv1a64(graph_bytes);
+
+  std::vector<const ::bosdyn::api::graph_nav::WaypointSnapshot*> waypoint_snapshots;
+  waypoint_snapshots.reserve(map_data.waypoint_snapshots.size());
+  for (const auto& snapshot : map_data.waypoint_snapshots) {
+    waypoint_snapshots.push_back(&snapshot);
+  }
+  std::sort(waypoint_snapshots.begin(), waypoint_snapshots.end(),
+            [](const auto* lhs, const auto* rhs) {
+              if (!lhs || !rhs) return lhs < rhs;
+              return lhs->id() < rhs->id();
+            });
+  for (const auto* snapshot : waypoint_snapshots) {
+    if (!snapshot) continue;
+    std::string snapshot_bytes;
+    (void)snapshot->SerializeToString(&snapshot_bytes);
+    hash = fnv1a64_append(hash, snapshot_bytes);
   }
 
-  return localization;
+  std::vector<const ::bosdyn::api::graph_nav::EdgeSnapshot*> edge_snapshots;
+  edge_snapshots.reserve(map_data.edge_snapshots.size());
+  for (const auto& snapshot : map_data.edge_snapshots) {
+    edge_snapshots.push_back(&snapshot);
+  }
+  std::sort(edge_snapshots.begin(), edge_snapshots.end(),
+            [](const auto* lhs, const auto* rhs) {
+              if (!lhs || !rhs) return lhs < rhs;
+              return lhs->id() < rhs->id();
+            });
+  for (const auto* snapshot : edge_snapshots) {
+    if (!snapshot) continue;
+    std::string snapshot_bytes;
+    (void)snapshot->SerializeToString(&snapshot_bytes);
+    hash = fnv1a64_append(hash, snapshot_bytes);
+  }
+
+  return (map_id.empty() ? std::string("graphnav") : map_id) + ":" + hex_u64(hash);
+}
+
+std::string pose3d_to_json(const SpotClient::Pose3D& pose);
+
+std::string build_graphnav_metadata_json(
+    const std::string& map_id,
+    const std::string& map_uuid,
+    const SpotClient::GraphNavMapSnapshot& graphnav_snapshot,
+    const std::unordered_map<std::string, std::vector<std::string>>& aliases_by_waypoint,
+    const std::string& dock_waypoint_id) {
+  std::ostringstream metadata;
+  metadata << "{\"map_id\":\"" << json_escape(map_id)
+           << "\",\"map_uuid\":\"" << json_escape(map_uuid)
+           << "\",\"has_anchoring\":" << (graphnav_snapshot.has_anchoring ? "true" : "false")
+           << ",\"has_map\":" << (graphnav_snapshot.has_map ? "true" : "false");
+  if (graphnav_snapshot.has_map) {
+    metadata << ",\"map\":{\"type\":\"" << json_escape(graphnav_snapshot.map.map_type)
+             << "\",\"resolution_m\":" << graphnav_snapshot.map.resolution_m
+             << ",\"width\":" << graphnav_snapshot.map.width
+             << ",\"height\":" << graphnav_snapshot.map.height
+             << ",\"seed_tform_grid\":" << pose3d_to_json(graphnav_snapshot.map.seed_tform_grid)
+             << "}";
+  }
+  metadata << ",\"waypoints\":[";
+  for (size_t i = 0; i < graphnav_snapshot.waypoints.size(); ++i) {
+    const auto& waypoint = graphnav_snapshot.waypoints[i];
+    const auto alias_it = aliases_by_waypoint.find(waypoint.id);
+    const std::vector<std::string>* aliases =
+        (alias_it == aliases_by_waypoint.end()) ? nullptr : &alias_it->second;
+    const std::string display_name =
+        (aliases && !aliases->empty()) ? aliases->front()
+                                       : (waypoint.label.empty() ? waypoint.id : waypoint.label);
+    if (i > 0) metadata << ",";
+    metadata << "{\"id\":\"" << json_escape(waypoint.id)
+             << "\",\"snapshot_id\":\"" << json_escape(waypoint.snapshot_id)
+             << "\",\"label\":\"" << json_escape(waypoint.label)
+             << "\",\"display_name\":\"" << json_escape(display_name)
+             << "\",\"is_dock\":" << (waypoint.id == dock_waypoint_id ? "true" : "false")
+             << ",\"aliases\":[";
+    if (aliases) {
+      for (size_t alias_index = 0; alias_index < aliases->size(); ++alias_index) {
+        if (alias_index > 0) metadata << ",";
+        metadata << "\"" << json_escape((*aliases)[alias_index]) << "\"";
+      }
+    }
+    metadata << "],\"seed_tform_waypoint\":" << pose3d_to_json(waypoint.seed_tform_waypoint)
+             << "}";
+  }
+  metadata << "],\"edges\":[";
+  for (size_t i = 0; i < graphnav_snapshot.edges.size(); ++i) {
+    const auto& edge = graphnav_snapshot.edges[i];
+    if (i > 0) metadata << ",";
+    metadata << "{\"from_waypoint_id\":\"" << json_escape(edge.from_waypoint_id)
+             << "\",\"to_waypoint_id\":\"" << json_escape(edge.to_waypoint_id)
+             << "\",\"snapshot_id\":\"" << json_escape(edge.snapshot_id)
+             << "\",\"from_tform_to\":" << pose3d_to_json(edge.from_tform_to)
+             << "}";
+  }
+  metadata << "],\"objects\":[";
+  for (size_t i = 0; i < graphnav_snapshot.objects.size(); ++i) {
+    const auto& object = graphnav_snapshot.objects[i];
+    if (i > 0) metadata << ",";
+    metadata << "{\"id\":\"" << json_escape(object.id)
+             << "\",\"seed_tform_object\":" << pose3d_to_json(object.seed_tform_object)
+             << "}";
+  }
+  metadata << "]}";
+  return metadata.str();
+}
+
+std::string map_staging_directory(const std::string& map_dir) {
+  return map_dir + ".tmp";
+}
+
+std::string map_backup_directory(const std::string& map_dir) {
+  return map_dir + ".bak";
+}
+
+std::string map_staging_ready_marker(const std::string& temp_dir) {
+  return temp_dir + "/.complete";
+}
+
+bool recover_map_directory_state(const std::string& map_dir, std::string* out_error) {
+  std::error_code ec;
+  const std::string temp_dir = map_staging_directory(map_dir);
+  const std::string backup_dir = map_backup_directory(map_dir);
+
+  const bool has_map_dir = std::filesystem::exists(map_dir, ec);
+  if (ec) {
+    if (out_error) *out_error = "failed checking map directory: " + ec.message();
+    return false;
+  }
+  const bool has_backup_dir = std::filesystem::exists(backup_dir, ec);
+  if (ec) {
+    if (out_error) *out_error = "failed checking map backup directory: " + ec.message();
+    return false;
+  }
+  const bool has_temp_dir = std::filesystem::exists(temp_dir, ec);
+  if (ec) {
+    if (out_error) *out_error = "failed checking map staging directory: " + ec.message();
+    return false;
+  }
+
+  if (has_map_dir) {
+    if (has_backup_dir) {
+      std::filesystem::remove_all(backup_dir, ec);
+      if (ec) {
+        if (out_error) *out_error = "failed removing stale map backup: " + ec.message();
+        return false;
+      }
+    }
+    if (has_temp_dir) {
+      std::filesystem::remove_all(temp_dir, ec);
+      if (ec) {
+        if (out_error) *out_error = "failed removing stale map staging dir: " + ec.message();
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (has_backup_dir) {
+    if (has_temp_dir) {
+      std::filesystem::remove_all(temp_dir, ec);
+      if (ec) {
+        if (out_error) *out_error = "failed removing stale map staging dir: " + ec.message();
+        return false;
+      }
+    }
+    std::filesystem::rename(backup_dir, map_dir, ec);
+    if (ec) {
+      if (out_error) *out_error = "failed restoring map backup: " + ec.message();
+      return false;
+    }
+    return true;
+  }
+
+  if (has_temp_dir) {
+    const bool staging_ready = std::filesystem::exists(map_staging_ready_marker(temp_dir), ec);
+    if (ec) {
+      if (out_error) *out_error = "failed checking map staging marker: " + ec.message();
+      return false;
+    }
+    if (!staging_ready) {
+      std::filesystem::remove_all(temp_dir, ec);
+      if (ec) {
+        if (out_error) *out_error = "failed removing incomplete map staging dir: " + ec.message();
+        return false;
+      }
+    } else {
+      std::filesystem::rename(temp_dir, map_dir, ec);
+      if (ec) {
+        if (out_error) *out_error = "failed promoting staged map dir: " + ec.message();
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+std::string pose3d_to_json(const SpotClient::Pose3D& pose) {
+  std::ostringstream oss;
+  oss << "{\"x\":" << pose.x
+      << ",\"y\":" << pose.y
+      << ",\"z\":" << pose.z
+      << ",\"qx\":" << pose.qx
+      << ",\"qy\":" << pose.qy
+      << ",\"qz\":" << pose.qz
+      << ",\"qw\":" << pose.qw
+      << ",\"yaw_rad\":" << quaternion_yaw_rad(pose_quaternion(pose)) << "}";
+  return oss.str();
 }
 
 std::string fault_list_to_json(const std::vector<SpotClient::FaultInfo>& faults) {
@@ -732,6 +999,22 @@ bool Adapter::Init() {
   }
   force_waypoint_publish_ = true;
   force_maps_publish_ = true;
+  force_graphnav_metadata_publish_ = true;
+  next_graphnav_map_post_ms_ = 0;
+  graphnav_map_post_backoff_ms_ = 1000;
+  last_graphnav_map_posted_version_ = 0;
+
+  std::string initial_map_id;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    initial_map_id = active_map_id_;
+    if (initial_map_id.empty()) initial_map_id = default_map_id_;
+  }
+  if (!initial_map_id.empty()) {
+    (void)RefreshGraphNavMapArtifactsFromDisk(initial_map_id);
+  } else {
+    ClearGraphNavMapArtifacts();
+  }
   return true;
 }
 
@@ -790,6 +1073,12 @@ void Adapter::Run() {
                                              std::max(1, cfg_.localization_image_fps),
                                              std::max(1, cfg_.localization_image_poll_hz));
   }
+  if (!cfg_.graphnav_map_image_stream_name.empty()) {
+    graphnav_map_image_thread_ = std::thread(&Adapter::GraphNavMapImageLoop, this,
+                                             cfg_.graphnav_map_image_stream_name,
+                                             std::max(1, cfg_.graphnav_map_image_fps),
+                                             std::max(1, cfg_.graphnav_map_image_poll_hz));
+  }
   lease_thread_ = std::thread(&Adapter::LeaseRetainLoop, this);
   dock_thread_ = std::thread(&Adapter::DockLoop, this);
   connection_thread_ = std::thread(&Adapter::ConnectionLoop, this);
@@ -804,8 +1093,10 @@ void Adapter::Run() {
     FlushAdapterLogStream(now);
     PublishWaypointsText(false);
     PublishMapsText(false);
+    PublishGraphNavMetadataText(false);
     PublishCurrentMapText(false);
     PublishDefaultMapText(false);
+    MaybePublishGraphNavMap(now);
 
     if (HeartbeatExpired() && lease_owned_.load() && moving_.load()) {
       spot_.ZeroVelocity(cfg_.zero_velocity_repeats);
@@ -938,6 +1229,7 @@ void Adapter::Run() {
   }
   camera_threads_.clear();
   if (localization_image_thread_.joinable()) localization_image_thread_.join();
+  if (graphnav_map_image_thread_.joinable()) graphnav_map_image_thread_.join();
   if (lease_thread_.joinable()) lease_thread_.join();
   if (dock_thread_.joinable()) dock_thread_.join();
   if (connection_thread_.joinable()) connection_thread_.join();
@@ -1339,6 +1631,327 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
   if (sender.joinable()) sender.join();
 }
 
+void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_hz) {
+  const int output_period_ms = std::max(1, 1000 / std::max(1, fps));
+  const int poll_period_ms = std::max(200, 1000 / std::max(1, poll_hz));
+  CachedImageState cached_image;
+
+  auto build_frame = [](const std::shared_ptr<GraphNavMapArtifacts>& artifacts,
+                        const SpotClient::LocalizationSnapshot* localization,
+                        const std::unordered_map<std::string, std::string>& display_names,
+                        const std::unordered_set<std::string>& dock_waypoints,
+                        const std::string& status_title,
+                        const std::string& status_detail,
+                        std::string* out_jpg) -> bool {
+    if (!out_jpg) return false;
+
+    const cv::Scalar canvas_bg(16, 24, 34);
+    const cv::Scalar grid_minor(34, 47, 62);
+    const cv::Scalar grid_major(46, 64, 84);
+    const cv::Scalar text_primary(236, 240, 245);
+    const cv::Scalar text_secondary(154, 172, 190);
+    const cv::Scalar map_unknown(24, 33, 44);
+    const cv::Scalar map_free(73, 88, 105);
+    const cv::Scalar map_occupied(176, 193, 208);
+    const cv::Scalar map_occupied_edge(222, 232, 240);
+    const cv::Scalar waypoint_fill(224, 164, 72);
+    const cv::Scalar waypoint_dock(66, 186, 122);
+    const cv::Scalar edge_line(92, 128, 158);
+    const cv::Scalar robot_fill(48, 190, 245);
+    const cv::Scalar robot_outline(18, 25, 34);
+
+    const bool has_map = artifacts && artifacts->snapshot.has_map &&
+                         artifacts->snapshot.map.width > 0 &&
+                         artifacts->snapshot.map.height > 0 &&
+                         artifacts->snapshot.map.resolution_m > 0.0;
+
+    cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, canvas_bg);
+    for (int x = 0; x <= canvas.cols; x += 80) {
+      cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1),
+               (x % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
+    }
+    for (int y = 0; y <= canvas.rows; y += 80) {
+      cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y),
+               (y % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
+    }
+
+    if (!has_map) {
+      const cv::Point center(canvas.cols / 2, canvas.rows / 2);
+      cv::circle(canvas, center, 54, cv::Scalar(48, 68, 88), 1, cv::LINE_AA);
+      cv::circle(canvas, center, 108, cv::Scalar(40, 58, 76), 1, cv::LINE_AA);
+      cv::line(canvas, cv::Point(center.x - 18, center.y), cv::Point(center.x + 18, center.y),
+               cv::Scalar(78, 104, 132), 1, cv::LINE_AA);
+      cv::line(canvas, cv::Point(center.x, center.y - 18), cv::Point(center.x, center.y + 18),
+               cv::Scalar(78, 104, 132), 1, cv::LINE_AA);
+
+      const std::string title = status_title.empty() ? "Waiting for saved GraphNav map" : status_title;
+      int baseline = 0;
+      const cv::Size title_size =
+          cv::getTextSize(title, cv::FONT_HERSHEY_SIMPLEX, 0.9, 2, &baseline);
+      const cv::Point title_pt((canvas.cols - title_size.width) / 2, (canvas.rows / 2) + 18);
+      cv::putText(canvas, title, title_pt, cv::FONT_HERSHEY_SIMPLEX, 0.9, text_primary, 2,
+                  cv::LINE_AA);
+      int detail_y = title_pt.y + 34;
+      for (const auto& line : wrap_text(status_detail.empty()
+                                            ? "Waiting for a stitched GraphNav map to be available."
+                                            : status_detail,
+                                        46)) {
+        cv::putText(canvas, line,
+                    cv::Point(std::max(32, (canvas.cols - 960) / 2), detail_y),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.56,
+                    text_secondary, 1, cv::LINE_AA);
+        detail_y += 26;
+      }
+      return encode_jpeg(canvas, out_jpg);
+    }
+
+    const auto& map = artifacts->snapshot.map;
+    cv::Mat grid_image(map.height, map.width, CV_8UC3, map_unknown);
+    cv::Mat occupied_mask(map.height, map.width, CV_8UC1, cv::Scalar(0));
+    for (int y = 0; y < map.height; ++y) {
+      for (int x = 0; x < map.width; ++x) {
+        const size_t idx = static_cast<size_t>(x) +
+                           static_cast<size_t>(map.width) * static_cast<size_t>(y);
+        const int draw_y = map.height - 1 - y;
+        const int32_t value = map.occupancy[idx];
+        cv::Vec3b* px = &grid_image.at<cv::Vec3b>(draw_y, x);
+        if (value < 0) {
+          *px = cv::Vec3b(static_cast<uchar>(map_unknown[0]),
+                          static_cast<uchar>(map_unknown[1]),
+                          static_cast<uchar>(map_unknown[2]));
+        } else if (value >= 50) {
+          *px = cv::Vec3b(static_cast<uchar>(map_occupied[0]),
+                          static_cast<uchar>(map_occupied[1]),
+                          static_cast<uchar>(map_occupied[2]));
+          occupied_mask.at<uchar>(draw_y, x) = 255;
+        } else {
+          *px = cv::Vec3b(static_cast<uchar>(map_free[0]),
+                          static_cast<uchar>(map_free[1]),
+                          static_cast<uchar>(map_free[2]));
+        }
+      }
+    }
+
+    const int pad_x = 40;
+    const int pad_top = 56;
+    const int pad_bottom = 34;
+    const int available_width = std::max(1, canvas.cols - (pad_x * 2));
+    const int available_height = std::max(1, canvas.rows - pad_top - pad_bottom);
+    const double scale = std::min(static_cast<double>(available_width) / std::max(1, map.width),
+                                  static_cast<double>(available_height) / std::max(1, map.height));
+    const int draw_width = std::max(1, cvRound(map.width * scale));
+    const int draw_height = std::max(1, cvRound(map.height * scale));
+    const int draw_x = (canvas.cols - draw_width) / 2;
+    const int draw_y = pad_top + ((available_height - draw_height) / 2);
+    const cv::Rect draw_rect(draw_x, draw_y, draw_width, draw_height);
+
+    cv::Mat scaled_grid;
+    cv::resize(grid_image, scaled_grid, draw_rect.size(), 0.0, 0.0, cv::INTER_NEAREST);
+    scaled_grid.copyTo(canvas(draw_rect));
+
+    cv::Mat scaled_mask;
+    cv::resize(occupied_mask, scaled_mask, draw_rect.size(), 0.0, 0.0, cv::INTER_NEAREST);
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(scaled_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    for (const auto& contour : contours) {
+      if (contour.size() < 3) continue;
+      std::vector<cv::Point> shifted;
+      shifted.reserve(contour.size());
+      for (const auto& point : contour) {
+        shifted.emplace_back(point.x + draw_rect.x, point.y + draw_rect.y);
+      }
+      cv::polylines(canvas, shifted, true, map_occupied_edge, 1, cv::LINE_AA);
+    }
+    cv::rectangle(canvas, draw_rect, cv::Scalar(90, 110, 128), 1, cv::LINE_AA);
+
+    auto local_to_pixel = [&](double local_x_m, double local_y_m) {
+      const double grid_x = local_x_m / map.resolution_m;
+      const double grid_y = local_y_m / map.resolution_m;
+      const double pixel_x = draw_rect.x + (grid_x * scale);
+      const double pixel_y = draw_rect.y + draw_rect.height - (grid_y * scale);
+      return cv::Point(cvRound(pixel_x), cvRound(pixel_y));
+    };
+
+    std::unordered_map<std::string, SpotClient::Pose3D> local_waypoints;
+    local_waypoints.reserve(artifacts->snapshot.waypoints.size());
+    const SpotClient::Pose3D map_tform_seed = inverse_pose(map.seed_tform_grid);
+    for (const auto& waypoint : artifacts->snapshot.waypoints) {
+      local_waypoints[waypoint.id] =
+          compose_pose(map_tform_seed, waypoint.seed_tform_waypoint);
+    }
+
+    for (const auto& edge : artifacts->snapshot.edges) {
+      const auto from_it = local_waypoints.find(edge.from_waypoint_id);
+      const auto to_it = local_waypoints.find(edge.to_waypoint_id);
+      if (from_it == local_waypoints.end() || to_it == local_waypoints.end()) continue;
+      cv::line(canvas, local_to_pixel(from_it->second.x, from_it->second.y),
+               local_to_pixel(to_it->second.x, to_it->second.y), edge_line, 1, cv::LINE_AA);
+    }
+
+    const bool draw_labels = artifacts->snapshot.waypoints.size() <= 28;
+    for (const auto& waypoint : artifacts->snapshot.waypoints) {
+      const auto pose_it = local_waypoints.find(waypoint.id);
+      if (pose_it == local_waypoints.end()) continue;
+      const auto label_it = display_names.find(waypoint.id);
+      const std::string display_name =
+          (label_it == display_names.end()) ? waypoint.label : label_it->second;
+      const bool is_dock = dock_waypoints.find(waypoint.id) != dock_waypoints.end();
+      const bool is_current =
+          localization && !localization->waypoint_id.empty() &&
+          localization->waypoint_id == waypoint.id;
+      const cv::Point point = local_to_pixel(pose_it->second.x, pose_it->second.y);
+      const cv::Scalar fill_color = is_dock ? waypoint_dock : waypoint_fill;
+      const int radius = is_current ? 7 : 5;
+      cv::circle(canvas, point, radius + 2, robot_outline, cv::FILLED, cv::LINE_AA);
+      cv::circle(canvas, point, radius, fill_color, cv::FILLED, cv::LINE_AA);
+      cv::circle(canvas, point, radius, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+      if (draw_labels && !display_name.empty()) {
+        cv::putText(canvas, display_name, cv::Point(point.x + 8, point.y - 8),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.38, robot_outline, 2, cv::LINE_AA);
+        cv::putText(canvas, display_name, cv::Point(point.x + 8, point.y - 8),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.38, text_primary, 1, cv::LINE_AA);
+      }
+    }
+
+    if (localization && localization->has_seed_tform_body) {
+      const SpotClient::Pose3D seed_tform_body = pose3d_from_localization_snapshot(*localization);
+      const SpotClient::Pose3D map_tform_body = compose_pose(map_tform_seed, seed_tform_body);
+      const double yaw_rad = quaternion_yaw_rad(pose_quaternion(map_tform_body));
+      const double c = std::cos(yaw_rad);
+      const double s = std::sin(yaw_rad);
+      const std::array<cv::Point2d, 4> footprint_local = {
+          cv::Point2d(0.45, 0.25), cv::Point2d(0.45, -0.25),
+          cv::Point2d(-0.45, -0.25), cv::Point2d(-0.45, 0.25)};
+      std::vector<cv::Point> footprint_pixels;
+      footprint_pixels.reserve(footprint_local.size());
+      for (const auto& corner : footprint_local) {
+        const double px = map_tform_body.x + c * corner.x - s * corner.y;
+        const double py = map_tform_body.y + s * corner.x + c * corner.y;
+        footprint_pixels.push_back(local_to_pixel(px, py));
+      }
+      cv::Mat overlay = canvas.clone();
+      cv::circle(overlay, local_to_pixel(map_tform_body.x, map_tform_body.y),
+                 std::max(10, cvRound(scale * 3.5)), robot_fill, cv::FILLED, cv::LINE_AA);
+      cv::addWeighted(overlay, 0.14, canvas, 0.86, 0.0, canvas);
+      cv::fillConvexPoly(canvas, footprint_pixels, robot_fill, cv::LINE_AA);
+      cv::polylines(canvas, footprint_pixels, true, robot_outline, 2, cv::LINE_AA);
+      const cv::Point body_center = local_to_pixel(map_tform_body.x, map_tform_body.y);
+      const cv::Point arrow_tip =
+          local_to_pixel(map_tform_body.x + (c * 0.8), map_tform_body.y + (s * 0.8));
+      cv::circle(canvas, body_center, 4, robot_outline, cv::FILLED, cv::LINE_AA);
+      cv::arrowedLine(canvas, body_center, arrow_tip, robot_outline, 3, cv::LINE_AA, 0, 0.28);
+    }
+
+    const double span_x_m = map.width * map.resolution_m;
+    double scale_bar_m = 1.0;
+    if (span_x_m >= 12.0) scale_bar_m = 2.0;
+    if (span_x_m >= 24.0) scale_bar_m = 5.0;
+    if (span_x_m >= 60.0) scale_bar_m = 10.0;
+    const int scale_bar_px = std::max(1, cvRound((scale_bar_m / map.resolution_m) * scale));
+    const cv::Point scale_start(draw_rect.x + 18, draw_rect.y + draw_rect.height - 18);
+    const cv::Point scale_end(scale_start.x + scale_bar_px, scale_start.y);
+    cv::line(canvas, cv::Point(scale_start.x, scale_start.y + 1),
+             cv::Point(scale_end.x, scale_end.y + 1), robot_outline, 5, cv::LINE_AA);
+    cv::line(canvas, scale_start, scale_end, text_primary, 3, cv::LINE_AA);
+    cv::line(canvas, cv::Point(scale_start.x, scale_start.y - 5),
+             cv::Point(scale_start.x, scale_start.y + 5), text_primary, 2, cv::LINE_AA);
+    cv::line(canvas, cv::Point(scale_end.x, scale_end.y - 5),
+             cv::Point(scale_end.x, scale_end.y + 5), text_primary, 2, cv::LINE_AA);
+    cv::putText(canvas, format_decimal(scale_bar_m, scale_bar_m >= 5.0 ? 0 : 1) + " m",
+                cv::Point(scale_end.x + 12, scale_start.y + 5), cv::FONT_HERSHEY_SIMPLEX, 0.48,
+                text_primary, 1, cv::LINE_AA);
+
+    fill_rect_alpha(&canvas, cv::Rect(14, 12, canvas.cols - 28, 72), cv::Scalar(10, 15, 22), 0.72);
+    const std::string title = status_title.empty() ? "GraphNav global map" : status_title;
+    cv::putText(canvas, title, cv::Point(28, 42), cv::FONT_HERSHEY_SIMPLEX, 0.82, text_primary, 2,
+                cv::LINE_AA);
+    std::string detail = status_detail;
+    if (detail.empty()) {
+      detail = "map=" + artifacts->map_id + " waypoints=" +
+               std::to_string(artifacts->snapshot.waypoints.size()) + " edges=" +
+               std::to_string(artifacts->snapshot.edges.size());
+    }
+    cv::putText(canvas, detail, cv::Point(28, 68), cv::FONT_HERSHEY_SIMPLEX, 0.48, text_secondary,
+                1, cv::LINE_AA);
+
+    return encode_jpeg(canvas, out_jpg);
+  };
+
+  {
+    auto initial = std::make_shared<std::string>();
+    build_frame(nullptr, nullptr, {}, {}, "Waiting for saved GraphNav map",
+                "Waiting for a stitched GraphNav map to be available.", initial.get());
+    update_cached_image(&cached_image, std::move(initial));
+  }
+
+  std::thread sender([this, &cached_image, &stream, output_period_ms]() {
+    publish_cached_image_loop(&agent_, &running_, &cached_image, stream, output_period_ms, 250);
+  });
+
+  while (running_) {
+    std::shared_ptr<GraphNavMapArtifacts> artifacts;
+    std::unordered_map<std::string, std::string> display_names;
+    std::unordered_set<std::string> dock_waypoints;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      artifacts = graphnav_map_artifacts_;
+      if (artifacts) {
+        const auto alias_it = waypoint_aliases_by_map_.find(artifacts->map_id);
+        if (alias_it != waypoint_aliases_by_map_.end()) {
+          for (const auto& alias : alias_it->second) {
+            auto& current = display_names[alias.second];
+            if (current.empty() || alias.first < current) current = alias.first;
+          }
+        }
+        const auto dock_it = dock_waypoint_by_map_.find(artifacts->map_id);
+        if (dock_it != dock_waypoint_by_map_.end() && !dock_it->second.empty()) {
+          dock_waypoints.insert(dock_it->second);
+        }
+        for (const auto& waypoint : artifacts->snapshot.waypoints) {
+          if (display_names.find(waypoint.id) == display_names.end()) {
+            display_names[waypoint.id] = waypoint.label.empty() ? waypoint.id : waypoint.label;
+          }
+        }
+      }
+    }
+
+    SpotClient::LocalizationSnapshot localization;
+    SpotClient::LocalizationSnapshot* localization_ptr = nullptr;
+    std::string status_title = "GraphNav global map";
+    std::string status_detail;
+
+    if (!artifacts || !artifacts->snapshot.has_map) {
+      status_title = "Waiting for saved GraphNav map";
+      status_detail = "Waiting for a stitched GraphNav map to be available.";
+    } else if (!SpotConnected()) {
+      status_title = "Saved GraphNav map";
+      status_detail = "Robot disconnected. Showing the stitched map without a live pose.";
+    } else if (spot_.GetLocalizationSnapshot(&localization) && localization.has_seed_tform_body) {
+      localization_ptr = &localization;
+      status_detail = "map=" + artifacts->map_id + " live pose available";
+    } else {
+      status_title = "Saved GraphNav map";
+      status_detail = "Stitched map loaded, but live GraphNav pose is unavailable.";
+    }
+
+    auto rendered = std::make_shared<std::string>();
+    if (build_frame(artifacts, localization_ptr, display_names, dock_waypoints,
+                    status_title, status_detail, rendered.get())) {
+      update_cached_image(&cached_image, std::move(rendered));
+    }
+
+    const int step_ms = 50;
+    int slept_ms = 0;
+    while (running_ && slept_ms < poll_period_ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(
+          std::min(step_ms, poll_period_ms - slept_ms)));
+      slept_ms += step_ms;
+    }
+  }
+
+  if (sender.joinable()) sender.join();
+}
+
 void Adapter::LeaseRetainLoop() {
   const int period_ms = 100;
   const int periodic_publish_ms = 5000;  // 0.2 Hz
@@ -1350,6 +1963,7 @@ void Adapter::LeaseRetainLoop() {
   long long last_map_progress_pub_ms = 0;
   long long last_localization_pub_ms = 0;
   long long last_localization_viz_pub_ms = 0;
+  long long last_graphnav_global_localization_pub_ms = 0;
   while (running_) {
     const long long now = now_ms();
     MaybeRestoreActiveMap(now);
@@ -1474,6 +2088,26 @@ void Adapter::LeaseRetainLoop() {
                                       build_formant_localization(localization_map));
       }
       last_localization_viz_pub_ms = now;
+    }
+
+    if ((now - last_graphnav_global_localization_pub_ms) >= periodic_publish_ms && SpotConnected()) {
+      std::shared_ptr<GraphNavMapArtifacts> artifacts;
+      {
+        std::lock_guard<std::mutex> lk(map_mu_);
+        artifacts = graphnav_map_artifacts_;
+      }
+      if (artifacts && artifacts->snapshot.has_map &&
+          !cfg_.graphnav_global_localization_stream.empty()) {
+        SpotClient::LocalizationSnapshot localization;
+        if (spot_.GetLocalizationSnapshot(&localization) && localization.has_seed_tform_body) {
+          (void)agent_.PostLocalization(
+              cfg_.graphnav_global_localization_stream,
+              build_formant_localization(pose3d_from_localization_snapshot(localization),
+                                         artifacts->snapshot.map,
+                                         artifacts->map_uuid));
+        }
+      }
+      last_graphnav_global_localization_pub_ms = now;
     }
 
     PollCurrentWaypointAtStatus(now);
@@ -1787,6 +2421,7 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
   }
   next_map_restore_attempt_ms_ = 0;
   RefreshGraphWaypointIndex();
+  (void)RefreshGraphNavMapArtifacts(restore_map_id, map_data);
   force_waypoint_publish_ = true;
   force_maps_publish_ = true;
   EmitLog(std::string("[graphnav] restored active map: ") + restore_map_id);
@@ -2304,20 +2939,25 @@ bool Adapter::ExecuteWaypointGotoCommand(const v1::model::CommandRequest& reques
   if (!EnsureLeaseForCommand("spot.waypoint.goto")) return false;
   std::string text;
   (void)ExtractCommandText(request, &text);
+  std::string waypoint_id = Trim(ExtractParam(text, {"waypoint_id"}));
   std::string name = Trim(ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"}));
-  if (name.empty()) {
-    EmitLog("[graphnav] spot.waypoint.goto rejected: missing waypoint name");
+  if (waypoint_id.empty() && name.empty()) {
+    EmitLog("[graphnav] spot.waypoint.goto rejected: missing waypoint_id or waypoint name");
     return false;
   }
 
-  std::string waypoint_id;
-    {
-      std::lock_guard<std::mutex> lk(map_mu_);
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (waypoint_id.empty()) {
       if (!ResolveWaypointNameLocked(name, &waypoint_id)) {
         EmitLog(std::string("[graphnav] spot.waypoint.goto failed: unresolved or ambiguous name=") + name);
         return false;
       }
+    } else if (name.empty()) {
+      name = ResolveWaypointNameForIdLocked(waypoint_id);
+      if (name.empty()) name = waypoint_id;
     }
+  }
 
   uint32_t command_id = 0;
   if (!StartNavigateWithRecovery("spot.waypoint.goto", waypoint_id, &command_id)) return false;
@@ -2342,18 +2982,23 @@ bool Adapter::ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest
   if (!EnsureLeaseForCommand("spot.waypoint.goto_straight")) return false;
   std::string text;
   (void)ExtractCommandText(request, &text);
+  std::string waypoint_id = Trim(ExtractParam(text, {"waypoint_id"}));
   std::string name = Trim(ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"}));
-  if (name.empty()) {
-    EmitLog("[graphnav] spot.waypoint.goto_straight rejected: missing waypoint name");
+  if (waypoint_id.empty() && name.empty()) {
+    EmitLog("[graphnav] spot.waypoint.goto_straight rejected: missing waypoint_id or waypoint name");
     return false;
   }
 
-  std::string waypoint_id;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
-    if (!ResolveWaypointNameLocked(name, &waypoint_id)) {
-      EmitLog(std::string("[graphnav] spot.waypoint.goto_straight failed: unresolved or ambiguous name=") + name);
-      return false;
+    if (waypoint_id.empty()) {
+      if (!ResolveWaypointNameLocked(name, &waypoint_id)) {
+        EmitLog(std::string("[graphnav] spot.waypoint.goto_straight failed: unresolved or ambiguous name=") + name);
+        return false;
+      }
+    } else if (name.empty()) {
+      name = ResolveWaypointNameForIdLocked(waypoint_id);
+      if (name.empty()) name = waypoint_id;
     }
   }
 
@@ -3132,38 +3777,115 @@ bool Adapter::SaveCurrentMapToDisk(const std::string& map_id) {
   if (map_id.empty()) return false;
   SpotClient::StoredMap map_data;
   if (!spot_.DownloadCurrentMap(&map_data)) return false;
+  return SaveMapToDisk(map_id, map_data);
+}
 
-  std::error_code ec;
+bool Adapter::SaveMapToDisk(const std::string& map_id, const SpotClient::StoredMap& map_data) {
+  if (map_id.empty()) return false;
   const std::string map_dir = MapDirectoryFor(map_id);
-  std::filesystem::create_directories(map_dir + "/waypoints", ec);
-  std::filesystem::create_directories(map_dir + "/edges", ec);
+  std::string storage_error;
+  if (!recover_map_directory_state(map_dir, &storage_error)) {
+    EmitLog(std::string("[graphnav] failed preparing map directory: ") + storage_error);
+    return false;
+  }
+
+  const std::string temp_dir = map_staging_directory(map_dir);
+  const std::string backup_dir = map_backup_directory(map_dir);
+  const auto cleanup_temp_dir = [&temp_dir]() {
+    std::error_code cleanup_ec;
+    std::filesystem::remove_all(temp_dir, cleanup_ec);
+  };
+  std::error_code ec;
+  std::filesystem::remove_all(temp_dir, ec);
+  if (ec) {
+    EmitLog(std::string("[graphnav] failed clearing map staging dir: ") + ec.message());
+    return false;
+  }
+  std::filesystem::create_directories(temp_dir + "/waypoints", ec);
+  std::filesystem::create_directories(temp_dir + "/edges", ec);
   if (ec) {
     EmitLog(std::string("[graphnav] failed creating map directories: ") + ec.message());
+    cleanup_temp_dir();
     return false;
   }
 
   {
-    std::ofstream graph_out(map_dir + "/graph.bin", std::ios::binary | std::ios::trunc);
+    std::ofstream graph_out(temp_dir + "/graph.bin", std::ios::binary | std::ios::trunc);
     if (!graph_out || !map_data.graph.SerializeToOstream(&graph_out)) {
       EmitLog("[graphnav] failed writing graph file");
+      cleanup_temp_dir();
       return false;
     }
   }
 
   for (const auto& snapshot : map_data.waypoint_snapshots) {
-    std::ofstream out(map_dir + "/waypoints/" + sanitize_id_token(snapshot.id()) + ".bin",
+    std::ofstream out(temp_dir + "/waypoints/" + sanitize_id_token(snapshot.id()) + ".bin",
                       std::ios::binary | std::ios::trunc);
     if (!out || !snapshot.SerializeToOstream(&out)) {
       EmitLog("[graphnav] failed writing waypoint snapshot");
+      cleanup_temp_dir();
       return false;
     }
   }
   for (const auto& snapshot : map_data.edge_snapshots) {
-    std::ofstream out(map_dir + "/edges/" + sanitize_id_token(snapshot.id()) + ".bin",
+    std::ofstream out(temp_dir + "/edges/" + sanitize_id_token(snapshot.id()) + ".bin",
                       std::ios::binary | std::ios::trunc);
     if (!out || !snapshot.SerializeToOstream(&out)) {
       EmitLog("[graphnav] failed writing edge snapshot");
+      cleanup_temp_dir();
       return false;
+    }
+  }
+  {
+    std::ofstream ready_out(map_staging_ready_marker(temp_dir), std::ios::binary | std::ios::trunc);
+    if (!ready_out) {
+      EmitLog("[graphnav] failed writing map staging marker");
+      cleanup_temp_dir();
+      return false;
+    }
+  }
+
+  bool moved_existing_map = false;
+  const bool has_existing_map = std::filesystem::exists(map_dir, ec);
+  if (ec) {
+    EmitLog(std::string("[graphnav] failed checking existing map dir: ") + ec.message());
+    cleanup_temp_dir();
+    return false;
+  }
+  if (has_existing_map) {
+    std::filesystem::remove_all(backup_dir, ec);
+    if (ec) {
+      EmitLog(std::string("[graphnav] failed clearing map backup dir: ") + ec.message());
+      cleanup_temp_dir();
+      return false;
+    }
+    std::filesystem::rename(map_dir, backup_dir, ec);
+    if (ec) {
+      EmitLog(std::string("[graphnav] failed moving current map to backup: ") + ec.message());
+      cleanup_temp_dir();
+      return false;
+    }
+    moved_existing_map = true;
+  }
+
+  std::filesystem::rename(temp_dir, map_dir, ec);
+  if (ec) {
+    if (moved_existing_map) {
+      std::error_code restore_ec;
+      std::filesystem::rename(backup_dir, map_dir, restore_ec);
+      if (restore_ec) {
+        EmitLog(std::string("[graphnav] failed restoring map backup after save error: ") +
+                restore_ec.message());
+      }
+    }
+    EmitLog(std::string("[graphnav] failed promoting staged map dir: ") + ec.message());
+    return false;
+  }
+
+  if (moved_existing_map) {
+    std::filesystem::remove_all(backup_dir, ec);
+    if (ec) {
+      EmitLog(std::string("[graphnav] warning: failed removing map backup dir: ") + ec.message());
     }
   }
   return true;
@@ -3173,64 +3895,59 @@ bool Adapter::LoadMapFromDisk(const std::string& map_id, SpotClient::StoredMap* 
   if (!out_map || map_id.empty()) return false;
   SpotClient::StoredMap map_data;
   const std::string map_dir = MapDirectoryFor(map_id);
+  std::string storage_error;
+  if (!recover_map_directory_state(map_dir, &storage_error)) {
+    EmitLog(std::string("[graphnav] failed recovering saved map dir: ") + storage_error);
+    return false;
+  }
 
   {
     std::ifstream graph_in(map_dir + "/graph.bin", std::ios::binary);
     if (!graph_in || !map_data.graph.ParseFromIstream(&graph_in)) return false;
   }
 
-  std::unordered_set<std::string> expected_waypoint_snapshot_ids;
+  std::vector<std::string> expected_waypoint_snapshot_ids;
   expected_waypoint_snapshot_ids.reserve(static_cast<size_t>(map_data.graph.waypoints_size()));
+  std::unordered_set<std::string> seen_waypoint_snapshot_ids;
+  seen_waypoint_snapshot_ids.reserve(static_cast<size_t>(map_data.graph.waypoints_size()));
   for (const auto& waypoint : map_data.graph.waypoints()) {
-    if (!waypoint.snapshot_id().empty()) expected_waypoint_snapshot_ids.insert(waypoint.snapshot_id());
+    if (!waypoint.snapshot_id().empty() &&
+        seen_waypoint_snapshot_ids.insert(waypoint.snapshot_id()).second) {
+      expected_waypoint_snapshot_ids.push_back(waypoint.snapshot_id());
+    }
   }
 
-  std::unordered_set<std::string> expected_edge_snapshot_ids;
+  std::vector<std::string> expected_edge_snapshot_ids;
   expected_edge_snapshot_ids.reserve(static_cast<size_t>(map_data.graph.edges_size()));
+  std::unordered_set<std::string> seen_edge_snapshot_ids;
+  seen_edge_snapshot_ids.reserve(static_cast<size_t>(map_data.graph.edges_size()));
   for (const auto& edge : map_data.graph.edges()) {
-    if (!edge.snapshot_id().empty()) expected_edge_snapshot_ids.insert(edge.snapshot_id());
+    if (!edge.snapshot_id().empty() &&
+        seen_edge_snapshot_ids.insert(edge.snapshot_id()).second) {
+      expected_edge_snapshot_ids.push_back(edge.snapshot_id());
+    }
   }
 
-  std::unordered_set<std::string> loaded_waypoint_snapshot_ids;
-  std::unordered_set<std::string> loaded_edge_snapshot_ids;
-  std::error_code ec;
-
-  for (const auto& entry : std::filesystem::directory_iterator(map_dir + "/waypoints", ec)) {
-    if (ec) return false;
-    if (!entry.is_regular_file()) continue;
-    std::ifstream in(entry.path(), std::ios::binary);
+  map_data.waypoint_snapshots.reserve(expected_waypoint_snapshot_ids.size());
+  for (const auto& snapshot_id : expected_waypoint_snapshot_ids) {
+    std::ifstream in(map_dir + "/waypoints/" + sanitize_id_token(snapshot_id) + ".bin",
+                     std::ios::binary);
     if (!in) return false;
     ::bosdyn::api::graph_nav::WaypointSnapshot snapshot;
     if (!snapshot.ParseFromIstream(&in)) return false;
-    if (snapshot.id().empty()) return false;
-    loaded_waypoint_snapshot_ids.insert(snapshot.id());
+    if (snapshot.id() != snapshot_id) return false;
     map_data.waypoint_snapshots.push_back(std::move(snapshot));
   }
-  if (ec) return false;
 
-  ec.clear();
-  for (const auto& entry : std::filesystem::directory_iterator(map_dir + "/edges", ec)) {
-    if (ec) return false;
-    if (!entry.is_regular_file()) continue;
-    std::ifstream in(entry.path(), std::ios::binary);
+  map_data.edge_snapshots.reserve(expected_edge_snapshot_ids.size());
+  for (const auto& snapshot_id : expected_edge_snapshot_ids) {
+    std::ifstream in(map_dir + "/edges/" + sanitize_id_token(snapshot_id) + ".bin",
+                     std::ios::binary);
     if (!in) return false;
     ::bosdyn::api::graph_nav::EdgeSnapshot snapshot;
     if (!snapshot.ParseFromIstream(&in)) return false;
-    if (snapshot.id().empty()) return false;
-    loaded_edge_snapshot_ids.insert(snapshot.id());
+    if (snapshot.id() != snapshot_id) return false;
     map_data.edge_snapshots.push_back(std::move(snapshot));
-  }
-  if (ec) return false;
-
-  for (const auto& expected_id : expected_waypoint_snapshot_ids) {
-    if (loaded_waypoint_snapshot_ids.find(expected_id) == loaded_waypoint_snapshot_ids.end()) {
-      return false;
-    }
-  }
-  for (const auto& expected_id : expected_edge_snapshot_ids) {
-    if (loaded_edge_snapshot_ids.find(expected_id) == loaded_edge_snapshot_ids.end()) {
-      return false;
-    }
   }
 
   *out_map = std::move(map_data);
@@ -3240,7 +3957,12 @@ bool Adapter::LoadMapFromDisk(const std::string& map_id, SpotClient::StoredMap* 
 bool Adapter::DeleteMapFromDisk(const std::string& map_id) {
   if (map_id.empty()) return false;
   std::error_code ec;
-  std::filesystem::remove_all(MapDirectoryFor(map_id), ec);
+  const std::string map_dir = MapDirectoryFor(map_id);
+  std::filesystem::remove_all(map_dir, ec);
+  if (ec) return false;
+  std::filesystem::remove_all(map_staging_directory(map_dir), ec);
+  if (ec) return false;
+  std::filesystem::remove_all(map_backup_directory(map_dir), ec);
   return !ec;
 }
 
@@ -3308,6 +4030,126 @@ bool Adapter::SaveAdapterMapState() {
     out << "dock_waypoint\t" << entry.first << "\t" << entry.second << "\n";
   }
   return true;
+}
+
+void Adapter::ClearGraphNavMapArtifacts() {
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    graphnav_map_artifacts_.reset();
+    ++graphnav_map_artifacts_version_;
+  }
+  next_graphnav_map_post_ms_ = 0;
+  graphnav_map_post_backoff_ms_ = 1000;
+  last_graphnav_map_posted_version_ = 0;
+  force_graphnav_metadata_publish_ = true;
+}
+
+bool Adapter::RefreshGraphNavMapArtifacts(const std::string& map_id,
+                                          const SpotClient::StoredMap& map_data) {
+  SpotClient::GraphNavMapSnapshot graphnav_snapshot;
+  if (!spot_.BuildGraphNavMapSnapshot(map_data, &graphnav_snapshot)) {
+    EmitLog(std::string("[graphnav] failed to build stitched map snapshot map_id=") + map_id);
+    ClearGraphNavMapArtifacts();
+    return false;
+  }
+
+  std::unordered_map<std::string, std::vector<std::string>> aliases_by_waypoint;
+  std::string dock_waypoint_id;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    const auto alias_it = waypoint_aliases_by_map_.find(map_id);
+    if (alias_it != waypoint_aliases_by_map_.end()) {
+      for (const auto& alias : alias_it->second) {
+        aliases_by_waypoint[alias.second].push_back(alias.first);
+      }
+    }
+    const auto dock_it = dock_waypoint_by_map_.find(map_id);
+    if (dock_it != dock_waypoint_by_map_.end()) {
+      dock_waypoint_id = dock_it->second;
+    }
+  }
+  for (auto& kv : aliases_by_waypoint) {
+    std::sort(kv.second.begin(), kv.second.end());
+    kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+  }
+
+  const std::string map_uuid = build_graphnav_map_uuid(map_id, map_data);
+
+  auto artifacts = std::make_shared<GraphNavMapArtifacts>();
+  artifacts->map_id = map_id;
+  artifacts->map_uuid = map_uuid;
+  artifacts->snapshot = std::move(graphnav_snapshot);
+  artifacts->metadata_json = build_graphnav_metadata_json(
+      map_id, map_uuid, artifacts->snapshot, aliases_by_waypoint, dock_waypoint_id);
+
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    graphnav_map_artifacts_ = std::move(artifacts);
+    ++graphnav_map_artifacts_version_;
+  }
+  next_graphnav_map_post_ms_ = 0;
+  graphnav_map_post_backoff_ms_ = 1000;
+  force_graphnav_metadata_publish_ = true;
+  return true;
+}
+
+bool Adapter::RefreshGraphNavMapArtifactsFromDisk(const std::string& map_id) {
+  if (map_id.empty()) {
+    ClearGraphNavMapArtifacts();
+    return false;
+  }
+
+  SpotClient::StoredMap map_data;
+  if (!LoadMapFromDisk(map_id, &map_data)) {
+    EmitLog(std::string("[graphnav] failed loading stitched map artifacts map_id=") + map_id);
+    ClearGraphNavMapArtifacts();
+    return false;
+  }
+  return RefreshGraphNavMapArtifacts(map_id, map_data);
+}
+
+void Adapter::RefreshGraphNavMetadataForMap(const std::string& map_id) {
+  if (map_id.empty()) return;
+
+  std::unordered_map<std::string, std::vector<std::string>> aliases_by_waypoint;
+  std::string dock_waypoint_id;
+  std::shared_ptr<GraphNavMapArtifacts> current_artifacts;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    current_artifacts = graphnav_map_artifacts_;
+    if (!current_artifacts || current_artifacts->map_id != map_id) return;
+
+    const auto alias_it = waypoint_aliases_by_map_.find(map_id);
+    if (alias_it != waypoint_aliases_by_map_.end()) {
+      for (const auto& alias : alias_it->second) {
+        aliases_by_waypoint[alias.second].push_back(alias.first);
+      }
+    }
+    const auto dock_it = dock_waypoint_by_map_.find(map_id);
+    if (dock_it != dock_waypoint_by_map_.end()) {
+      dock_waypoint_id = dock_it->second;
+    }
+  }
+
+  for (auto& kv : aliases_by_waypoint) {
+    std::sort(kv.second.begin(), kv.second.end());
+    kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+  }
+
+  auto updated_artifacts = std::make_shared<GraphNavMapArtifacts>(*current_artifacts);
+  updated_artifacts->metadata_json = build_graphnav_metadata_json(
+      updated_artifacts->map_id, updated_artifacts->map_uuid, updated_artifacts->snapshot,
+      aliases_by_waypoint, dock_waypoint_id);
+
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (!graphnav_map_artifacts_ || graphnav_map_artifacts_->map_id != map_id ||
+        graphnav_map_artifacts_->map_uuid != current_artifacts->map_uuid) {
+      return;
+    }
+    graphnav_map_artifacts_ = std::move(updated_artifacts);
+  }
+  force_graphnav_metadata_publish_ = true;
 }
 
 void Adapter::RefreshGraphWaypointIndex() {
@@ -3452,6 +4294,7 @@ void Adapter::CommitDockWaypointCandidateOnSuccess() {
   if (!SaveAdapterMapState()) {
     EmitLog("[dock] warning: failed to persist dock waypoint state");
   }
+  RefreshGraphNavMetadataForMap(map_id);
   EmitLog("[dock] dock waypoint saved map_id=" + map_id + " waypoint_id=" + waypoint_id);
 }
 
@@ -3574,6 +4417,61 @@ void Adapter::PublishMapsText(bool force) {
   }
   QueueStatusText(cfg_.maps_text_stream, text);
   last_maps_pub_ms_ = now;
+}
+
+void Adapter::PublishGraphNavMetadataText(bool force) {
+  if (cfg_.graphnav_metadata_stream.empty()) return;
+  const long long kPeriodicMs = 5000;
+  const long long now = now_ms();
+  const bool force_flag = force_graphnav_metadata_publish_.exchange(false);
+  std::string payload;
+  bool changed = false;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    payload = graphnav_map_artifacts_ ? graphnav_map_artifacts_->metadata_json : "";
+    changed = (payload != last_graphnav_metadata_payload_);
+    if (changed) last_graphnav_metadata_payload_ = payload;
+  }
+  if (!force && !force_flag && !changed &&
+      (now - last_graphnav_metadata_pub_ms_.load()) < kPeriodicMs) {
+    return;
+  }
+  QueueStatusText(cfg_.graphnav_metadata_stream, payload);
+  last_graphnav_metadata_pub_ms_ = now;
+}
+
+void Adapter::MaybePublishGraphNavMap(long long now) {
+  if (cfg_.graphnav_map_stream.empty()) return;
+  if (now < next_graphnav_map_post_ms_.load()) return;
+
+  std::shared_ptr<GraphNavMapArtifacts> artifacts;
+  uint64_t version = 0;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    artifacts = graphnav_map_artifacts_;
+    version = graphnav_map_artifacts_version_;
+  }
+  if (!artifacts || !artifacts->snapshot.has_map) return;
+  if (version == last_graphnav_map_posted_version_) return;
+
+  const SpotClient::Pose3D identity_pose;
+  // The current vendored datapoint proto has no top-level Datapoint.map field.
+  // Keep the dedicated map stream isolated here so switching to agent_.PostMap(...)
+  // is a transport-only change when the upstream proto surface catches up.
+  const bool ok = agent_.PostLocalization(
+      cfg_.graphnav_map_stream,
+      build_formant_localization(identity_pose, artifacts->snapshot.map,
+                                 artifacts->map_uuid + ":map_only"));
+  if (ok) {
+    last_graphnav_map_posted_version_ = version;
+    graphnav_map_post_backoff_ms_ = 1000;
+    next_graphnav_map_post_ms_ = 0;
+    return;
+  }
+
+  const int backoff_ms = std::max(250, graphnav_map_post_backoff_ms_);
+  next_graphnav_map_post_ms_ = now + backoff_ms;
+  graphnav_map_post_backoff_ms_ = std::min(10000, backoff_ms * 2);
 }
 
 void Adapter::PublishCurrentMapText(bool force) {
@@ -3705,6 +4603,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
     if (!SaveAdapterMapState()) {
       EmitLog("[graphnav] map.create warning: failed to persist adapter map state");
     }
+    ClearGraphNavMapArtifacts();
     PublishWaypointsText(true);
     PublishMapsText(true);
     EmitLog(std::string("[graphnav] map created: ") + map_id);
@@ -3749,6 +4648,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       EmitLog(std::string("[graphnav] map.load localization warning: ") + spot_.LastError());
     }
     RefreshGraphWaypointIndex();
+    (void)RefreshGraphNavMapArtifacts(map_id, map_data);
     SaveAdapterMapState();
     PublishWaypointsText(true);
     PublishMapsText(true);
@@ -3842,6 +4742,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       return false;
     }
     SaveAdapterMapState();
+    if (clear_loaded_graph) ClearGraphNavMapArtifacts();
     PublishWaypointsText(true);
     PublishMapsText(true);
     EmitLog(std::string("[graphnav] map deleted: ") + map_id);
@@ -3896,10 +4797,11 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       active_map = EnsureActiveMapIdLocked();
     }
     if (!SaveCurrentMapToDisk(active_map)) {
-      EmitLog(std::string("[graphnav] stop_mapping saved graph failed: ") + spot_.LastError());
+      EmitLog("[graphnav] stop_mapping failed saving map to disk");
       return false;
     }
     RefreshGraphWaypointIndex();
+    (void)RefreshGraphNavMapArtifactsFromDisk(active_map);
     SaveAdapterMapState();
     PublishWaypointsText(true);
     PublishMapsText(true);
@@ -3955,6 +4857,12 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
       return false;
     }
     SaveAdapterMapState();
+    std::string active_map;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      active_map = active_map_id_;
+    }
+    RefreshGraphNavMetadataForMap(active_map);
     PublishWaypointsText(true);
     EmitLog(std::string("[graphnav] waypoint alias deleted: ") + name);
     return true;
@@ -4019,11 +4927,21 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
       active_map = EnsureActiveMapIdLocked();
       waypoint_aliases_by_map_[active_map][name] = waypoint_id;
     }
-    if (!SaveCurrentMapToDisk(active_map)) {
-      EmitLog(std::string("[graphnav] waypoint create warning: failed to save map to disk: ") +
-              spot_.LastError());
+    SpotClient::StoredMap live_map_data;
+    const bool have_live_map_data = spot_.DownloadCurrentMap(&live_map_data);
+    if (have_live_map_data) {
+      if (!SaveMapToDisk(active_map, live_map_data)) {
+        EmitLog("[graphnav] waypoint create warning: failed to save current map to disk");
+      }
+    } else if (!SaveCurrentMapToDisk(active_map)) {
+      EmitLog("[graphnav] waypoint create warning: failed to save current map to disk");
     }
     RefreshGraphWaypointIndex();
+    if (have_live_map_data) {
+      (void)RefreshGraphNavMapArtifacts(active_map, live_map_data);
+    } else {
+      (void)RefreshGraphNavMapArtifactsFromDisk(active_map);
+    }
     SaveAdapterMapState();
     PublishWaypointsText(true);
     PublishMapsText(true);

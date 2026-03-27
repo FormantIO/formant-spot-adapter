@@ -40,6 +40,12 @@ struct Config {
   std::string localization_image_stream_name{"spot.localization.image"};
   int localization_image_fps{15};
   int localization_image_poll_hz{2};
+  std::string graphnav_global_localization_stream{"spot.localization.graphnav.global"};
+  std::string graphnav_map_stream{"spot.map.graphnav"};
+  std::string graphnav_metadata_stream{"spot.graphnav.metadata"};
+  std::string graphnav_map_image_stream_name{"spot.map.graphnav.image"};
+  int graphnav_map_image_fps{15};
+  int graphnav_map_image_poll_hz{2};
   double twist_deadband{0.08};
   int teleop_idle_timeout_ms{300};
 

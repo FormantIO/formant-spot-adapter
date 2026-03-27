@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -28,6 +29,7 @@ class Adapter {
   void CameraLoop(const std::string& source, const std::string& stream, int output_fps,
                   int poll_hz, bool rotate_180, bool normalize_jpeg, int post_timeout_ms);
   void LocalizationImageLoop(const std::string& stream, int fps, int poll_hz);
+  void GraphNavMapImageLoop(const std::string& stream, int fps, int poll_hz);
   void LeaseRetainLoop();
   void HandleTeleop(const v1::model::ControlDatapoint& dp);
   void HandleHeartbeat(const v1::agent::GetTeleopHeartbeatStreamResponse& hb);
@@ -77,12 +79,19 @@ class Adapter {
   bool LoadAdapterMapState();
   bool SaveAdapterMapState();
   bool SaveCurrentMapToDisk(const std::string& map_id);
+  bool SaveMapToDisk(const std::string& map_id, const SpotClient::StoredMap& map_data);
   bool LoadMapFromDisk(const std::string& map_id, SpotClient::StoredMap* out_map);
   bool DeleteMapFromDisk(const std::string& map_id);
   std::string MapDirectoryFor(const std::string& map_id) const;
   void RefreshGraphWaypointIndex();
+  void ClearGraphNavMapArtifacts();
+  bool RefreshGraphNavMapArtifacts(const std::string& map_id, const SpotClient::StoredMap& map_data);
+  bool RefreshGraphNavMapArtifactsFromDisk(const std::string& map_id);
+  void RefreshGraphNavMetadataForMap(const std::string& map_id);
   void PublishWaypointsText(bool force);
   void PublishMapsText(bool force);
+  void PublishGraphNavMetadataText(bool force);
+  void MaybePublishGraphNavMap(long long now_ms);
   void PublishCurrentMapText(bool force);
   void PublishDefaultMapText(bool force);
   void PollCurrentWaypointAtStatus(long long now_ms);
@@ -149,6 +158,7 @@ class Adapter {
 
   std::vector<std::thread> camera_threads_;
   std::thread localization_image_thread_;
+  std::thread graphnav_map_image_thread_;
   std::thread lease_thread_;
   std::thread dock_thread_;
   std::thread connection_thread_;
@@ -208,8 +218,17 @@ class Adapter {
   std::unordered_map<std::string, std::string> loaded_waypoint_id_to_label_;
   std::unordered_map<std::string, std::vector<std::string>> loaded_waypoint_label_to_ids_;
   std::unordered_map<std::string, std::vector<std::string>> loaded_waypoint_lower_label_to_ids_;
+  struct GraphNavMapArtifacts {
+    std::string map_id;
+    std::string map_uuid;
+    SpotClient::GraphNavMapSnapshot snapshot;
+    std::string metadata_json;
+  };
+  std::shared_ptr<GraphNavMapArtifacts> graphnav_map_artifacts_;
+  uint64_t graphnav_map_artifacts_version_{0};
   std::string last_waypoint_text_payload_;
   std::string last_maps_text_payload_;
+  std::string last_graphnav_metadata_payload_;
   std::string last_current_map_text_payload_;
   std::string last_default_map_text_payload_;
   std::string last_map_progress_signature_;
@@ -226,19 +245,24 @@ class Adapter {
   std::atomic<long long> last_waypoint_at_poll_ms_{0};
   std::atomic<long long> last_waypoint_at_pub_ms_{0};
   std::atomic<long long> last_maps_pub_ms_{0};
+  std::atomic<long long> last_graphnav_metadata_pub_ms_{0};
   std::atomic<long long> last_current_map_pub_ms_{0};
   std::atomic<long long> last_default_map_pub_ms_{0};
+  std::atomic<long long> next_graphnav_map_post_ms_{0};
   std::atomic<long long> next_map_restore_attempt_ms_{0};
   std::atomic<long long> last_nav_feedback_poll_ms_{0};
   std::atomic<long long> last_nav_hold_log_ms_{0};
   std::atomic<long long> last_nav_diag_log_ms_{0};
   std::atomic<bool> force_waypoint_publish_{true};
   std::atomic<bool> force_maps_publish_{true};
+  std::atomic<bool> force_graphnav_metadata_publish_{true};
   std::string current_waypoint_at_text_;
   std::atomic<bool> map_recording_active_{false};
   std::atomic<bool> graphnav_navigation_active_{false};
   std::atomic<bool> nav_auto_recovered_{false};
   std::atomic<uint32_t> last_graph_nav_command_id_{0};
+  int graphnav_map_post_backoff_ms_{1000};
+  uint64_t last_graphnav_map_posted_version_{0};
   mutable std::mutex nav_state_mu_;
 
   static constexpr size_t kMaxCommandQueueDepth = 10;

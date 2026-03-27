@@ -136,6 +136,34 @@ class SpotClient {
     OccupancyGridMapSnapshot map;
   };
 
+  struct GraphNavWaypoint {
+    std::string id;
+    std::string snapshot_id;
+    std::string label;
+    Pose3D seed_tform_waypoint;
+  };
+
+  struct GraphNavEdge {
+    std::string from_waypoint_id;
+    std::string to_waypoint_id;
+    std::string snapshot_id;
+    Pose3D from_tform_to;
+  };
+
+  struct GraphNavObject {
+    std::string id;
+    Pose3D seed_tform_object;
+  };
+
+  struct GraphNavMapSnapshot {
+    bool has_anchoring{false};
+    bool has_map{false};
+    OccupancyGridMapSnapshot map;
+    std::vector<GraphNavWaypoint> waypoints;
+    std::vector<GraphNavEdge> edges;
+    std::vector<GraphNavObject> objects;
+  };
+
   SpotClient() = default;
 
   bool Connect(const std::string& host, const std::string& username, const std::string& password);
@@ -170,6 +198,7 @@ class SpotClient {
   bool DownloadCurrentGraph(::bosdyn::api::graph_nav::Graph* out_graph);
   bool DownloadCurrentMap(StoredMap* out_map);
   bool GetMappingStatus(MappingStatus* out_status);
+  bool BuildGraphNavMapSnapshot(const StoredMap& map_data, GraphNavMapSnapshot* out_snapshot);
   bool UploadGraphMap(const StoredMap& map_data);
   bool ClearGraph();
   bool SetLocalizationFiducial();

@@ -63,4 +63,10 @@ message AdapterConfig {
   google.protobuf.Int32Value surround_camera_fps = 57;
   google.protobuf.Int32Value surround_camera_poll_hz = 58;
   google.protobuf.BoolValue right_camera_rotate_180 = 59;
+  google.protobuf.StringValue graphnav_global_localization_stream = 60;
+  google.protobuf.StringValue graphnav_map_stream = 61;
+  google.protobuf.StringValue graphnav_metadata_stream = 62;
+  google.protobuf.StringValue graphnav_map_image_stream_name = 63;
+  google.protobuf.Int32Value graphnav_map_image_fps = 64;
+  google.protobuf.Int32Value graphnav_map_image_poll_hz = 65;
 }

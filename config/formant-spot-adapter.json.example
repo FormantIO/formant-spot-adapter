@@ -11,5 +11,11 @@
   "localizationImageStreamName": "spot.localization.image",
   "localizationImageFps": 15,
   "localizationImagePollHz": 2,
+  "graphnavGlobalLocalizationStream": "spot.localization.graphnav.global",
+  "graphnavMapStream": "spot.map.graphnav",
+  "graphnavMetadataStream": "spot.graphnav.metadata",
+  "graphnavMapImageStreamName": "spot.map.graphnav.image",
+  "graphnavMapImageFps": 15,
+  "graphnavMapImagePollHz": 2,
   "graphnavCommandTimeoutSec": 60
 }

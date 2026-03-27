@@ -1,11 +1,14 @@
 #include "formant_spot_adapter/spot_client.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "bosdyn/client/docking/docking_helpers.h"
@@ -274,16 +277,29 @@ bool local_grid_has_matching_layout(const ::bosdyn::api::LocalGrid& a,
          std::fabs(a.extent().cell_size() - b.extent().cell_size()) < 1e-9;
 }
 
-bool build_occupancy_grid_from_live_data(
-    const ::bosdyn::api::graph_nav::Localization& localization,
+::bosdyn::api::Vec3 make_vec3(double x, double y, double z) {
+  ::bosdyn::api::Vec3 out;
+  out.set_x(x);
+  out.set_y(y);
+  out.set_z(z);
+  return out;
+}
+
+struct DecodedLocalGrid {
+  std::string map_type;
+  double resolution_m{0.0};
+  int width{0};
+  int height{0};
+  ::bosdyn::api::FrameTreeSnapshot transforms_snapshot;
+  ::bosdyn::api::SE3Pose body_tform_grid;
+  std::vector<int32_t> occupancy;
+};
+
+bool build_decoded_local_grid(
     const google::protobuf::RepeatedPtrField<::bosdyn::api::LocalGrid>& local_grids,
-    SpotClient::OccupancyGridMapSnapshot* out_map,
+    DecodedLocalGrid* out_grid,
     std::string* out_error) {
-  if (!out_map) return false;
-  if (!localization.has_seed_tform_body()) {
-    if (out_error) *out_error = "localization missing seed_tform_body";
-    return false;
-  }
+  if (!out_grid) return false;
 
   const ::bosdyn::api::LocalGrid* no_step_grid = nullptr;
   const ::bosdyn::api::LocalGrid* obstacle_distance_grid = nullptr;
@@ -363,18 +379,81 @@ bool build_occupancy_grid_from_live_data(
     return false;
   }
 
+  DecodedLocalGrid decoded;
+  decoded.map_type = primary_grid->local_grid_type_name().empty()
+                         ? primary_grid->frame_name_local_grid_data()
+                         : primary_grid->local_grid_type_name();
+  decoded.resolution_m = primary_grid->extent().cell_size();
+  decoded.width = primary_grid->extent().num_cells_x();
+  decoded.height = primary_grid->extent().num_cells_y();
+  decoded.transforms_snapshot = primary_grid->transforms_snapshot();
+  decoded.body_tform_grid = body_tform_grid;
+  decoded.occupancy = std::move(occupancy);
+  *out_grid = std::move(decoded);
+  return true;
+}
+
+bool build_occupancy_grid_from_live_data(
+    const ::bosdyn::api::graph_nav::Localization& localization,
+    const google::protobuf::RepeatedPtrField<::bosdyn::api::LocalGrid>& local_grids,
+    SpotClient::OccupancyGridMapSnapshot* out_map,
+    std::string* out_error) {
+  if (!out_map) return false;
+  if (!localization.has_seed_tform_body()) {
+    if (out_error) *out_error = "localization missing seed_tform_body";
+    return false;
+  }
+
+  DecodedLocalGrid decoded;
+  if (!build_decoded_local_grid(local_grids, &decoded, out_error)) return false;
+
   SpotClient::OccupancyGridMapSnapshot map_snapshot;
-  map_snapshot.map_type = primary_grid->local_grid_type_name().empty()
-                              ? primary_grid->frame_name_local_grid_data()
-                              : primary_grid->local_grid_type_name();
-  map_snapshot.resolution_m = primary_grid->extent().cell_size();
-  map_snapshot.width = primary_grid->extent().num_cells_x();
-  map_snapshot.height = primary_grid->extent().num_cells_y();
-  fill_pose3d(localization.seed_tform_body() * body_tform_grid,
+  map_snapshot.map_type = decoded.map_type;
+  map_snapshot.resolution_m = decoded.resolution_m;
+  map_snapshot.width = decoded.width;
+  map_snapshot.height = decoded.height;
+  fill_pose3d(localization.seed_tform_body() * decoded.body_tform_grid,
               &map_snapshot.seed_tform_grid);
-  map_snapshot.occupancy = std::move(occupancy);
+  map_snapshot.occupancy = std::move(decoded.occupancy);
   *out_map = std::move(map_snapshot);
   return true;
+}
+
+struct AccumulatedOccupancyCell {
+  double known_weight{0.0};
+  double occupied_weight{0.0};
+};
+
+void accumulate_occupancy_sample(double seed_x,
+                                 double seed_y,
+                                 double min_x,
+                                 double min_y,
+                                 double resolution_m,
+                                 int width,
+                                 int height,
+                                 bool occupied,
+                                 std::vector<AccumulatedOccupancyCell>* accum) {
+  if (!accum || resolution_m <= 0.0 || width <= 0 || height <= 0) return;
+
+  const double grid_x = ((seed_x - min_x) / resolution_m) - 0.5;
+  const double grid_y = ((seed_y - min_y) / resolution_m) - 0.5;
+  const int x0 = static_cast<int>(std::floor(grid_x));
+  const int y0 = static_cast<int>(std::floor(grid_y));
+  const double tx = grid_x - static_cast<double>(x0);
+  const double ty = grid_y - static_cast<double>(y0);
+
+  const auto apply = [&](int cell_x, int cell_y, double weight) {
+    if (weight <= 0.0 || cell_x < 0 || cell_y < 0 || cell_x >= width || cell_y >= height) return;
+    auto& cell = (*accum)[static_cast<size_t>(cell_x) +
+                          static_cast<size_t>(width) * static_cast<size_t>(cell_y)];
+    cell.known_weight += weight;
+    if (occupied) cell.occupied_weight += weight;
+  };
+
+  apply(x0, y0, (1.0 - tx) * (1.0 - ty));
+  apply(x0 + 1, y0, tx * (1.0 - ty));
+  apply(x0, y0 + 1, (1.0 - tx) * ty);
+  apply(x0 + 1, y0 + 1, tx * ty);
 }
 
 }  // namespace
@@ -1059,6 +1138,208 @@ bool SpotClient::GetMappingStatus(MappingStatus* out_status) {
       status.visible_fiducial_ids.end());
 
   *out_status = std::move(status);
+  return true;
+}
+
+bool SpotClient::BuildGraphNavMapSnapshot(const StoredMap& map_data,
+                                          GraphNavMapSnapshot* out_snapshot) {
+  if (!out_snapshot) return false;
+
+  GraphNavMapSnapshot snapshot;
+  const auto& graph = map_data.graph;
+
+  std::unordered_map<std::string, ::bosdyn::api::SE3Pose> anchors_by_waypoint;
+  anchors_by_waypoint.reserve(static_cast<size_t>(graph.anchoring().anchors_size()));
+  for (const auto& anchor : graph.anchoring().anchors()) {
+    if (anchor.id().empty()) continue;
+    anchors_by_waypoint[anchor.id()] = anchor.seed_tform_waypoint();
+  }
+  snapshot.has_anchoring = !anchors_by_waypoint.empty();
+
+  snapshot.waypoints.reserve(static_cast<size_t>(graph.waypoints_size()));
+  for (const auto& waypoint : graph.waypoints()) {
+    const auto anchor_it = anchors_by_waypoint.find(waypoint.id());
+    if (anchor_it == anchors_by_waypoint.end()) continue;
+
+    GraphNavWaypoint out_waypoint;
+    out_waypoint.id = waypoint.id();
+    out_waypoint.snapshot_id = waypoint.snapshot_id();
+    out_waypoint.label = waypoint.annotations().name().empty() ? waypoint.id()
+                                                               : waypoint.annotations().name();
+    fill_pose3d(anchor_it->second, &out_waypoint.seed_tform_waypoint);
+    snapshot.waypoints.push_back(std::move(out_waypoint));
+  }
+
+  snapshot.edges.reserve(static_cast<size_t>(graph.edges_size()));
+  for (const auto& edge : graph.edges()) {
+    if (edge.id().from_waypoint().empty() || edge.id().to_waypoint().empty()) continue;
+    GraphNavEdge out_edge;
+    out_edge.from_waypoint_id = edge.id().from_waypoint();
+    out_edge.to_waypoint_id = edge.id().to_waypoint();
+    out_edge.snapshot_id = edge.snapshot_id();
+    fill_pose3d(edge.from_tform_to(), &out_edge.from_tform_to);
+    snapshot.edges.push_back(std::move(out_edge));
+  }
+
+  snapshot.objects.reserve(static_cast<size_t>(graph.anchoring().objects_size()));
+  for (const auto& object : graph.anchoring().objects()) {
+    if (object.id().empty()) continue;
+    GraphNavObject out_object;
+    out_object.id = object.id();
+    fill_pose3d(object.seed_tform_object(), &out_object.seed_tform_object);
+    snapshot.objects.push_back(std::move(out_object));
+  }
+
+  if (anchors_by_waypoint.empty()) {
+    *out_snapshot = std::move(snapshot);
+    return true;
+  }
+
+  std::unordered_map<std::string, const ::bosdyn::api::graph_nav::WaypointSnapshot*> snapshots_by_id;
+  snapshots_by_id.reserve(map_data.waypoint_snapshots.size());
+  for (const auto& waypoint_snapshot : map_data.waypoint_snapshots) {
+    if (waypoint_snapshot.id().empty()) continue;
+    snapshots_by_id[waypoint_snapshot.id()] = &waypoint_snapshot;
+  }
+
+  struct AnchoredLocalGrid {
+    DecodedLocalGrid grid;
+    ::bosdyn::api::SE3Pose seed_tform_grid;
+  };
+
+  std::vector<AnchoredLocalGrid> anchored_grids;
+  anchored_grids.reserve(snapshot.waypoints.size());
+  double min_x = std::numeric_limits<double>::infinity();
+  double min_y = std::numeric_limits<double>::infinity();
+  double min_z = std::numeric_limits<double>::infinity();
+  double max_x = -std::numeric_limits<double>::infinity();
+  double max_y = -std::numeric_limits<double>::infinity();
+  double base_resolution_m = std::numeric_limits<double>::infinity();
+
+  for (const auto& waypoint : graph.waypoints()) {
+    const auto anchor_it = anchors_by_waypoint.find(waypoint.id());
+    if (anchor_it == anchors_by_waypoint.end()) continue;
+    if (waypoint.snapshot_id().empty()) continue;
+
+    const auto snapshot_it = snapshots_by_id.find(waypoint.snapshot_id());
+    if (snapshot_it == snapshots_by_id.end() || !snapshot_it->second) continue;
+
+    DecodedLocalGrid decoded;
+    std::string decode_error;
+    if (!build_decoded_local_grid(snapshot_it->second->robot_local_grids(), &decoded, &decode_error)) {
+      continue;
+    }
+
+    ::bosdyn::api::SE3Pose ko_tform_body;
+    if (!::bosdyn::api::get_a_tform_b(decoded.transforms_snapshot,
+                                      ::bosdyn::api::kOdomFrame,
+                                      ::bosdyn::api::kBodyFrame,
+                                      &ko_tform_body)) {
+      continue;
+    }
+
+    const ::bosdyn::api::SE3Pose seed_tform_body =
+        anchor_it->second * waypoint.waypoint_tform_ko() * ko_tform_body;
+    const ::bosdyn::api::SE3Pose seed_tform_grid = seed_tform_body * decoded.body_tform_grid;
+
+    const double span_x_m = static_cast<double>(decoded.width) * decoded.resolution_m;
+    const double span_y_m = static_cast<double>(decoded.height) * decoded.resolution_m;
+    const std::array<::bosdyn::api::Vec3, 4> corners = {
+        make_vec3(0.0, 0.0, 0.0),
+        make_vec3(span_x_m, 0.0, 0.0),
+        make_vec3(0.0, span_y_m, 0.0),
+        make_vec3(span_x_m, span_y_m, 0.0),
+    };
+    for (const auto& corner : corners) {
+      const ::bosdyn::api::Vec3 seed_corner = seed_tform_grid * corner;
+      min_x = std::min(min_x, seed_corner.x());
+      min_y = std::min(min_y, seed_corner.y());
+      min_z = std::min(min_z, seed_corner.z());
+      max_x = std::max(max_x, seed_corner.x());
+      max_y = std::max(max_y, seed_corner.y());
+    }
+    base_resolution_m = std::min(base_resolution_m, decoded.resolution_m);
+
+    AnchoredLocalGrid anchored_grid;
+    anchored_grid.grid = std::move(decoded);
+    anchored_grid.seed_tform_grid = seed_tform_grid;
+    anchored_grids.push_back(std::move(anchored_grid));
+  }
+
+  if (anchored_grids.empty() || !std::isfinite(base_resolution_m) || base_resolution_m <= 0.0 ||
+      !std::isfinite(min_x) || !std::isfinite(min_y) || !std::isfinite(max_x) ||
+      !std::isfinite(max_y)) {
+    *out_snapshot = std::move(snapshot);
+    return true;
+  }
+
+  const double span_x_m = std::max(base_resolution_m, max_x - min_x);
+  const double span_y_m = std::max(base_resolution_m, max_y - min_y);
+  double output_resolution_m = base_resolution_m;
+  constexpr double kMaxGlobalMapCells = 1000000.0;
+  const double estimated_cells =
+      (span_x_m / output_resolution_m) * (span_y_m / output_resolution_m);
+  if (estimated_cells > kMaxGlobalMapCells) {
+    output_resolution_m =
+        std::max(output_resolution_m, std::sqrt((span_x_m * span_y_m) / kMaxGlobalMapCells));
+  }
+
+  const int width =
+      std::max(1, static_cast<int>(std::ceil(span_x_m / output_resolution_m)));
+  const int height =
+      std::max(1, static_cast<int>(std::ceil(span_y_m / output_resolution_m)));
+  std::vector<AccumulatedOccupancyCell> accum(
+      static_cast<size_t>(width) * static_cast<size_t>(height));
+
+  for (const auto& anchored_grid : anchored_grids) {
+    const auto& grid = anchored_grid.grid;
+    const ::bosdyn::api::Vec3 grid_origin = anchored_grid.seed_tform_grid * make_vec3(0.0, 0.0, 0.0);
+    const ::bosdyn::api::Vec3 step_x =
+        (anchored_grid.seed_tform_grid * make_vec3(grid.resolution_m, 0.0, 0.0)) - grid_origin;
+    const ::bosdyn::api::Vec3 step_y =
+        (anchored_grid.seed_tform_grid * make_vec3(0.0, grid.resolution_m, 0.0)) - grid_origin;
+    const ::bosdyn::api::Vec3 first_center =
+        anchored_grid.seed_tform_grid * make_vec3(grid.resolution_m * 0.5,
+                                                  grid.resolution_m * 0.5,
+                                                  0.0);
+
+    for (int y = 0; y < grid.height; ++y) {
+      const ::bosdyn::api::Vec3 row_center =
+          first_center + (static_cast<double>(y) * step_y);
+      for (int x = 0; x < grid.width; ++x) {
+        const int32_t cell = grid.occupancy[static_cast<size_t>(x) +
+                                            static_cast<size_t>(grid.width) * static_cast<size_t>(y)];
+        if (cell < 0) continue;
+        const ::bosdyn::api::Vec3 seed_center =
+            row_center + (static_cast<double>(x) * step_x);
+        accumulate_occupancy_sample(seed_center.x(), seed_center.y(), min_x, min_y,
+                                    output_resolution_m, width, height, cell >= 50, &accum);
+      }
+    }
+  }
+
+  SpotClient::OccupancyGridMapSnapshot stitched_map;
+  stitched_map.map_type = "graphnav_stitched";
+  stitched_map.resolution_m = output_resolution_m;
+  stitched_map.width = width;
+  stitched_map.height = height;
+  stitched_map.seed_tform_grid.x = min_x;
+  stitched_map.seed_tform_grid.y = min_y;
+  stitched_map.seed_tform_grid.z = std::isfinite(min_z) ? min_z : 0.0;
+  stitched_map.seed_tform_grid.qx = 0.0;
+  stitched_map.seed_tform_grid.qy = 0.0;
+  stitched_map.seed_tform_grid.qz = 0.0;
+  stitched_map.seed_tform_grid.qw = 1.0;
+  stitched_map.occupancy.resize(accum.size(), -1);
+  for (size_t i = 0; i < accum.size(); ++i) {
+    if (accum[i].known_weight <= 1e-9) continue;
+    const double occupied_ratio = accum[i].occupied_weight / accum[i].known_weight;
+    stitched_map.occupancy[i] = occupied_ratio >= 0.5 ? 100 : 0;
+  }
+
+  snapshot.has_map = true;
+  snapshot.map = std::move(stitched_map);
+  *out_snapshot = std::move(snapshot);
   return true;
 }
 

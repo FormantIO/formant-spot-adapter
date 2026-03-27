@@ -41,6 +41,18 @@ include_directories(
 add_subdirectory(${SPOT_CPP_SDK_DIR}/cpp ${CMAKE_BINARY_DIR}/spot_cpp_sdk_build EXCLUDE_FROM_ALL)
 
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
+# Clean up obsolete generated files from the pre-vendored Formant proto layout so
+# manual inspection of build/generated does not pick up stale message shapes.
+file(REMOVE
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/formant_agent.pb.cc
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/formant_agent.pb.h
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/formant_agent.grpc.pb.cc
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/formant_agent.grpc.pb.h
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/formant_model.pb.cc
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/formant_model.pb.h
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/formant_model.grpc.pb.cc
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/formant_model.grpc.pb.h
+)
 
 set(FORMANT_PROTO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/proto)
 set(PROTO_FILES
