@@ -107,7 +107,9 @@ target_link_libraries(formant-spot-adapter PRIVATE
   ${OpenCV_LIBS}
 )
 
+# The supported service deployment path for a source checkout is scripts/deploy.sh,
+# which generates a checkout-specific unit file. Keep cmake --install limited to
+# the binary and example configuration artifacts.
 install(TARGETS formant-spot-adapter RUNTIME DESTINATION /usr/local/bin)
-install(FILES systemd/formant-spot-adapter.service DESTINATION /etc/systemd/system)
-install(FILES config/formant-spot-adapter.env.example DESTINATION /etc)
-install(FILES config/formant-spot-adapter.json.example DESTINATION /etc)
+install(FILES config/formant-spot-adapter.env.example DESTINATION /usr/local/share/formant-spot-adapter/examples)
+install(FILES config/formant-spot-adapter.json.example DESTINATION /usr/local/share/formant-spot-adapter/examples)

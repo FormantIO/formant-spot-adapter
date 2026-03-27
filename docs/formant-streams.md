@@ -296,8 +296,8 @@ Command response behavior:
 - No auto-sit on heartbeat timeout.
 - Adapter enforces twist deadband and uses held-command resend for smoother teleop control.
 - Very short pitch-only zero pulses are filtered to reduce oscillation from pulsed joystick transport.
-- Camera auto-rotation can be enabled via `cameraAutoRotate` and uses `arm0.wr1` threshold
-  `cameraRotateWr1ThresholdRad` to rotate hand-camera frames 90 degrees CCW when wrist is turned.
+- Surround-camera JPEG frames are republished from cached images, and the right camera is rotated
+  180 degrees by default.
 - Arm hold mode is always active while lease is owned:
   - adapter continuously keeps the arm stowed/retracted
   - pressing `Reset Arm` immediately requests stow

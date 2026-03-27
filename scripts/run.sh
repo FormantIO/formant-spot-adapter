@@ -4,9 +4,34 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT_DIR}/build/formant-spot-adapter"
 ENV_FILE="${ENV_FILE:-${ROOT_DIR}/config/formant-spot-adapter.env}"
+ENV_EXAMPLE="${ROOT_DIR}/config/formant-spot-adapter.env.example"
 DEFAULT_CONFIG="${ROOT_DIR}/config/formant-spot-adapter.json"
+CONFIG_EXAMPLE="${ROOT_DIR}/config/formant-spot-adapter.json.example"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/logs}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/adapter-$(date +%Y%m%d-%H%M%S).log}"
+
+ensure_local_file() {
+  local example_path="$1"
+  local target_path="$2"
+  local label="$3"
+
+  if [[ -f "${target_path}" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${example_path}" ]]; then
+    echo "Missing ${label}: ${target_path}" >&2
+    echo "Also missing example file: ${example_path}" >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "${target_path}")"
+  cp "${example_path}" "${target_path}"
+  echo "[run] created ${label} from example: ${target_path}"
+}
+
+has_placeholder_credentials() {
+  [[ -z "${SPOT_USERNAME:-}" || -z "${SPOT_PASSWORD:-}" || "${SPOT_USERNAME}" == "user" || "${SPOT_PASSWORD}" == "changeme" ]]
+}
 
 if [[ ! -x "${BIN}" ]]; then
   echo "Missing binary: ${BIN}" >&2
@@ -14,7 +39,14 @@ if [[ ! -x "${BIN}" ]]; then
   exit 1
 fi
 
-# Load environment variables from env file if present and readable.
+export CONFIG_PATH="${CONFIG_PATH:-${DEFAULT_CONFIG}}"
+
+ensure_local_file "${ENV_EXAMPLE}" "${ENV_FILE}" "env file"
+ensure_local_file "${CONFIG_EXAMPLE}" "${CONFIG_PATH}" "config JSON"
+
+shell_spot_username="${SPOT_USERNAME:-}"
+shell_spot_password="${SPOT_PASSWORD:-}"
+
 if [[ -f "${ENV_FILE}" && -r "${ENV_FILE}" ]]; then
   # shellcheck source=/dev/null
   set -a
@@ -25,18 +57,16 @@ elif [[ -f "${ENV_FILE}" ]]; then
   echo "Set credentials in shell env or fix file permissions." >&2
 fi
 
-# Default config path if not supplied by env.
-export CONFIG_PATH="${CONFIG_PATH:-${DEFAULT_CONFIG}}"
-
-if [[ ! -f "${CONFIG_PATH}" ]]; then
-  echo "Missing config JSON: ${CONFIG_PATH}" >&2
-  echo "Expected ${ROOT_DIR}/config/formant-spot-adapter.json or set CONFIG_PATH." >&2
-  exit 1
+if [[ -n "${shell_spot_username}" ]]; then
+  export SPOT_USERNAME="${shell_spot_username}"
+fi
+if [[ -n "${shell_spot_password}" ]]; then
+  export SPOT_PASSWORD="${shell_spot_password}"
 fi
 
-if [[ -z "${SPOT_USERNAME:-}" || -z "${SPOT_PASSWORD:-}" ]]; then
-  echo "Missing SPOT_USERNAME/SPOT_PASSWORD." >&2
-  echo "Set them in ${ENV_FILE} or current shell env." >&2
+if has_placeholder_credentials; then
+  echo "Edit ${ENV_FILE} and set SPOT_USERNAME/SPOT_PASSWORD before running." >&2
+  echo "The file was created from ${ENV_EXAMPLE} if it did not already exist." >&2
   exit 1
 fi
 

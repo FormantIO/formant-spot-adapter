@@ -14,6 +14,11 @@ __pycache__/
 
 .env
 config/formant-spot-adapter.env
+config/formant-spot-adapter.json
+
+AGENTS.md
+PLAN.md
+IMPLEMENTATION_HISTORY.md
 
 compile_commands.json
 CMakeUserPresets.json

@@ -4,8 +4,33 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY_SCRIPT="${ROOT_DIR}/scripts/print_arm_state.py"
 ENV_FILE="${ENV_FILE:-${ROOT_DIR}/config/formant-spot-adapter.env}"
+ENV_EXAMPLE="${ROOT_DIR}/config/formant-spot-adapter.env.example"
 DEFAULT_CONFIG="${ROOT_DIR}/config/formant-spot-adapter.json"
+CONFIG_EXAMPLE="${ROOT_DIR}/config/formant-spot-adapter.json.example"
 PYTHON_BIN="${PYTHON_BIN:-}"
+
+ensure_local_file() {
+  local example_path="$1"
+  local target_path="$2"
+  local label="$3"
+
+  if [[ -f "${target_path}" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${example_path}" ]]; then
+    echo "Missing ${label}: ${target_path}" >&2
+    echo "Also missing example file: ${example_path}" >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "${target_path}")"
+  cp "${example_path}" "${target_path}"
+  echo "[arm_state] created ${label} from example: ${target_path}"
+}
+
+has_placeholder_credentials() {
+  [[ -z "${SPOT_USERNAME:-}" || -z "${SPOT_PASSWORD:-}" || "${SPOT_USERNAME}" == "user" || "${SPOT_PASSWORD}" == "changeme" ]]
+}
 
 if [[ -z "${PYTHON_BIN}" ]]; then
   if [[ -x "${ROOT_DIR}/.venv/bin/python3" ]]; then
@@ -27,7 +52,14 @@ if [[ ! -f "${PY_SCRIPT}" ]]; then
   exit 1
 fi
 
-# Load secrets/env overrides.
+export CONFIG_PATH="${CONFIG_PATH:-${DEFAULT_CONFIG}}"
+
+ensure_local_file "${ENV_EXAMPLE}" "${ENV_FILE}" "env file"
+ensure_local_file "${CONFIG_EXAMPLE}" "${CONFIG_PATH}" "config JSON"
+
+shell_spot_username="${SPOT_USERNAME:-}"
+shell_spot_password="${SPOT_PASSWORD:-}"
+
 if [[ -f "${ENV_FILE}" && -r "${ENV_FILE}" ]]; then
   set -a
   # shellcheck source=/dev/null
@@ -37,7 +69,12 @@ elif [[ -f "${ENV_FILE}" ]]; then
   echo "Warning: env file exists but is not readable: ${ENV_FILE}" >&2
 fi
 
-export CONFIG_PATH="${CONFIG_PATH:-${DEFAULT_CONFIG}}"
+if [[ -n "${shell_spot_username}" ]]; then
+  export SPOT_USERNAME="${shell_spot_username}"
+fi
+if [[ -n "${shell_spot_password}" ]]; then
+  export SPOT_PASSWORD="${shell_spot_password}"
+fi
 
 # Fill SPOT_HOST from config json if not provided.
 if [[ -z "${SPOT_HOST:-}" && -f "${CONFIG_PATH}" ]]; then
@@ -62,8 +99,8 @@ if [[ -z "${SPOT_HOST:-}" ]]; then
   echo "Missing SPOT_HOST (set env var or config json spotHost)." >&2
   exit 1
 fi
-if [[ -z "${SPOT_USERNAME:-}" || -z "${SPOT_PASSWORD:-}" ]]; then
-  echo "Missing SPOT_USERNAME/SPOT_PASSWORD (set in env file or shell env)." >&2
+if has_placeholder_credentials; then
+  echo "Edit ${ENV_FILE} and set SPOT_USERNAME/SPOT_PASSWORD before running arm_state." >&2
   exit 1
 fi
 

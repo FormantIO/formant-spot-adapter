@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
+if [[ ! -d build ]]; then
+  echo "[install] missing build directory: ${ROOT_DIR}/build" >&2
+  echo "[install] build first with: ./scripts/build.sh" >&2
+  exit 1
+fi
+
 cmake --install build
 
-if [[ ! -f config/formant-spot-adapter.env ]]; then
-  cp config/formant-spot-adapter.env.example config/formant-spot-adapter.env
-fi
-
-if [[ ! -f config/formant-spot-adapter.json ]]; then
-  cp config/formant-spot-adapter.json.example config/formant-spot-adapter.json
-fi
+echo "[install] installed the binary and example config artifacts."
+echo "[install] use ./scripts/deploy.sh for the supported systemd deployment path for this checkout."

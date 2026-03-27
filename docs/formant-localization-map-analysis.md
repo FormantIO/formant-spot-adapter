@@ -5,7 +5,7 @@
 - Formant already supports typed localization uploads with an occupancy grid in
   `Localization.map.occupancy_grid`.
 - This adapter previously could not send that type because
-  [`proto/formant_model.proto`](/home/walter/shin-spot-adapter/proto/formant_model.proto)
+  [`proto/formant_model.proto`](../proto/formant_model.proto)
   only exposed text/numeric/image payloads.
 - Spot already exposes map-related data in the local SDK checkout:
   - `GetLocalizationState(... request_live_terrain_maps=true)` returns live

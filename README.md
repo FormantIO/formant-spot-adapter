@@ -1,6 +1,9 @@
 # formant-spot-adapter
 
-C++ adapter for Boston Dynamics Spot + Formant Agent teleoperation without ROS.
+C++ adapter for Spot + Formant Agent teleoperation without ROS.
+
+This repository is maintained by Formant. It is not affiliated with or endorsed by
+Boston Dynamics.
 
 ## What It Does
 
@@ -41,7 +44,7 @@ Additional control channels (not streams):
 
 | Stream name (default) | Type | Content |
 |---|---|---|
-| `spot.hand.image` | Image (JPEG) | Hand camera (`hand_color_image`), optional 90deg CCW auto-rotation |
+| `spot.hand.image` | Image (JPEG) | Hand camera (`hand_color_image`) |
 | `spot.left.image` | Image (JPEG) | Left fisheye (`left_fisheye_image`) |
 | `spot.right.image` | Image (JPEG) | Right fisheye (`right_fisheye_image`) |
 | `spot.back.image` | Image (JPEG) | Back fisheye (`back_fisheye_image`) |
@@ -76,7 +79,7 @@ Additional control channels (not streams):
 - For GraphNav nav commands, adapter prechecks localization and attempts fiducial relocalization before failing.
 - `spot.localization.graphnav` is a live local terrain/occupancy patch around the robot, not a
   stitched full-site map. See
-  [`docs/formant-localization-map-analysis.md`](/home/walter/shin-spot-adapter/docs/formant-localization-map-analysis.md)
+  [`docs/formant-localization-map-analysis.md`](docs/formant-localization-map-analysis.md)
   for the implementation notes and next steps.
 - `spot.localization.image` is a rendered 16:9 visualization of the same local patch with a robot
   footprint, heading arrow, scale bar, and status HUD. The adapter renders only when the Spot data
@@ -141,62 +144,85 @@ Command responses:
 
 ## Configuration Model
 
-- Non-secrets: `config/formant-spot-adapter.json`
-- Secrets: `config/formant-spot-adapter.env` (`SPOT_USERNAME`, `SPOT_PASSWORD`)
+- Local runtime config: `config/formant-spot-adapter.json` (materialized from the example on first run/deploy; not tracked)
+- Secrets: `config/formant-spot-adapter.env` (`SPOT_USERNAME`, `SPOT_PASSWORD`) (materialized from the example on first run/deploy; not tracked)
+- Tracked templates: `config/formant-spot-adapter.json.example`, `config/formant-spot-adapter.env.example`
 
 Important:
+- `config/formant-spot-adapter.json.example` is the canonical baseline configuration for this repository.
 - Current runtime `load_config()` takes secrets from env and all other runtime params from JSON.
 - If you want to change stream names, arm pose, docking config, or camera config, update JSON.
 
-## Quickstart (Ubuntu/Jetson)
+## Quickstart (Ubuntu, Including Jetson)
 
-1. Configure files:
+Current setup scripts target Ubuntu-based systems. Jetson deployments are expected to use Ubuntu as well.
+Other Linux distributions may work, but they are not currently documented or supported by the bootstrap/deploy scripts.
 
-```bash
-cp config/formant-spot-adapter.env.example config/formant-spot-adapter.env
-cp config/formant-spot-adapter.json.example config/formant-spot-adapter.json
-nano config/formant-spot-adapter.env
-nano config/formant-spot-adapter.json
-```
-
-2. Install deps and build:
+1. Install deps and build:
 
 ```bash
 ./scripts/bootstrap_ubuntu.sh
 ./scripts/build.sh
 ```
 
-3. Run directly:
+2. Run directly once to materialize local config files:
 
 ```bash
 ./scripts/run.sh
 ```
 
-4. Or deploy as a persistent service:
+On first run, the script creates local `config/formant-spot-adapter.env` and
+`config/formant-spot-adapter.json` files from the tracked example files if they
+do not already exist, then exits if credentials are still set to the example
+placeholders.
+
+3. Edit the local config files as needed:
+
+```bash
+nano config/formant-spot-adapter.env
+nano config/formant-spot-adapter.json
+```
+
+At minimum, set `SPOT_USERNAME` and `SPOT_PASSWORD` in
+`config/formant-spot-adapter.env` before rerunning `./scripts/run.sh`. Change
+`config/formant-spot-adapter.json` if `spotHost` or other runtime defaults need
+to differ from the example values.
+
+4. Smoke-test locally or deploy as a persistent service:
+
+```bash
+./scripts/run.sh
+```
+
+or:
 
 ```bash
 ./scripts/deploy.sh
 ```
+
+`./scripts/deploy.sh` uses the same local env/config files, creates them from
+the tracked examples if they are missing, and refuses to start the service with
+placeholder credentials.
 
 ## Service Lifecycle Scripts
 
-- First-time deploy (build + install/update service + enable/start):
+- Canonical deploy/redeploy path (build + install/update service + start/restart):
 
 ```bash
 ./scripts/deploy.sh
 ```
 
-- Update from git + rebuild + restart service:
+- `./scripts/deploy.sh` is the supported service-install path for a checkout of
+  this repository. It generates the systemd unit with the correct working
+  directory and local config paths for the current machine.
+
+- Pull latest from git, then redeploy:
 
 ```bash
-./scripts/update.sh
+PULL_FROM_GIT=1 ./scripts/deploy.sh
 ```
 
-- Rebuild/restart without pulling from git:
-
-```bash
-PULL_FROM_GIT=0 ./scripts/update.sh
-```
+- `./scripts/update.sh` remains as a compatibility wrapper around `deploy.sh` with `PULL_FROM_GIT=1` by default.
 
 - Remove service unit and stop service:
 
