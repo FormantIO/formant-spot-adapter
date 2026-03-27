@@ -150,8 +150,17 @@ Command responses:
 
 Important:
 - `config/formant-spot-adapter.json.example` is the canonical baseline configuration for this repository.
-- Current runtime `load_config()` takes secrets from env and all other runtime params from JSON.
+- Current runtime `load_config()` takes secrets plus `FORMANT_AGENT_TARGET` from env and all other runtime params from JSON.
 - If you want to change stream names, arm pose, docking config, or camera config, update JSON.
+
+## Deployment Modes
+
+This repository supports two deployment modes:
+
+- Host service mode: build and run the adapter directly on the device with the systemd-backed scripts in `scripts/`.
+- Docker mode: build and run the adapter container from the checked-out repository on the device with the Docker scripts in `scripts/`.
+
+Only one deployment mode should be active on a device at a time.
 
 ## Quickstart (Ubuntu, Including Jetson)
 
@@ -216,7 +225,95 @@ or:
 the tracked examples if they are missing, and refuses to start the service with
 placeholder credentials.
 
-## Service Lifecycle Scripts
+## Docker Deployment
+
+The supported container workflow is to build and manage the adapter directly
+from a checked-out copy of this repository on the target device.
+
+The intended topology is:
+
+- Formant Agent in its own container on the same host
+- This adapter in a separate container on the same host
+- Both containers using host networking
+- The host still having LAN reachability to the Spot robot
+
+Container deployment notes:
+
+- With `network_mode: host`, the default Formant agent target remains `localhost:5501`.
+- The container runtime mounts `./config` and `./data` into the adapter container.
+- `./data` must be persistent if you want GraphNav state and saved map artifacts to survive container recreation.
+- Container logs go to `docker logs`; the container path does not write repo log files by default.
+- `spot.jetson.reboot` is not supported in container deployment because it is a host reboot command.
+- The current Docker build follows the repository's existing aarch64-focused build assumptions. Build it on the same class of target machine that will run it.
+- Repo-local Docker management scripts use plain `docker`.
+- A sample [`compose.yaml`](compose.yaml) is included only as a reference for larger setups; it is not the canonical management path for this repository.
+
+Prerequisites:
+
+- Docker installed on the target device
+- This repository checked out on the target device
+- The Formant Agent container running separately on the same host with host networking
+- `config/formant-spot-adapter.env` populated with real `SPOT_USERNAME` and `SPOT_PASSWORD`
+- `config/formant-spot-adapter.json` populated with the correct `spotHost`
+
+Canonical Docker deployment lifecycle from the checked-out repository:
+
+1. Build, stop the host service if present, and deploy the Docker container:
+
+```bash
+./scripts/docker_deploy.sh
+```
+
+2. Watch logs:
+
+```bash
+./scripts/docker_logs.sh
+```
+
+3. Check container status:
+
+```bash
+./scripts/docker_status.sh
+```
+
+4. Stop and remove the adapter container:
+
+```bash
+./scripts/docker_uninstall.sh
+```
+
+5. Pull latest from git, rebuild, and redeploy:
+
+```bash
+./scripts/docker_update.sh
+```
+
+The `docker_deploy.sh` script:
+
+- disables and stops the host systemd service if it exists
+- rebuilds the adapter image from the current checkout
+- recreates the adapter container
+
+The Docker container runs with:
+
+- host networking
+- mounted `./config` at `/opt/formant-spot-adapter/config`
+- mounted `./data` at `/opt/formant-spot-adapter/data`
+- automatic restart policy `unless-stopped`
+
+Low-level Docker scripts remain available for manual control:
+
+- `./scripts/docker_build.sh`
+- `./scripts/docker_up.sh`
+- `./scripts/docker_down.sh`
+
+If you want a one-shot rebuild and replace without the higher-level deploy wrapper:
+
+```bash
+./scripts/docker_up.sh --build
+```
+
+## Host Service Lifecycle Scripts
 
 - Canonical deploy/redeploy path (build + install/update service + start/restart):
 

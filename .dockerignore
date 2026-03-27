@@ -1,0 +1,8 @@
+/.git
+/build
+/logs
+/data/*
+!/data/.gitkeep
+/config/formant-spot-adapter.env
+/config/formant-spot-adapter.json
+/third_party/spot-cpp-sdk/

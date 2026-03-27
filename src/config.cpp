@@ -250,9 +250,12 @@ Config load_config() {
               << " (using defaults + env secrets)" << std::endl;
   }
 
-  // Only secrets come from env in normal adapter execution.
+  // Secrets come from env in normal adapter execution. Keep a narrow runtime
+  // override for the local agent target so containerized deployments can
+  // redirect the adapter without rewriting the JSON config.
   c.spot_username = getenv_or("SPOT_USERNAME", c.spot_username);
   c.spot_password = getenv_or("SPOT_PASSWORD", c.spot_password);
+  c.formant_agent_target = getenv_or("FORMANT_AGENT_TARGET", c.formant_agent_target);
   return c;
 }
 

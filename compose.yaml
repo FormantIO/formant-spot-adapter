@@ -1,0 +1,17 @@
+services:
+  formant-spot-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: formant-spot-adapter:local
+    container_name: formant-spot-adapter
+    init: true
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - ./config/formant-spot-adapter.env
+    environment:
+      CONFIG_PATH: /opt/formant-spot-adapter/config/formant-spot-adapter.json
+    volumes:
+      - ./config:/opt/formant-spot-adapter/config
+      - ./data:/opt/formant-spot-adapter/data
