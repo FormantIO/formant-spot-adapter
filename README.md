@@ -165,6 +165,12 @@ Other Linux distributions may work, but they are not currently documented or sup
 ./scripts/build.sh
 ```
 
+`./scripts/bootstrap_ubuntu.sh` installs the Ubuntu packages and ensures a
+local Spot C++ SDK checkout is available at `third_party/spot-cpp-sdk`. By
+default the setup is pinned to Spot C++ SDK `v5.1.0`. If a local archive such
+as `bosdyn/spot-cpp-sdk-5.1.0.zip` is present, the setup uses it; otherwise it
+clones the pinned upstream tag from Boston Dynamics.
+
 2. Run directly once to materialize local config files:
 
 ```bash
@@ -292,5 +298,13 @@ an E-Stop is active, or `camera_server` still has active init faults.
 
 - Formant agent target default is `localhost:5501`.
 - This project intentionally does not use ROS.
+- The setup/build flow expects the Boston Dynamics Spot C++ SDK as an external
+  dependency under its own license. The repo fetches the pinned SDK automatically
+  into `third_party/spot-cpp-sdk` during bootstrap/build if it is missing.
+- Default Spot SDK pin: `v5.1.0`. You can override with `SPOT_SDK_REF=vX.Y.Z`.
+- If you change the SDK pin for an existing checkout, rerun with
+  `FORCE_REINSTALL_SPOT_SDK=1` or point `SPOT_CPP_SDK_DIR` at a different SDK path.
+- If you already have a local SDK checkout, point the build at it with
+  `SPOT_CPP_SDK_DIR=/path/to/spot-cpp-sdk ./scripts/build.sh`.
 - For UI examples, see `docs/formant-streams.md`.
 - For detailed implementation history/behavior notes, see `docs/graphnav-teleop-implementation-notes.md`.
