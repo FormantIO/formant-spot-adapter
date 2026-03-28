@@ -81,6 +81,25 @@ std::string json_escape(const std::string& in) {
 }
 
 constexpr char kGraphNavLocalizationVizStream[] = "spot.localization.graphnav";
+constexpr char kStatusStream[] = "spot.status";
+constexpr char kConnectionStream[] = "spot.connection";
+constexpr char kLocalizationStatusStream[] = "spot.localization";
+constexpr char kRobotStatePowerStream[] = "spot.robot_state.power";
+constexpr char kRobotStateBatteryStream[] = "spot.robot_state.battery";
+constexpr char kRobotStateBodyPitchStream[] = "spot.robot_state.body_pitch_rad";
+constexpr char kFaultsSystemStream[] = "spot.faults.system";
+constexpr char kFaultsBehaviorStream[] = "spot.faults.behavior";
+constexpr char kFaultsServiceStream[] = "spot.faults.service";
+constexpr char kFaultEventsStream[] = "spot.fault.events";
+constexpr char kNavFeedbackStream[] = "spot.nav.feedback";
+constexpr char kAdapterLogStream[] = "spot.adapter.log";
+constexpr char kCurrentMapStream[] = "spot.map.current";
+constexpr char kDefaultMapStream[] = "spot.map.default";
+constexpr char kCurrentWaypointStream[] = "spot.waypoint.current";
+constexpr char kMapProgressStream[] = "spot.map.progress";
+constexpr char kMapProgressWaypointsStream[] = "spot.map.progress.waypoints";
+constexpr char kMapProgressPathLengthStream[] = "spot.map.progress.path_length_m";
+constexpr char kMapProgressFiducialsStream[] = "spot.map.progress.fiducials";
 
 constexpr int kLocalizationImageWidth = 1280;
 constexpr int kLocalizationImageHeight = 720;
@@ -169,6 +188,19 @@ double quaternion_yaw_rad(const Quaterniond& q) {
   return std::atan2(siny_cosp, cosy_cosp);
 }
 
+double normalize_angle_rad(double angle_rad) {
+  return std::atan2(std::sin(angle_rad), std::cos(angle_rad));
+}
+
+const SpotClient::GraphNavWaypoint* find_graphnav_waypoint(
+    const SpotClient::GraphNavMapSnapshot& snapshot,
+    const std::string& waypoint_id) {
+  for (const auto& waypoint : snapshot.waypoints) {
+    if (waypoint.id == waypoint_id) return &waypoint;
+  }
+  return nullptr;
+}
+
 std::string shorten_identifier(const std::string& value, size_t limit = 20) {
   if (value.size() <= limit) return value;
   if (limit < 8) return value.substr(0, limit);
@@ -246,6 +278,193 @@ bool prepare_jpeg_frame(const std::string& input_bytes,
     return encode_jpeg(rotated, out_bytes);
   }
   return encode_jpeg(decoded, out_bytes);
+}
+
+struct GraphNavImagePalette {
+  cv::Scalar canvas_bg{16, 24, 34};
+  cv::Scalar grid_minor{34, 47, 62};
+  cv::Scalar grid_major{46, 64, 84};
+  cv::Scalar text_primary{236, 240, 245};
+  cv::Scalar text_secondary{154, 172, 190};
+  cv::Scalar map_unknown{24, 33, 44};
+  cv::Scalar map_free{73, 88, 105};
+  cv::Scalar map_occupied{176, 193, 208};
+  cv::Scalar map_occupied_edge{222, 232, 240};
+  cv::Scalar waypoint_fill{224, 164, 72};
+  cv::Scalar waypoint_dock{66, 186, 122};
+  cv::Scalar edge_line{92, 128, 158};
+  cv::Scalar robot_fill{48, 190, 245};
+  cv::Scalar robot_outline{18, 25, 34};
+};
+
+const GraphNavImagePalette& graphnav_image_palette() {
+  static const GraphNavImagePalette palette;
+  return palette;
+}
+
+bool build_graphnav_status_frame(const std::string& default_title,
+                                 const std::string& default_detail,
+                                 const std::string& title,
+                                 const std::string& detail,
+                                 std::string* out_jpg) {
+  if (!out_jpg) return false;
+  const auto& palette = graphnav_image_palette();
+  cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, palette.canvas_bg);
+  for (int x = 0; x <= canvas.cols; x += 80) {
+    cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1),
+             (x % 240) == 0 ? palette.grid_major : palette.grid_minor, 1, cv::LINE_AA);
+  }
+  for (int y = 0; y <= canvas.rows; y += 80) {
+    cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y),
+             (y % 240) == 0 ? palette.grid_major : palette.grid_minor, 1, cv::LINE_AA);
+  }
+  const cv::Point center(canvas.cols / 2, canvas.rows / 2);
+  cv::circle(canvas, center, 54, cv::Scalar(48, 68, 88), 1, cv::LINE_AA);
+  cv::circle(canvas, center, 108, cv::Scalar(40, 58, 76), 1, cv::LINE_AA);
+  cv::line(canvas, cv::Point(center.x - 18, center.y), cv::Point(center.x + 18, center.y),
+           cv::Scalar(78, 104, 132), 1, cv::LINE_AA);
+  cv::line(canvas, cv::Point(center.x, center.y - 18), cv::Point(center.x, center.y + 18),
+           cv::Scalar(78, 104, 132), 1, cv::LINE_AA);
+
+  const std::string display_title = title.empty() ? default_title : title;
+  const std::string display_detail = detail.empty() ? default_detail : detail;
+  int baseline = 0;
+  const cv::Size title_size =
+      cv::getTextSize(display_title, cv::FONT_HERSHEY_SIMPLEX, 0.9, 2, &baseline);
+  const cv::Point title_pt((canvas.cols - title_size.width) / 2, (canvas.rows / 2) + 18);
+  cv::putText(canvas, display_title, title_pt, cv::FONT_HERSHEY_SIMPLEX, 0.9,
+              palette.text_primary, 2, cv::LINE_AA);
+  int detail_y = title_pt.y + 34;
+  for (const auto& line : wrap_text(display_detail, 46)) {
+    cv::putText(canvas, line, cv::Point(std::max(32, (canvas.cols - 960) / 2), detail_y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.56, palette.text_secondary, 1, cv::LINE_AA);
+    detail_y += 26;
+  }
+  return encode_jpeg(canvas, out_jpg);
+}
+
+bool rasterize_occupancy_grid(const SpotClient::OccupancyGridMapSnapshot& map,
+                              const GraphNavImagePalette& palette,
+                              cv::Mat* out_grid_image,
+                              cv::Mat* out_occupied_mask) {
+  if (!out_grid_image || !out_occupied_mask) return false;
+  if (map.width <= 0 || map.height <= 0) return false;
+  *out_grid_image = cv::Mat(map.height, map.width, CV_8UC3, palette.map_unknown);
+  *out_occupied_mask = cv::Mat(map.height, map.width, CV_8UC1, cv::Scalar(0));
+  for (int y = 0; y < map.height; ++y) {
+    for (int x = 0; x < map.width; ++x) {
+      const size_t idx = static_cast<size_t>(x) +
+                         static_cast<size_t>(map.width) * static_cast<size_t>(y);
+      const int32_t value = idx < map.occupancy.size() ? map.occupancy[idx] : -1;
+      const int draw_y = map.height - 1 - y;
+      cv::Vec3b* px = &out_grid_image->at<cv::Vec3b>(draw_y, x);
+      if (value < 0) {
+        *px = cv::Vec3b(static_cast<uchar>(palette.map_unknown[0]),
+                        static_cast<uchar>(palette.map_unknown[1]),
+                        static_cast<uchar>(palette.map_unknown[2]));
+      } else if (value >= 50) {
+        *px = cv::Vec3b(static_cast<uchar>(palette.map_occupied[0]),
+                        static_cast<uchar>(palette.map_occupied[1]),
+                        static_cast<uchar>(palette.map_occupied[2]));
+        out_occupied_mask->at<uchar>(draw_y, x) = 255;
+      } else {
+        *px = cv::Vec3b(static_cast<uchar>(palette.map_free[0]),
+                        static_cast<uchar>(palette.map_free[1]),
+                        static_cast<uchar>(palette.map_free[2]));
+      }
+    }
+  }
+  return true;
+}
+
+void draw_occupied_contours(cv::Mat* canvas,
+                            const cv::Mat& occupied_mask,
+                            const cv::Rect& draw_rect,
+                            const cv::Scalar& color) {
+  if (!canvas || canvas->empty() || occupied_mask.empty() || draw_rect.width <= 0 ||
+      draw_rect.height <= 0) {
+    return;
+  }
+  cv::Mat scaled_mask;
+  cv::resize(occupied_mask, scaled_mask, draw_rect.size(), 0.0, 0.0, cv::INTER_NEAREST);
+  std::vector<std::vector<cv::Point>> contours;
+  cv::findContours(scaled_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+  for (const auto& contour : contours) {
+    if (contour.size() < 3) continue;
+    if (draw_rect.x == 0 && draw_rect.y == 0) {
+      cv::polylines(*canvas, contour, true, color, 1, cv::LINE_AA);
+      continue;
+    }
+    std::vector<cv::Point> shifted;
+    shifted.reserve(contour.size());
+    for (const auto& point : contour) {
+      shifted.emplace_back(point.x + draw_rect.x, point.y + draw_rect.y);
+    }
+    cv::polylines(*canvas, shifted, true, color, 1, cv::LINE_AA);
+  }
+}
+
+template <typename ToPixelFn>
+void draw_robot_pose_overlay(cv::Mat* canvas,
+                             ToPixelFn&& to_pixel,
+                             double body_x,
+                             double body_y,
+                             double yaw_rad,
+                             double aura_radius_px,
+                             double aura_alpha,
+                             const cv::Scalar& robot_fill,
+                             const cv::Scalar& robot_outline) {
+  if (!canvas || canvas->empty()) return;
+  const double c = std::cos(yaw_rad);
+  const double s = std::sin(yaw_rad);
+  const std::array<cv::Point2d, 4> footprint_local = {
+      cv::Point2d(0.45, 0.25),
+      cv::Point2d(0.45, -0.25),
+      cv::Point2d(-0.45, -0.25),
+      cv::Point2d(-0.45, 0.25),
+  };
+  std::vector<cv::Point> footprint_pixels;
+  footprint_pixels.reserve(footprint_local.size());
+  for (const auto& corner : footprint_local) {
+    const double px = body_x + c * corner.x - s * corner.y;
+    const double py = body_y + s * corner.x + c * corner.y;
+    footprint_pixels.push_back(to_pixel(px, py));
+  }
+  cv::Mat overlay = canvas->clone();
+  cv::circle(overlay, to_pixel(body_x, body_y), std::max(10, cvRound(aura_radius_px)), robot_fill,
+             cv::FILLED, cv::LINE_AA);
+  cv::addWeighted(overlay, aura_alpha, *canvas, 1.0 - aura_alpha, 0.0, *canvas);
+  cv::fillConvexPoly(*canvas, footprint_pixels, robot_fill, cv::LINE_AA);
+  cv::polylines(*canvas, footprint_pixels, true, robot_outline, 2, cv::LINE_AA);
+  const cv::Point body_center = to_pixel(body_x, body_y);
+  const cv::Point arrow_tip = to_pixel(body_x + c * 0.8, body_y + s * 0.8);
+  cv::circle(*canvas, body_center, 4, robot_outline, cv::FILLED, cv::LINE_AA);
+  cv::arrowedLine(*canvas, body_center, arrow_tip, robot_outline, 3, cv::LINE_AA, 0, 0.28);
+}
+
+void draw_scale_bar(cv::Mat* canvas,
+                    const cv::Point& scale_start,
+                    int scale_bar_px,
+                    double scale_bar_m,
+                    const cv::Scalar& text_primary,
+                    const cv::Scalar& robot_outline,
+                    bool draw_shadowed_text) {
+  if (!canvas || canvas->empty() || scale_bar_px <= 0) return;
+  const cv::Point scale_end(scale_start.x + scale_bar_px, scale_start.y);
+  cv::line(*canvas, cv::Point(scale_start.x, scale_start.y + 1),
+           cv::Point(scale_end.x, scale_end.y + 1), robot_outline, 5, cv::LINE_AA);
+  cv::line(*canvas, scale_start, scale_end, text_primary, 3, cv::LINE_AA);
+  cv::line(*canvas, cv::Point(scale_start.x, scale_start.y - 5),
+           cv::Point(scale_start.x, scale_start.y + 5), text_primary, 2, cv::LINE_AA);
+  cv::line(*canvas, cv::Point(scale_end.x, scale_end.y - 5),
+           cv::Point(scale_end.x, scale_end.y + 5), text_primary, 2, cv::LINE_AA);
+  const std::string label = format_decimal(scale_bar_m, scale_bar_m >= 5.0 ? 0 : 1) + " m";
+  if (draw_shadowed_text) {
+    cv::putText(*canvas, label, cv::Point(scale_end.x + 13, scale_start.y + 6),
+                cv::FONT_HERSHEY_SIMPLEX, 0.48, robot_outline, 2, cv::LINE_AA);
+  }
+  cv::putText(*canvas, label, cv::Point(scale_end.x + 12, scale_start.y + 5),
+              cv::FONT_HERSHEY_SIMPLEX, 0.48, text_primary, 1, cv::LINE_AA);
 }
 
 double dot_vec(const Vec3d& a, const Vec3d& b) {
@@ -1395,6 +1614,25 @@ bool Adapter::Init() {
     SetSpotConnected();
   }
 
+  DisableConfiguredStreamIfDisabled(&cfg_.can_dock_stream, "can_dock_stream");
+  DisableConfiguredStreamIfDisabled(&cfg_.stateful_mode_stream, "stateful_mode_stream");
+  DisableConfiguredStreamIfDisabled(&cfg_.camera_stream_name, "camera_stream_name");
+  DisableConfiguredStreamIfDisabled(&cfg_.left_camera_stream_name, "left_camera_stream_name");
+  DisableConfiguredStreamIfDisabled(&cfg_.right_camera_stream_name, "right_camera_stream_name");
+  DisableConfiguredStreamIfDisabled(&cfg_.back_camera_stream_name, "back_camera_stream_name");
+  DisableConfiguredStreamIfDisabled(&cfg_.front_image_stream_name, "front_image_stream_name");
+  DisableConfiguredStreamIfDisabled(&cfg_.localization_image_stream_name,
+                                    "localization_image_stream_name");
+  DisableConfiguredStreamIfDisabled(&cfg_.graphnav_global_localization_stream,
+                                    "graphnav_global_localization_stream");
+  DisableConfiguredStreamIfDisabled(&cfg_.graphnav_map_stream, "graphnav_map_stream");
+  DisableConfiguredStreamIfDisabled(&cfg_.graphnav_metadata_stream, "graphnav_metadata_stream");
+  DisableConfiguredStreamIfDisabled(&cfg_.graphnav_nav_state_stream, "graphnav_nav_state_stream");
+  DisableConfiguredStreamIfDisabled(&cfg_.graphnav_map_image_stream_name,
+                                    "graphnav_map_image_stream_name");
+  DisableConfiguredStreamIfDisabled(&cfg_.waypoint_text_stream, "waypoint_text_stream");
+  DisableConfiguredStreamIfDisabled(&cfg_.maps_text_stream, "maps_text_stream");
+
   std::vector<SpotClient::ImageSourceInfo> sources;
   if (SpotConnected() && spot_.ListImageSources(&sources)) {
     std::unordered_map<std::string, SpotClient::ImageSourceInfo> source_map;
@@ -1474,6 +1712,18 @@ bool Adapter::Init() {
               << " data_poll_hz=" << std::max(1, cfg_.localization_image_poll_hz)
               << " sdk_poll_cap_hz=5" << std::endl;
   }
+  if (!cfg_.graphnav_global_localization_stream.empty()) {
+    std::cerr << "[graphnav] global localization stream config: stream="
+              << cfg_.graphnav_global_localization_stream
+              << " publish_hz=" << std::max(1, cfg_.graphnav_global_localization_hz)
+              << std::endl;
+  }
+  if (!cfg_.graphnav_nav_state_stream.empty()) {
+    std::cerr << "[graphnav] nav state stream config: stream="
+              << cfg_.graphnav_nav_state_stream
+              << " publish_hz=1"
+              << std::endl;
+  }
   std::cerr << "[camera] surround stream config: output_fps=" << std::max(1, cfg_.surround_camera_fps)
             << " data_poll_hz=" << std::max(1, cfg_.surround_camera_poll_hz)
             << " batch_sources=left,right,back"
@@ -1537,6 +1787,25 @@ bool Adapter::Init() {
   return true;
 }
 
+bool Adapter::IsStreamEnabled(const std::string& stream) const {
+  return cfg_.IsStreamEnabled(stream);
+}
+
+bool Adapter::AnyStreamEnabled(std::initializer_list<const char*> streams) const {
+  for (const char* stream : streams) {
+    if (stream && *stream && IsStreamEnabled(stream)) return true;
+  }
+  return false;
+}
+
+void Adapter::DisableConfiguredStreamIfDisabled(std::string* stream, const char* label) {
+  if (!stream || stream->empty()) return;
+  if (IsStreamEnabled(*stream)) return;
+  std::cerr << "[stream] disabled " << (label ? label : "stream")
+            << ": " << *stream << std::endl;
+  stream->clear();
+}
+
 void Adapter::Run() {
   running_ = true;
   std::cerr << "[adapter] starting teleop loops" << std::endl;
@@ -1563,7 +1832,8 @@ void Adapter::Run() {
                            "spot.map.start_mapping", "spot.map.stop_mapping",
                            "spot.waypoint.save",
                            "spot.waypoint.delete", "spot.waypoint.goto",
-                           "spot.waypoint.goto_straight"},
+                           "spot.waypoint.goto_straight",
+                           "spot.graphnav.goto_pose", "spot.graphnav.goto_pose_straight"},
                           [this](const v1::model::CommandRequest& request) { HandleCommand(request); });
   agent_.StartHeartbeatLoop(
       [this](const v1::agent::GetTeleopHeartbeatStreamResponse& hb) { HandleHeartbeat(hb); });
@@ -2197,245 +2467,147 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
                         const std::string& status_detail,
                         std::string* out_jpg) -> bool {
     if (!out_jpg) return false;
-
-    const cv::Scalar canvas_bg(16, 24, 34);
-    const cv::Scalar grid_minor(34, 47, 62);
-    const cv::Scalar grid_major(46, 64, 84);
-    const cv::Scalar text_primary(236, 240, 245);
-    const cv::Scalar text_secondary(154, 172, 190);
-    const cv::Scalar map_unknown(24, 33, 44);
-    const cv::Scalar map_free(73, 88, 105);
-    const cv::Scalar map_occupied(176, 193, 208);
-    const cv::Scalar map_occupied_edge(222, 232, 240);
-    const cv::Scalar waypoint_blue(224, 164, 72);
-    const cv::Scalar robot_fill(48, 190, 245);
-    const cv::Scalar robot_outline(18, 25, 34);
+    const auto& palette = graphnav_image_palette();
 
     const bool has_live_map = snapshot && snapshot->localized && snapshot->has_seed_tform_body &&
                               snapshot->has_map && snapshot->map.width > 0 &&
                               snapshot->map.height > 0 && snapshot->map.resolution_m > 0.0;
 
-    cv::Mat canvas;
-    if (has_live_map) {
-      const int grid_width = snapshot->map.width;
-      const int grid_height = snapshot->map.height;
-      canvas = cv::Mat(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, map_unknown);
+    if (!has_live_map) {
+      return build_graphnav_status_frame("Waiting for live localization",
+                                         "Waiting for the first GraphNav occupancy patch.",
+                                         status_title, status_detail, out_jpg);
+    }
 
-      cv::Mat grid_image(grid_height, grid_width, CV_8UC3, map_unknown);
-      cv::Mat occupied_mask(grid_height, grid_width, CV_8UC1, cv::Scalar(0));
-      for (int y = 0; y < grid_height; ++y) {
-        for (int x = 0; x < grid_width; ++x) {
-          const size_t idx = static_cast<size_t>(x) +
-                             static_cast<size_t>(grid_width) * static_cast<size_t>(y);
-          const int draw_y = grid_height - 1 - y;
-          const int32_t value = snapshot->map.occupancy[idx];
-          cv::Vec3b* px = &grid_image.at<cv::Vec3b>(draw_y, x);
-          if (value < 0) {
-            *px = cv::Vec3b(static_cast<uchar>(map_unknown[0]),
-                            static_cast<uchar>(map_unknown[1]),
-                            static_cast<uchar>(map_unknown[2]));
-          } else if (value >= 50) {
-            *px = cv::Vec3b(static_cast<uchar>(map_occupied[0]),
-                            static_cast<uchar>(map_occupied[1]),
-                            static_cast<uchar>(map_occupied[2]));
-            occupied_mask.at<uchar>(draw_y, x) = 255;
-          } else {
-            *px = cv::Vec3b(static_cast<uchar>(map_free[0]),
-                            static_cast<uchar>(map_free[1]),
-                            static_cast<uchar>(map_free[2]));
-          }
-        }
-      }
+    const int grid_width = snapshot->map.width;
+    const int grid_height = snapshot->map.height;
+    cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, palette.map_unknown);
+    cv::Mat grid_image;
+    cv::Mat occupied_mask;
+    if (!rasterize_occupancy_grid(snapshot->map, palette, &grid_image, &occupied_mask)) {
+      return build_graphnav_status_frame("Waiting for live localization",
+                                         "Waiting for the first GraphNav occupancy patch.",
+                                         "Live terrain map unavailable",
+                                         "GraphNav returned an invalid occupancy grid payload.",
+                                         out_jpg);
+    }
 
-      const SpotClient::Pose3D grid_tform_body =
-          compose_pose(inverse_pose(snapshot->map.seed_tform_grid), snapshot->seed_tform_body);
-      const double yaw_rad = quaternion_yaw_rad(pose_quaternion(grid_tform_body));
-      const double body_grid_x = grid_tform_body.x / snapshot->map.resolution_m;
-      const double body_grid_y_img =
-          static_cast<double>(grid_height) - (grid_tform_body.y / snapshot->map.resolution_m);
+    const SpotClient::Pose3D grid_tform_body =
+        compose_pose(inverse_pose(snapshot->map.seed_tform_grid), snapshot->seed_tform_body);
+    const double yaw_rad = quaternion_yaw_rad(pose_quaternion(grid_tform_body));
+    const double body_grid_x = grid_tform_body.x / snapshot->map.resolution_m;
+    const double body_grid_y_img =
+        static_cast<double>(grid_height) - (grid_tform_body.y / snapshot->map.resolution_m);
 
-      const double output_aspect =
-          static_cast<double>(kLocalizationImageWidth) / static_cast<double>(kLocalizationImageHeight);
-      double crop_width = static_cast<double>(grid_width);
-      double crop_height = static_cast<double>(grid_height);
-      if ((crop_width / crop_height) > output_aspect) {
-        crop_width = crop_height * output_aspect;
-      } else {
-        crop_height = crop_width / output_aspect;
-      }
-      crop_width = std::max(1.0, std::min(crop_width, static_cast<double>(grid_width)));
-      crop_height = std::max(1.0, std::min(crop_height, static_cast<double>(grid_height)));
-
-      double crop_x = body_grid_x - (crop_width / 2.0);
-      double crop_y = body_grid_y_img - (crop_height / 2.0);
-      crop_x = std::max(0.0, std::min(crop_x, static_cast<double>(grid_width) - crop_width));
-      crop_y = std::max(0.0, std::min(crop_y, static_cast<double>(grid_height) - crop_height));
-
-      const int crop_x0 = std::max(0, std::min(grid_width - 1, static_cast<int>(std::floor(crop_x))));
-      const int crop_y0 = std::max(0, std::min(grid_height - 1, static_cast<int>(std::floor(crop_y))));
-      const int crop_x1 = std::max(crop_x0 + 1,
-                                   std::min(grid_width, static_cast<int>(std::ceil(crop_x + crop_width))));
-      const int crop_y1 = std::max(crop_y0 + 1,
-                                   std::min(grid_height, static_cast<int>(std::ceil(crop_y + crop_height))));
-      const cv::Rect crop_rect(crop_x0, crop_y0, crop_x1 - crop_x0, crop_y1 - crop_y0);
-
-      const double x_scale = static_cast<double>(canvas.cols) / std::max(1, crop_rect.width);
-      const double y_scale = static_cast<double>(canvas.rows) / std::max(1, crop_rect.height);
-
-      cv::Mat cropped_grid = grid_image(crop_rect);
-      cv::Mat scaled_grid;
-      cv::resize(cropped_grid, scaled_grid, canvas.size(), 0.0, 0.0, cv::INTER_NEAREST);
-      if (std::min(x_scale, y_scale) >= 3.0) {
-        const cv::Scalar grid_line(74, 80, 88);
-        const int start_grid_x = std::max(0, static_cast<int>(std::floor(crop_x / 10.0)) * 10);
-        const int end_grid_x = std::min(grid_width, static_cast<int>(std::ceil((crop_x + crop_width) / 10.0)) * 10);
-        for (int x = start_grid_x; x <= end_grid_x; x += 10) {
-          const int line_x = std::min(canvas.cols - 1, std::max(0, cvRound((x - crop_x) * x_scale)));
-          cv::line(scaled_grid, cv::Point(line_x, 0), cv::Point(line_x, canvas.rows - 1), grid_line,
-                   1, cv::LINE_8);
-        }
-        const int start_grid_y = std::max(0, static_cast<int>(std::floor(crop_y / 10.0)) * 10);
-        const int end_grid_y =
-            std::min(grid_height, static_cast<int>(std::ceil((crop_y + crop_height) / 10.0)) * 10);
-        for (int y = start_grid_y; y <= end_grid_y; y += 10) {
-          const int line_y = std::min(canvas.rows - 1, std::max(0, cvRound((y - crop_y) * y_scale)));
-          cv::line(scaled_grid, cv::Point(0, line_y), cv::Point(canvas.cols - 1, line_y), grid_line,
-                   1, cv::LINE_8);
-        }
-      }
-      scaled_grid.copyTo(canvas);
-      for (int x = 0; x <= canvas.cols; x += 96) {
-        cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1), grid_major, 1, cv::LINE_AA);
-      }
-      for (int y = 0; y <= canvas.rows; y += 96) {
-        cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y), grid_major, 1, cv::LINE_AA);
-      }
-
-      cv::Mat cropped_mask = occupied_mask(crop_rect);
-      cv::Mat scaled_mask;
-      cv::resize(cropped_mask, scaled_mask, canvas.size(), 0.0, 0.0, cv::INTER_NEAREST);
-      std::vector<std::vector<cv::Point>> contours;
-      cv::findContours(scaled_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-      for (const auto& contour : contours) {
-        if (contour.size() < 3) continue;
-        cv::polylines(canvas, contour, true, map_occupied_edge, 1, cv::LINE_AA);
-      }
-
-      auto local_to_pixel = [&](double local_x_m, double local_y_m) {
-        const double pixel_x =
-            ((local_x_m / snapshot->map.resolution_m) - crop_x) * x_scale;
-        const double pixel_y =
-            ((static_cast<double>(grid_height) - (local_y_m / snapshot->map.resolution_m)) - crop_y) *
-            y_scale;
-        return cv::Point(cvRound(pixel_x), cvRound(pixel_y));
-      };
-
-      const double body_x = grid_tform_body.x;
-      const double body_y = grid_tform_body.y;
-      const double c = std::cos(yaw_rad);
-      const double s = std::sin(yaw_rad);
-      const std::array<cv::Point2d, 4> footprint_local = {
-          cv::Point2d(0.45, 0.25), cv::Point2d(0.45, -0.25), cv::Point2d(-0.45, -0.25),
-          cv::Point2d(-0.45, 0.25)};
-      std::vector<cv::Point> footprint_pixels;
-      footprint_pixels.reserve(footprint_local.size());
-      for (const auto& corner : footprint_local) {
-        const double px = body_x + c * corner.x - s * corner.y;
-        const double py = body_y + s * corner.x + c * corner.y;
-        footprint_pixels.push_back(local_to_pixel(px, py));
-      }
-
-      cv::Mat overlay = canvas.clone();
-      cv::circle(overlay, local_to_pixel(body_x, body_y),
-                 std::max(10, cvRound(std::max(x_scale, y_scale) * 4.0)),
-                 robot_fill, cv::FILLED, cv::LINE_AA);
-      cv::addWeighted(overlay, 0.18, canvas, 0.82, 0.0, canvas);
-      cv::fillConvexPoly(canvas, footprint_pixels, robot_fill, cv::LINE_AA);
-      cv::polylines(canvas, footprint_pixels, true, robot_outline, 2, cv::LINE_AA);
-      const cv::Point body_center = local_to_pixel(body_x, body_y);
-      const cv::Point arrow_tip = local_to_pixel(body_x + c * 0.8, body_y + s * 0.8);
-      cv::circle(canvas, body_center, 4, robot_outline, cv::FILLED, cv::LINE_AA);
-      cv::arrowedLine(canvas, body_center, arrow_tip, robot_outline, 3, cv::LINE_AA, 0, 0.28);
-
-      if (snapshot->has_waypoint_tform_body) {
-        const SpotClient::Pose3D seed_tform_waypoint =
-            compose_pose(snapshot->seed_tform_body, inverse_pose(snapshot->waypoint_tform_body));
-        const SpotClient::Pose3D grid_tform_waypoint =
-            compose_pose(inverse_pose(snapshot->map.seed_tform_grid), seed_tform_waypoint);
-        const cv::Point waypoint_pt = local_to_pixel(grid_tform_waypoint.x, grid_tform_waypoint.y);
-        cv::Mat waypoint_overlay = canvas.clone();
-        cv::circle(waypoint_overlay, waypoint_pt,
-                   std::max(10, cvRound(std::max(x_scale, y_scale) * 3.0)), waypoint_blue,
-                   cv::FILLED, cv::LINE_AA);
-        cv::addWeighted(waypoint_overlay, 0.12, canvas, 0.88, 0.0, canvas);
-        cv::circle(canvas, waypoint_pt,
-                   std::max(6, cvRound(std::max(x_scale, y_scale) * 2.0)),
-                   cv::Scalar(255, 255, 255), 2,
-                   cv::LINE_AA);
-        cv::circle(canvas, waypoint_pt, 3, waypoint_blue, cv::FILLED, cv::LINE_AA);
-        cv::line(canvas, cv::Point(waypoint_pt.x - 10, waypoint_pt.y),
-                 cv::Point(waypoint_pt.x + 10, waypoint_pt.y), waypoint_blue, 1, cv::LINE_AA);
-        cv::line(canvas, cv::Point(waypoint_pt.x, waypoint_pt.y - 10),
-                 cv::Point(waypoint_pt.x, waypoint_pt.y + 10), waypoint_blue, 1, cv::LINE_AA);
-      }
-
-      const double span_x_m = snapshot->map.width * snapshot->map.resolution_m;
-      double scale_bar_m = 1.0;
-      if (span_x_m >= 8.0) scale_bar_m = 2.0;
-      if (span_x_m >= 16.0) scale_bar_m = 5.0;
-      const int scale_bar_px =
-          std::max(1, cvRound((scale_bar_m / snapshot->map.resolution_m) * x_scale));
-      const cv::Point scale_start(16, std::max(24, canvas.rows - 20));
-      const cv::Point scale_end(scale_start.x + scale_bar_px, scale_start.y);
-      cv::line(canvas, cv::Point(scale_start.x, scale_start.y + 1),
-               cv::Point(scale_end.x, scale_end.y + 1), robot_outline, 5, cv::LINE_AA);
-      cv::line(canvas, scale_start, scale_end, text_primary, 3, cv::LINE_AA);
-      cv::line(canvas, cv::Point(scale_start.x, scale_start.y - 5),
-               cv::Point(scale_start.x, scale_start.y + 5), text_primary, 2, cv::LINE_AA);
-      cv::line(canvas, cv::Point(scale_end.x, scale_end.y - 5),
-               cv::Point(scale_end.x, scale_end.y + 5), text_primary, 2, cv::LINE_AA);
-      cv::putText(canvas, format_decimal(scale_bar_m, scale_bar_m >= 5.0 ? 0 : 1) + " m",
-                  cv::Point(scale_end.x + 13, scale_start.y + 6), cv::FONT_HERSHEY_SIMPLEX, 0.48,
-                  robot_outline, 2, cv::LINE_AA);
-      cv::putText(canvas, format_decimal(scale_bar_m, scale_bar_m >= 5.0 ? 0 : 1) + " m",
-                  cv::Point(scale_end.x + 12, scale_start.y + 5), cv::FONT_HERSHEY_SIMPLEX, 0.48,
-                  text_primary, 1, cv::LINE_AA);
+    const double output_aspect =
+        static_cast<double>(kLocalizationImageWidth) / static_cast<double>(kLocalizationImageHeight);
+    double crop_width = static_cast<double>(grid_width);
+    double crop_height = static_cast<double>(grid_height);
+    if ((crop_width / crop_height) > output_aspect) {
+      crop_width = crop_height * output_aspect;
     } else {
-      canvas = cv::Mat(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, canvas_bg);
-      for (int x = 0; x <= canvas.cols; x += 80) {
-        cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1),
-                 (x % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
-      }
-      for (int y = 0; y <= canvas.rows; y += 80) {
-        cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y),
-                 (y % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
-      }
-      const cv::Point center(canvas.cols / 2, canvas.rows / 2);
-      cv::circle(canvas, center, 54, cv::Scalar(48, 68, 88), 1, cv::LINE_AA);
-      cv::circle(canvas, center, 108, cv::Scalar(40, 58, 76), 1, cv::LINE_AA);
-      cv::line(canvas, cv::Point(center.x - 18, center.y), cv::Point(center.x + 18, center.y),
-               cv::Scalar(78, 104, 132), 1, cv::LINE_AA);
-      cv::line(canvas, cv::Point(center.x, center.y - 18), cv::Point(center.x, center.y + 18),
-               cv::Scalar(78, 104, 132), 1, cv::LINE_AA);
+      crop_height = crop_width / output_aspect;
+    }
+    crop_width = std::max(1.0, std::min(crop_width, static_cast<double>(grid_width)));
+    crop_height = std::max(1.0, std::min(crop_height, static_cast<double>(grid_height)));
 
-      const std::string title = status_title.empty() ? "Waiting for live localization" : status_title;
-      int baseline = 0;
-      const cv::Size title_size =
-          cv::getTextSize(title, cv::FONT_HERSHEY_SIMPLEX, 0.9, 2, &baseline);
-      const cv::Point title_pt((canvas.cols - title_size.width) / 2, (canvas.rows / 2) + 18);
-      cv::putText(canvas, title, title_pt, cv::FONT_HERSHEY_SIMPLEX, 0.9, text_primary, 2,
-                  cv::LINE_AA);
-      int detail_y = title_pt.y + 34;
-      for (const auto& line : wrap_text(status_detail.empty() ? "Waiting for the first GraphNav occupancy patch."
-                                                              : status_detail,
-                                        46)) {
-        cv::putText(canvas, line,
-                    cv::Point(std::max(32, (canvas.cols - 960) / 2), detail_y),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.56,
-                    text_secondary, 1, cv::LINE_AA);
-        detail_y += 26;
+    double crop_x = body_grid_x - (crop_width / 2.0);
+    double crop_y = body_grid_y_img - (crop_height / 2.0);
+    crop_x = std::max(0.0, std::min(crop_x, static_cast<double>(grid_width) - crop_width));
+    crop_y = std::max(0.0, std::min(crop_y, static_cast<double>(grid_height) - crop_height));
+
+    const int crop_x0 = std::max(0, std::min(grid_width - 1, static_cast<int>(std::floor(crop_x))));
+    const int crop_y0 = std::max(0, std::min(grid_height - 1, static_cast<int>(std::floor(crop_y))));
+    const int crop_x1 = std::max(crop_x0 + 1,
+                                 std::min(grid_width, static_cast<int>(std::ceil(crop_x + crop_width))));
+    const int crop_y1 = std::max(crop_y0 + 1,
+                                 std::min(grid_height, static_cast<int>(std::ceil(crop_y + crop_height))));
+    const cv::Rect crop_rect(crop_x0, crop_y0, crop_x1 - crop_x0, crop_y1 - crop_y0);
+
+    const double x_scale = static_cast<double>(canvas.cols) / std::max(1, crop_rect.width);
+    const double y_scale = static_cast<double>(canvas.rows) / std::max(1, crop_rect.height);
+
+    cv::Mat cropped_grid = grid_image(crop_rect);
+    cv::Mat scaled_grid;
+    cv::resize(cropped_grid, scaled_grid, canvas.size(), 0.0, 0.0, cv::INTER_NEAREST);
+    if (std::min(x_scale, y_scale) >= 3.0) {
+      const cv::Scalar grid_line(74, 80, 88);
+      const int start_grid_x = std::max(0, static_cast<int>(std::floor(crop_x / 10.0)) * 10);
+      const int end_grid_x =
+          std::min(grid_width, static_cast<int>(std::ceil((crop_x + crop_width) / 10.0)) * 10);
+      for (int x = start_grid_x; x <= end_grid_x; x += 10) {
+        const int line_x = std::min(canvas.cols - 1, std::max(0, cvRound((x - crop_x) * x_scale)));
+        cv::line(scaled_grid, cv::Point(line_x, 0), cv::Point(line_x, canvas.rows - 1), grid_line,
+                 1, cv::LINE_8);
+      }
+      const int start_grid_y = std::max(0, static_cast<int>(std::floor(crop_y / 10.0)) * 10);
+      const int end_grid_y =
+          std::min(grid_height, static_cast<int>(std::ceil((crop_y + crop_height) / 10.0)) * 10);
+      for (int y = start_grid_y; y <= end_grid_y; y += 10) {
+        const int line_y = std::min(canvas.rows - 1, std::max(0, cvRound((y - crop_y) * y_scale)));
+        cv::line(scaled_grid, cv::Point(0, line_y), cv::Point(canvas.cols - 1, line_y), grid_line,
+                 1, cv::LINE_8);
       }
     }
+
+    scaled_grid.copyTo(canvas);
+    for (int x = 0; x <= canvas.cols; x += 96) {
+      cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1), palette.grid_major, 1,
+               cv::LINE_AA);
+    }
+    for (int y = 0; y <= canvas.rows; y += 96) {
+      cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y), palette.grid_major, 1,
+               cv::LINE_AA);
+    }
+
+    draw_occupied_contours(&canvas, occupied_mask(crop_rect),
+                           cv::Rect(0, 0, canvas.cols, canvas.rows),
+                           palette.map_occupied_edge);
+
+    auto local_to_pixel = [&](double local_x_m, double local_y_m) {
+      const double pixel_x = ((local_x_m / snapshot->map.resolution_m) - crop_x) * x_scale;
+      const double pixel_y =
+          ((static_cast<double>(grid_height) - (local_y_m / snapshot->map.resolution_m)) - crop_y) *
+          y_scale;
+      return cv::Point(cvRound(pixel_x), cvRound(pixel_y));
+    };
+
+    const double body_x = grid_tform_body.x;
+    const double body_y = grid_tform_body.y;
+    draw_robot_pose_overlay(&canvas, local_to_pixel, body_x, body_y, yaw_rad,
+                            std::max(x_scale, y_scale) * 4.0, 0.18, palette.robot_fill,
+                            palette.robot_outline);
+
+    if (snapshot->has_waypoint_tform_body) {
+      const SpotClient::Pose3D seed_tform_waypoint =
+          compose_pose(snapshot->seed_tform_body, inverse_pose(snapshot->waypoint_tform_body));
+      const SpotClient::Pose3D grid_tform_waypoint =
+          compose_pose(inverse_pose(snapshot->map.seed_tform_grid), seed_tform_waypoint);
+      const cv::Point waypoint_pt = local_to_pixel(grid_tform_waypoint.x, grid_tform_waypoint.y);
+      cv::Mat waypoint_overlay = canvas.clone();
+      cv::circle(waypoint_overlay, waypoint_pt,
+                 std::max(10, cvRound(std::max(x_scale, y_scale) * 3.0)), palette.waypoint_fill,
+                 cv::FILLED, cv::LINE_AA);
+      cv::addWeighted(waypoint_overlay, 0.12, canvas, 0.88, 0.0, canvas);
+      cv::circle(canvas, waypoint_pt, std::max(6, cvRound(std::max(x_scale, y_scale) * 2.0)),
+                 cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+      cv::circle(canvas, waypoint_pt, 3, palette.waypoint_fill, cv::FILLED, cv::LINE_AA);
+      cv::line(canvas, cv::Point(waypoint_pt.x - 10, waypoint_pt.y),
+               cv::Point(waypoint_pt.x + 10, waypoint_pt.y), palette.waypoint_fill, 1,
+               cv::LINE_AA);
+      cv::line(canvas, cv::Point(waypoint_pt.x, waypoint_pt.y - 10),
+               cv::Point(waypoint_pt.x, waypoint_pt.y + 10), palette.waypoint_fill, 1,
+               cv::LINE_AA);
+    }
+
+    const double span_x_m = snapshot->map.width * snapshot->map.resolution_m;
+    double scale_bar_m = 1.0;
+    if (span_x_m >= 8.0) scale_bar_m = 2.0;
+    if (span_x_m >= 16.0) scale_bar_m = 5.0;
+    const int scale_bar_px =
+        std::max(1, cvRound((scale_bar_m / snapshot->map.resolution_m) * x_scale));
+    draw_scale_bar(&canvas, cv::Point(16, std::max(24, canvas.rows - 20)), scale_bar_px,
+                   scale_bar_m, palette.text_primary, palette.robot_outline, true);
 
     return encode_jpeg(canvas, out_jpg);
   };
@@ -2511,27 +2683,12 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
 
   auto build_frame = [](const std::shared_ptr<GraphNavMapArtifacts>& artifacts,
                         const SpotClient::LocalizationSnapshot* localization,
-                        const std::unordered_map<std::string, std::string>& display_names,
                         const std::unordered_set<std::string>& dock_waypoints,
                         const std::string& status_title,
                         const std::string& status_detail,
                         std::string* out_jpg) -> bool {
     if (!out_jpg) return false;
-
-    const cv::Scalar canvas_bg(16, 24, 34);
-    const cv::Scalar grid_minor(34, 47, 62);
-    const cv::Scalar grid_major(46, 64, 84);
-    const cv::Scalar text_primary(236, 240, 245);
-    const cv::Scalar text_secondary(154, 172, 190);
-    const cv::Scalar map_unknown(24, 33, 44);
-    const cv::Scalar map_free(73, 88, 105);
-    const cv::Scalar map_occupied(176, 193, 208);
-    const cv::Scalar map_occupied_edge(222, 232, 240);
-    const cv::Scalar waypoint_fill(224, 164, 72);
-    const cv::Scalar waypoint_dock(66, 186, 122);
-    const cv::Scalar edge_line(92, 128, 158);
-    const cv::Scalar robot_fill(48, 190, 245);
-    const cv::Scalar robot_outline(18, 25, 34);
+    const auto& palette = graphnav_image_palette();
 
     const bool has_map = artifacts && artifacts->snapshot.has_map &&
                          artifacts->snapshot.map.width > 0 &&
@@ -2539,72 +2696,21 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
                          artifacts->snapshot.map.resolution_m > 0.0;
 
     if (!has_map) {
-      cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, canvas_bg);
-      for (int x = 0; x <= canvas.cols; x += 80) {
-        cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1),
-                 (x % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
-      }
-      for (int y = 0; y <= canvas.rows; y += 80) {
-        cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y),
-                 (y % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
-      }
-      const cv::Point center(canvas.cols / 2, canvas.rows / 2);
-      cv::circle(canvas, center, 54, cv::Scalar(48, 68, 88), 1, cv::LINE_AA);
-      cv::circle(canvas, center, 108, cv::Scalar(40, 58, 76), 1, cv::LINE_AA);
-      cv::line(canvas, cv::Point(center.x - 18, center.y), cv::Point(center.x + 18, center.y),
-               cv::Scalar(78, 104, 132), 1, cv::LINE_AA);
-      cv::line(canvas, cv::Point(center.x, center.y - 18), cv::Point(center.x, center.y + 18),
-               cv::Scalar(78, 104, 132), 1, cv::LINE_AA);
-
-      const std::string title = status_title.empty() ? "Waiting for saved GraphNav map" : status_title;
-      int baseline = 0;
-      const cv::Size title_size =
-          cv::getTextSize(title, cv::FONT_HERSHEY_SIMPLEX, 0.9, 2, &baseline);
-      const cv::Point title_pt((canvas.cols - title_size.width) / 2, (canvas.rows / 2) + 18);
-      cv::putText(canvas, title, title_pt, cv::FONT_HERSHEY_SIMPLEX, 0.9, text_primary, 2,
-                  cv::LINE_AA);
-      int detail_y = title_pt.y + 34;
-      for (const auto& line : wrap_text(status_detail.empty()
-                                            ? "Waiting for a stitched GraphNav map to be available."
-                                            : status_detail,
-                                        46)) {
-        cv::putText(canvas, line,
-                    cv::Point(std::max(32, (canvas.cols - 960) / 2), detail_y),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.56,
-                    text_secondary, 1, cv::LINE_AA);
-        detail_y += 26;
-      }
-      return encode_jpeg(canvas, out_jpg);
+      return build_graphnav_status_frame("Waiting for saved GraphNav map",
+                                         "Waiting for a stitched GraphNav map to be available.",
+                                         status_title, status_detail, out_jpg);
     }
 
-    (void)display_names;
-
-    cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, map_unknown);
+    cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, palette.map_unknown);
     const auto& map = artifacts->snapshot.map;
-    cv::Mat grid_image(map.height, map.width, CV_8UC3, map_unknown);
-    cv::Mat occupied_mask(map.height, map.width, CV_8UC1, cv::Scalar(0));
-    for (int y = 0; y < map.height; ++y) {
-      for (int x = 0; x < map.width; ++x) {
-        const size_t idx = static_cast<size_t>(x) +
-                           static_cast<size_t>(map.width) * static_cast<size_t>(y);
-        const int draw_y = map.height - 1 - y;
-        const int32_t value = map.occupancy[idx];
-        cv::Vec3b* px = &grid_image.at<cv::Vec3b>(draw_y, x);
-        if (value < 0) {
-          *px = cv::Vec3b(static_cast<uchar>(map_unknown[0]),
-                          static_cast<uchar>(map_unknown[1]),
-                          static_cast<uchar>(map_unknown[2]));
-        } else if (value >= 50) {
-          *px = cv::Vec3b(static_cast<uchar>(map_occupied[0]),
-                          static_cast<uchar>(map_occupied[1]),
-                          static_cast<uchar>(map_occupied[2]));
-          occupied_mask.at<uchar>(draw_y, x) = 255;
-        } else {
-          *px = cv::Vec3b(static_cast<uchar>(map_free[0]),
-                          static_cast<uchar>(map_free[1]),
-                          static_cast<uchar>(map_free[2]));
-        }
-      }
+    cv::Mat grid_image;
+    cv::Mat occupied_mask;
+    if (!rasterize_occupancy_grid(map, palette, &grid_image, &occupied_mask)) {
+      return build_graphnav_status_frame("Waiting for saved GraphNav map",
+                                         "Waiting for a stitched GraphNav map to be available.",
+                                         "Saved GraphNav map invalid",
+                                         "The stitched map payload is missing a usable occupancy grid.",
+                                         out_jpg);
     }
 
     const int pad_x = 12;
@@ -2624,19 +2730,7 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
     cv::resize(grid_image, scaled_grid, draw_rect.size(), 0.0, 0.0, cv::INTER_NEAREST);
     scaled_grid.copyTo(canvas(draw_rect));
 
-    cv::Mat scaled_mask;
-    cv::resize(occupied_mask, scaled_mask, draw_rect.size(), 0.0, 0.0, cv::INTER_NEAREST);
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(scaled_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-    for (const auto& contour : contours) {
-      if (contour.size() < 3) continue;
-      std::vector<cv::Point> shifted;
-      shifted.reserve(contour.size());
-      for (const auto& point : contour) {
-        shifted.emplace_back(point.x + draw_rect.x, point.y + draw_rect.y);
-      }
-      cv::polylines(canvas, shifted, true, map_occupied_edge, 1, cv::LINE_AA);
-    }
+    draw_occupied_contours(&canvas, occupied_mask, draw_rect, palette.map_occupied_edge);
 
     auto local_to_pixel = [&](double local_x_m, double local_y_m) {
       const double grid_x = local_x_m / map.resolution_m;
@@ -2659,7 +2753,8 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
       const auto to_it = local_waypoints.find(edge.to_waypoint_id);
       if (from_it == local_waypoints.end() || to_it == local_waypoints.end()) continue;
       cv::line(canvas, local_to_pixel(from_it->second.x, from_it->second.y),
-               local_to_pixel(to_it->second.x, to_it->second.y), edge_line, 1, cv::LINE_AA);
+               local_to_pixel(to_it->second.x, to_it->second.y), palette.edge_line, 1,
+               cv::LINE_AA);
     }
 
     for (const auto& waypoint : artifacts->snapshot.waypoints) {
@@ -2670,9 +2765,9 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
           localization && !localization->waypoint_id.empty() &&
           localization->waypoint_id == waypoint.id;
       const cv::Point point = local_to_pixel(pose_it->second.x, pose_it->second.y);
-      const cv::Scalar fill_color = is_dock ? waypoint_dock : waypoint_fill;
+      const cv::Scalar fill_color = is_dock ? palette.waypoint_dock : palette.waypoint_fill;
       const int radius = is_current ? 7 : 5;
-      cv::circle(canvas, point, radius + 2, robot_outline, cv::FILLED, cv::LINE_AA);
+      cv::circle(canvas, point, radius + 2, palette.robot_outline, cv::FILLED, cv::LINE_AA);
       cv::circle(canvas, point, radius, fill_color, cv::FILLED, cv::LINE_AA);
       cv::circle(canvas, point, radius, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
     }
@@ -2681,29 +2776,9 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
       const SpotClient::Pose3D seed_tform_body = pose3d_from_localization_snapshot(*localization);
       const SpotClient::Pose3D map_tform_body = compose_pose(map_tform_seed, seed_tform_body);
       const double yaw_rad = quaternion_yaw_rad(pose_quaternion(map_tform_body));
-      const double c = std::cos(yaw_rad);
-      const double s = std::sin(yaw_rad);
-      const std::array<cv::Point2d, 4> footprint_local = {
-          cv::Point2d(0.45, 0.25), cv::Point2d(0.45, -0.25),
-          cv::Point2d(-0.45, -0.25), cv::Point2d(-0.45, 0.25)};
-      std::vector<cv::Point> footprint_pixels;
-      footprint_pixels.reserve(footprint_local.size());
-      for (const auto& corner : footprint_local) {
-        const double px = map_tform_body.x + c * corner.x - s * corner.y;
-        const double py = map_tform_body.y + s * corner.x + c * corner.y;
-        footprint_pixels.push_back(local_to_pixel(px, py));
-      }
-      cv::Mat overlay = canvas.clone();
-      cv::circle(overlay, local_to_pixel(map_tform_body.x, map_tform_body.y),
-                 std::max(10, cvRound(scale * 3.5)), robot_fill, cv::FILLED, cv::LINE_AA);
-      cv::addWeighted(overlay, 0.14, canvas, 0.86, 0.0, canvas);
-      cv::fillConvexPoly(canvas, footprint_pixels, robot_fill, cv::LINE_AA);
-      cv::polylines(canvas, footprint_pixels, true, robot_outline, 2, cv::LINE_AA);
-      const cv::Point body_center = local_to_pixel(map_tform_body.x, map_tform_body.y);
-      const cv::Point arrow_tip =
-          local_to_pixel(map_tform_body.x + (c * 0.8), map_tform_body.y + (s * 0.8));
-      cv::circle(canvas, body_center, 4, robot_outline, cv::FILLED, cv::LINE_AA);
-      cv::arrowedLine(canvas, body_center, arrow_tip, robot_outline, 3, cv::LINE_AA, 0, 0.28);
+      draw_robot_pose_overlay(&canvas, local_to_pixel, map_tform_body.x, map_tform_body.y,
+                              yaw_rad, scale * 3.5, 0.14, palette.robot_fill,
+                              palette.robot_outline);
     }
 
     const double span_x_m = map.width * map.resolution_m;
@@ -2712,25 +2787,15 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
     if (span_x_m >= 24.0) scale_bar_m = 5.0;
     if (span_x_m >= 60.0) scale_bar_m = 10.0;
     const int scale_bar_px = std::max(1, cvRound((scale_bar_m / map.resolution_m) * scale));
-    const cv::Point scale_start(draw_rect.x + 18, draw_rect.y + draw_rect.height - 18);
-    const cv::Point scale_end(scale_start.x + scale_bar_px, scale_start.y);
-    cv::line(canvas, cv::Point(scale_start.x, scale_start.y + 1),
-             cv::Point(scale_end.x, scale_end.y + 1), robot_outline, 5, cv::LINE_AA);
-    cv::line(canvas, scale_start, scale_end, text_primary, 3, cv::LINE_AA);
-    cv::line(canvas, cv::Point(scale_start.x, scale_start.y - 5),
-             cv::Point(scale_start.x, scale_start.y + 5), text_primary, 2, cv::LINE_AA);
-    cv::line(canvas, cv::Point(scale_end.x, scale_end.y - 5),
-             cv::Point(scale_end.x, scale_end.y + 5), text_primary, 2, cv::LINE_AA);
-    cv::putText(canvas, format_decimal(scale_bar_m, scale_bar_m >= 5.0 ? 0 : 1) + " m",
-                cv::Point(scale_end.x + 12, scale_start.y + 5), cv::FONT_HERSHEY_SIMPLEX, 0.48,
-                text_primary, 1, cv::LINE_AA);
+    draw_scale_bar(&canvas, cv::Point(draw_rect.x + 18, draw_rect.y + draw_rect.height - 18),
+                   scale_bar_px, scale_bar_m, palette.text_primary, palette.robot_outline, false);
 
     return encode_jpeg(canvas, out_jpg);
   };
 
   {
     auto initial = std::make_shared<std::string>();
-    build_frame(nullptr, nullptr, {}, {}, "Waiting for saved GraphNav map",
+    build_frame(nullptr, nullptr, {}, "Waiting for saved GraphNav map",
                 "Waiting for a stitched GraphNav map to be available.", initial.get());
     update_cached_image(&cached_image, std::move(initial));
   }
@@ -2741,27 +2806,14 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
 
   while (running_) {
     std::shared_ptr<GraphNavMapArtifacts> artifacts;
-    std::unordered_map<std::string, std::string> display_names;
     std::unordered_set<std::string> dock_waypoints;
     {
       std::lock_guard<std::mutex> lk(map_mu_);
       artifacts = graphnav_map_artifacts_;
       if (artifacts) {
-        const auto alias_it = waypoint_aliases_by_map_.find(artifacts->map_id);
-        if (alias_it != waypoint_aliases_by_map_.end()) {
-          for (const auto& alias : alias_it->second) {
-            auto& current = display_names[alias.second];
-            if (current.empty() || alias.first < current) current = alias.first;
-          }
-        }
         const auto dock_it = dock_waypoint_by_map_.find(artifacts->map_id);
         if (dock_it != dock_waypoint_by_map_.end() && !dock_it->second.empty()) {
           dock_waypoints.insert(dock_it->second);
-        }
-        for (const auto& waypoint : artifacts->snapshot.waypoints) {
-          if (display_names.find(waypoint.id) == display_names.end()) {
-            display_names[waypoint.id] = waypoint.label.empty() ? waypoint.id : waypoint.label;
-          }
         }
       }
     }
@@ -2786,7 +2838,7 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
     }
 
     auto rendered = std::make_shared<std::string>();
-    if (build_frame(artifacts, localization_ptr, display_names, dock_waypoints,
+    if (build_frame(artifacts, localization_ptr, dock_waypoints,
                     status_title, status_detail, rendered.get())) {
       update_cached_image(&cached_image, std::move(rendered));
     }
@@ -2806,6 +2858,8 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
 void Adapter::LeaseRetainLoop() {
   const int period_ms = 100;
   const int periodic_publish_ms = 5000;  // 0.2 Hz
+  const int graphnav_global_localization_period_ms =
+      std::max(250, 1000 / std::max(1, cfg_.graphnav_global_localization_hz));
   long long last_retain_ms = 0;
   long long last_can_dock_pub_ms = 0;
   long long last_status_pub_ms = 0;
@@ -2826,7 +2880,8 @@ void Adapter::LeaseRetainLoop() {
       last_retain_ms = now;
     }
 
-    if ((now - last_can_dock_pub_ms) >= periodic_publish_ms) {
+    if (!cfg_.can_dock_stream.empty() &&
+        (now - last_can_dock_pub_ms) >= periodic_publish_ms) {
       int dock_id = resolved_dock_id_.load();
       if (dock_id <= 0) dock_id = ResolveDockId();
       bool can_dock = false;
@@ -2840,19 +2895,24 @@ void Adapter::LeaseRetainLoop() {
     }
 
     if ((now - last_status_pub_ms) >= periodic_publish_ms) {
-      QueueStatusBitset("spot.status", {
-        {"Has lease", lease_owned_.load()},
-        {"Robot available", SpotConnected()},
-        {"Robot degraded", spot_degraded_non_estop_.load()},
-        {"Teleop running", running_.load()},
-        {"Teleop active", TeleopSessionActive()},
-        {"Docking", docking_in_progress_.load()},
-      });
-      QueueStatusText("spot.connection", BuildSpotConnectionJson());
+      if (IsStreamEnabled(kStatusStream)) {
+        QueueStatusBitset(kStatusStream, {
+          {"Has lease", lease_owned_.load()},
+          {"Robot available", SpotConnected()},
+          {"Robot degraded", spot_degraded_non_estop_.load()},
+          {"Teleop running", running_.load()},
+          {"Teleop active", TeleopSessionActive()},
+          {"Docking", docking_in_progress_.load()},
+        });
+      }
+      if (IsStreamEnabled(kConnectionStream)) {
+        QueueStatusText(kConnectionStream, BuildSpotConnectionJson());
+      }
       last_status_pub_ms = now;
     }
 
-    if ((now - last_mode_pub_ms) >= periodic_publish_ms) {
+    if (!cfg_.stateful_mode_stream.empty() &&
+        (now - last_mode_pub_ms) >= periodic_publish_ms) {
       QueueStatusBitset(cfg_.stateful_mode_stream, {
         {"Walk", desired_motion_mode_.load() == kMotionModeWalk},
         {"Stairs", desired_motion_mode_.load() == kMotionModeStairs},
@@ -2861,20 +2921,30 @@ void Adapter::LeaseRetainLoop() {
       last_mode_pub_ms = now;
     }
 
-    if ((now - last_robot_diag_pub_ms) >= periodic_publish_ms && SpotConnected()) {
+    const bool need_robot_diag = AnyStreamEnabled({
+        kRobotStatePowerStream,
+        kRobotStateBatteryStream,
+        kRobotStateBodyPitchStream,
+        kFaultsSystemStream,
+        kFaultsBehaviorStream,
+        kFaultsServiceStream,
+        kFaultEventsStream,
+    });
+    if (need_robot_diag &&
+        (now - last_robot_diag_pub_ms) >= periodic_publish_ms && SpotConnected()) {
       SpotClient::RobotStateSnapshot snap;
       if (spot_.GetRobotStateSnapshot(&snap)) {
         ApplySoftRecoveryForRobotState(snap);
-        QueueStatusText("spot.robot_state.power", robot_state_to_json(snap));
+        QueueStatusText(kRobotStatePowerStream, robot_state_to_json(snap));
         if (snap.has_battery_pct) {
-          QueueStatusNumeric("spot.robot_state.battery", snap.battery_pct);
+          QueueStatusNumeric(kRobotStateBatteryStream, snap.battery_pct);
         }
         if (snap.has_body_pitch_rad) {
-          QueueStatusNumeric("spot.robot_state.body_pitch_rad", snap.body_pitch_rad);
+          QueueStatusNumeric(kRobotStateBodyPitchStream, snap.body_pitch_rad);
         }
-        QueueStatusText("spot.faults.system", fault_list_to_json(snap.system_faults));
-        QueueStatusText("spot.faults.behavior", fault_list_to_json(snap.behavior_faults));
-        QueueStatusText("spot.faults.service", fault_list_to_json(snap.service_faults));
+        QueueStatusText(kFaultsSystemStream, fault_list_to_json(snap.system_faults));
+        QueueStatusText(kFaultsBehaviorStream, fault_list_to_json(snap.behavior_faults));
+        QueueStatusText(kFaultsServiceStream, fault_list_to_json(snap.service_faults));
         PublishFaultEvents(snap);
       } else {
         std::cerr << "[state] failed to fetch robot state: " << spot_.LastError() << std::endl;
@@ -2882,15 +2952,22 @@ void Adapter::LeaseRetainLoop() {
       last_robot_diag_pub_ms = now;
     }
 
-    if ((now - last_map_progress_pub_ms) >= periodic_publish_ms && SpotConnected()) {
+    const bool need_map_progress = AnyStreamEnabled({
+        kMapProgressStream,
+        kMapProgressWaypointsStream,
+        kMapProgressPathLengthStream,
+        kMapProgressFiducialsStream,
+    });
+    if (need_map_progress &&
+        (now - last_map_progress_pub_ms) >= periodic_publish_ms && SpotConnected()) {
       SpotClient::MappingStatus map_status;
       if (spot_.GetMappingStatus(&map_status)) {
         map_recording_active_ = map_status.is_recording;
-        QueueStatusText("spot.map.progress", mapping_status_to_json(map_status));
-        QueueStatusNumeric("spot.map.progress.waypoints",
+        QueueStatusText(kMapProgressStream, mapping_status_to_json(map_status));
+        QueueStatusNumeric(kMapProgressWaypointsStream,
                            static_cast<double>(map_status.waypoint_count));
-        QueueStatusNumeric("spot.map.progress.path_length_m", map_status.total_path_length_m);
-        QueueStatusNumeric("spot.map.progress.fiducials",
+        QueueStatusNumeric(kMapProgressPathLengthStream, map_status.total_path_length_m);
+        QueueStatusNumeric(kMapProgressFiducialsStream,
                            static_cast<double>(map_status.visible_fiducial_ids.size()));
 
         const std::string signature = mapping_status_signature(map_status);
@@ -2908,7 +2985,8 @@ void Adapter::LeaseRetainLoop() {
       last_map_progress_pub_ms = now;
     }
 
-    if ((now - last_localization_pub_ms) >= periodic_publish_ms) {
+    if (IsStreamEnabled(kLocalizationStatusStream) &&
+        (now - last_localization_pub_ms) >= periodic_publish_ms) {
       bool localized = false;
       std::string waypoint_id;
       std::string error;
@@ -2925,11 +3003,12 @@ void Adapter::LeaseRetainLoop() {
       oss << "{\"localized\":" << (localized ? "true" : "false")
           << ",\"waypoint_id\":\"" << json_escape(waypoint_id) << "\""
           << ",\"error\":\"" << json_escape(error) << "\"}";
-      QueueStatusText("spot.localization", oss.str());
+      QueueStatusText(kLocalizationStatusStream, oss.str());
       last_localization_pub_ms = now;
     }
 
-    if ((now - last_localization_viz_pub_ms) >= periodic_publish_ms && SpotConnected()) {
+    if (IsStreamEnabled(kGraphNavLocalizationVizStream) &&
+        (now - last_localization_viz_pub_ms) >= periodic_publish_ms && SpotConnected()) {
       SpotClient::LocalizationMapSnapshot localization_map;
       if (spot_.GetLocalizationMapSnapshot(&localization_map) &&
           localization_map.localized &&
@@ -2941,7 +3020,8 @@ void Adapter::LeaseRetainLoop() {
       last_localization_viz_pub_ms = now;
     }
 
-    if ((now - last_graphnav_global_localization_pub_ms) >= periodic_publish_ms && SpotConnected()) {
+    if ((now - last_graphnav_global_localization_pub_ms) >= graphnav_global_localization_period_ms &&
+        SpotConnected()) {
       std::shared_ptr<GraphNavMapArtifacts> artifacts;
       {
         std::lock_guard<std::mutex> lk(map_mu_);
@@ -2962,6 +3042,7 @@ void Adapter::LeaseRetainLoop() {
     }
 
     PollCurrentWaypointAtStatus(now);
+    PublishGraphNavNavState(now);
 
     if (lease_owned_ && TeleopSessionActive() && !docking_in_progress_) {
       ApplyDesiredArmMode(false);
@@ -3017,6 +3098,14 @@ void Adapter::SetSpotDisconnected(const std::string& reason) {
     std::lock_guard<std::mutex> lk(spot_connection_mu_);
     last_spot_error_ = reason;
     spot_degraded_reason_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    ClearGraphNavNavTargetLocked();
+    last_nav_feedback_signature_.clear();
+    last_nav_status_ = 0;
+    last_nav_remaining_route_m_ = 0.0;
+    last_nav_progress_change_ms_ = 0;
   }
   ResetFaultEventsState();
   if (was_connected) {
@@ -3104,6 +3193,7 @@ void Adapter::ResetFaultEventsState() {
 }
 
 void Adapter::PublishFaultEvents(const SpotClient::RobotStateSnapshot& snap) {
+  if (!IsStreamEnabled(kFaultEventsStream)) return;
   std::unordered_map<std::string, SpotClient::FaultInfo> current_faults;
   add_faults_for_events("system", snap.system_faults, &current_faults);
   add_faults_for_events("behavior", snap.behavior_faults, &current_faults);
@@ -3176,7 +3266,7 @@ void Adapter::PublishFaultEvents(const SpotClient::RobotStateSnapshot& snap) {
     payload << lines[i];
     if (i + 1 < lines.size()) payload << "\n";
   }
-  QueueStatusText("spot.fault.events", payload.str());
+  QueueStatusText(kFaultEventsStream, payload.str());
 }
 
 void Adapter::ConnectionLoop() {
@@ -3295,7 +3385,9 @@ void Adapter::PollGraphNavNavigation(long long now) {
   }
   const int status = fb.status;
 
-  QueueStatusText("spot.nav.feedback", nav_feedback_to_json(command_id, fb));
+        if (IsStreamEnabled(kNavFeedbackStream)) {
+          QueueStatusText(kNavFeedbackStream, nav_feedback_to_json(command_id, fb));
+        }
 
   const std::string feedback_sig = nav_feedback_signature(fb);
   bool changed = false;
@@ -3361,13 +3453,17 @@ void Adapter::PollGraphNavNavigation(long long now) {
     last_nav_feedback_signature_.clear();
     last_nav_progress_change_ms_ = 0;
     last_nav_remaining_route_m_ = 0.0;
-    last_nav_status_ = 0;
   };
 
   graphnav_navigation_active_ = false;
   using Resp = ::bosdyn::api::graph_nav::NavigationFeedbackResponse;
   if (status == Resp::STATUS_REACHED_GOAL) {
     EmitLog("[graphnav] navigation reached goal");
+    {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      last_nav_status_ = status;
+      last_nav_remaining_route_m_ = fb.remaining_route_length;
+    }
     last_graph_nav_command_id_ = 0;
     nav_auto_recovered_ = false;
     clear_nav_state();
@@ -3376,14 +3472,14 @@ void Adapter::PollGraphNavNavigation(long long now) {
 
   if (status == Resp::STATUS_ROBOT_IMPAIRED) {
     const bool already_recovered = nav_auto_recovered_.exchange(true);
-    std::string waypoint_id;
     std::string waypoint_name;
     {
-      std::lock_guard<std::mutex> lk(map_mu_);
-      waypoint_id = nav_target_waypoint_id_;
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
       waypoint_name = nav_target_waypoint_name_;
+      last_nav_status_ = status;
+      last_nav_remaining_route_m_ = fb.remaining_route_length;
     }
-    if (!already_recovered && !waypoint_id.empty()) {
+    if (!already_recovered) {
       EmitLog("[graphnav] navigation impaired, auto-recovering and retrying");
       if (!spot_.RecoverSelfRight()) {
         EmitLog(std::string("[graphnav] auto-recover failed: ") + spot_.LastError());
@@ -3394,20 +3490,25 @@ void Adapter::PollGraphNavNavigation(long long now) {
       (void)spot_.Stand();
 
       uint32_t retry_command_id = 0;
-      if (spot_.NavigateToWaypoint(waypoint_id, cfg_.graphnav_command_timeout_sec, &retry_command_id)) {
+      if (RetryActiveGraphNavCommandWithRecovery("graphnav.navigation.retry",
+                                                 &retry_command_id)) {
         last_graph_nav_command_id_ = retry_command_id;
         graphnav_navigation_active_ = true;
-        EmitLog(std::string("[graphnav] retrying waypoint after recover name=") + waypoint_name +
-                " id=" + waypoint_id);
+        EmitLog(std::string("[graphnav] retrying navigation after recover name=") + waypoint_name);
         return;
       }
-      EmitLog(std::string("[graphnav] waypoint retry after recover failed: ") + spot_.LastError());
+      EmitLog(std::string("[graphnav] navigation retry after recover failed: ") + spot_.LastError());
     }
     last_graph_nav_command_id_ = 0;
     clear_nav_state();
     return;
   }
 
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    last_nav_status_ = status;
+    last_nav_remaining_route_m_ = fb.remaining_route_length;
+  }
   EmitLog(std::string("[graphnav] navigation ended status=") + std::to_string(status) +
           " (" + nav_status_name(status) + ")");
   last_graph_nav_command_id_ = 0;
@@ -3416,7 +3517,7 @@ void Adapter::PollGraphNavNavigation(long long now) {
 }
 
 void Adapter::QueueStatusText(const std::string& stream, const std::string& value) {
-  if (stream.empty()) return;
+  if (stream.empty() || !IsStreamEnabled(stream)) return;
   std::lock_guard<std::mutex> lk(status_queue_mu_);
   auto& dp = status_queue_[stream];
   dp.kind = PendingStatusDatapoint::Kind::kText;
@@ -3425,7 +3526,7 @@ void Adapter::QueueStatusText(const std::string& stream, const std::string& valu
 }
 
 void Adapter::QueueStatusNumeric(const std::string& stream, double value) {
-  if (stream.empty()) return;
+  if (stream.empty() || !IsStreamEnabled(stream)) return;
   std::lock_guard<std::mutex> lk(status_queue_mu_);
   auto& dp = status_queue_[stream];
   dp.kind = PendingStatusDatapoint::Kind::kNumeric;
@@ -3435,7 +3536,7 @@ void Adapter::QueueStatusNumeric(const std::string& stream, double value) {
 
 void Adapter::QueueStatusBitset(const std::string& stream,
                                 const std::vector<std::pair<std::string, bool>>& bits) {
-  if (stream.empty()) return;
+  if (stream.empty() || !IsStreamEnabled(stream)) return;
   std::lock_guard<std::mutex> lk(status_queue_mu_);
   auto& dp = status_queue_[stream];
   dp.kind = PendingStatusDatapoint::Kind::kBitset;
@@ -3503,6 +3604,7 @@ void Adapter::FlushQueuedStatus(long long now) {
 
 void Adapter::EmitLog(const std::string& msg) {
   std::cerr << msg << std::endl;
+  if (!IsStreamEnabled(kAdapterLogStream)) return;
   const long long ts = now_ms();
   std::lock_guard<std::mutex> lk(adapter_log_mu_);
   adapter_log_buffer_.emplace_back(std::to_string(ts) + " " + msg);
@@ -3513,6 +3615,7 @@ void Adapter::EmitLog(const std::string& msg) {
 
 void Adapter::FlushAdapterLogStream(long long now) {
   static constexpr size_t kMaxPendingLogBytes = 64 * 1024;
+  if (!IsStreamEnabled(kAdapterLogStream)) return;
   if (now < adapter_log_retry_after_ms_.load()) return;
   if ((now - last_adapter_log_pub_ms_.load()) < 1000) return;
 
@@ -3550,7 +3653,7 @@ void Adapter::FlushAdapterLogStream(long long now) {
     payload = adapter_log_pending_payload_;
   }
 
-  const bool ok = agent_.PostText("spot.adapter.log", payload);
+  const bool ok = agent_.PostText(kAdapterLogStream, payload);
   if (ok) {
     std::lock_guard<std::mutex> lk(adapter_log_mu_);
     adapter_log_pending_payload_.clear();
@@ -3714,7 +3817,9 @@ bool Adapter::WaitForGraphNavCommandResult(uint32_t command_id, long long timeou
       EmitLog(std::string("[command] graphnav feedback failed: ") + spot_.LastError());
       return false;
     }
-    QueueStatusText("spot.nav.feedback", nav_feedback_to_json(command_id, fb));
+    if (IsStreamEnabled(kNavFeedbackStream)) {
+      QueueStatusText(kNavFeedbackStream, nav_feedback_to_json(command_id, fb));
+    }
     if (fb.status == Resp::STATUS_REACHED_GOAL) return true;
     if (fb.status != Resp::STATUS_FOLLOWING_ROUTE) {
       EmitLog("[command] graphnav ended status=" + std::to_string(fb.status) +
@@ -3748,16 +3853,32 @@ bool Adapter::EnsureLocalizedForNavigation(const std::string& action_name) {
 bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
                                         const std::string& waypoint_id,
                                         uint32_t* out_command_id,
-                                        bool straight) {
+                                        bool straight,
+                                        bool has_waypoint_goal,
+                                        double waypoint_goal_x,
+                                        double waypoint_goal_y,
+                                        double waypoint_goal_yaw_rad) {
   if (!EnsureLocalizedForNavigation(action_name)) return false;
 
   bool retried_localization = false;
   bool retried_recover = false;
   for (;;) {
     uint32_t command_id = 0;
-    const bool nav_ok =
-        straight ? spot_.NavigateToWaypointStraight(waypoint_id, cfg_.graphnav_command_timeout_sec, &command_id)
-                 : spot_.NavigateToWaypoint(waypoint_id, cfg_.graphnav_command_timeout_sec, &command_id);
+    const bool nav_ok = has_waypoint_goal
+                            ? (straight ? spot_.NavigateToWaypointPoseStraight(
+                                              waypoint_id, waypoint_goal_x, waypoint_goal_y,
+                                              waypoint_goal_yaw_rad,
+                                              cfg_.graphnav_command_timeout_sec, &command_id)
+                                        : spot_.NavigateToWaypointPose(
+                                              waypoint_id, waypoint_goal_x, waypoint_goal_y,
+                                              waypoint_goal_yaw_rad,
+                                              cfg_.graphnav_command_timeout_sec, &command_id))
+                            : (straight ? spot_.NavigateToWaypointStraight(
+                                              waypoint_id, cfg_.graphnav_command_timeout_sec,
+                                              &command_id)
+                                        : spot_.NavigateToWaypoint(
+                                              waypoint_id, cfg_.graphnav_command_timeout_sec,
+                                              &command_id));
     if (nav_ok) {
       if (out_command_id) *out_command_id = command_id;
       return true;
@@ -3786,10 +3907,42 @@ bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
   }
 }
 
+bool Adapter::RetryActiveGraphNavCommandWithRecovery(const std::string& action_name,
+                                                     uint32_t* out_command_id) {
+  std::string waypoint_id;
+  std::string mode;
+  bool has_waypoint_goal = false;
+  double waypoint_goal_x = 0.0;
+  double waypoint_goal_y = 0.0;
+  double waypoint_goal_yaw_rad = 0.0;
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    waypoint_id = nav_target_waypoint_id_;
+    mode = nav_target_mode_;
+    has_waypoint_goal = nav_target_has_waypoint_goal_;
+    waypoint_goal_x = nav_target_waypoint_goal_x_;
+    waypoint_goal_y = nav_target_waypoint_goal_y_;
+    waypoint_goal_yaw_rad = nav_target_waypoint_goal_yaw_rad_;
+  }
+  if (waypoint_id.empty()) return false;
+  const bool straight =
+      (mode == "waypoint_straight" || mode == "pose_straight");
+  return StartNavigateWithRecovery(action_name, waypoint_id, out_command_id, straight,
+                                   has_waypoint_goal, waypoint_goal_x, waypoint_goal_y,
+                                   waypoint_goal_yaw_rad);
+}
+
 bool Adapter::ExecuteWaypointGotoCommand(const v1::model::CommandRequest& request) {
   if (!EnsureLeaseForCommand("spot.waypoint.goto")) return false;
   std::string text;
   (void)ExtractCommandText(request, &text);
+  const std::string requested_map_uuid = Trim(ExtractParam(text, {"map_uuid"}));
+  std::string map_id;
+  std::string map_uuid;
+  if (!ValidateGraphNavCommandMapUuid("spot.waypoint.goto", requested_map_uuid, false,
+                                      &map_id, &map_uuid)) {
+    return false;
+  }
   std::string waypoint_id = Trim(ExtractParam(text, {"waypoint_id"}));
   std::string name = Trim(ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"}));
   if (waypoint_id.empty() && name.empty()) {
@@ -3813,11 +3966,24 @@ bool Adapter::ExecuteWaypointGotoCommand(const v1::model::CommandRequest& reques
   uint32_t command_id = 0;
   if (!StartNavigateWithRecovery("spot.waypoint.goto", waypoint_id, &command_id)) return false;
 
+  bool has_seed_goal = false;
+  double seed_x = 0.0;
+  double seed_y = 0.0;
+  double seed_yaw_rad = 0.0;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
-    nav_target_waypoint_id_ = waypoint_id;
-    nav_target_waypoint_name_ = name;
+    SpotClient::Pose3D waypoint_pose;
+    std::string resolved_map_uuid;
+    if (LookupWaypointSeedPoseLocked(waypoint_id, &waypoint_pose, &resolved_map_uuid)) {
+      has_seed_goal = true;
+      seed_x = waypoint_pose.x;
+      seed_y = waypoint_pose.y;
+      seed_yaw_rad = quaternion_yaw_rad(pose_quaternion(waypoint_pose));
+      if (map_uuid.empty()) map_uuid = resolved_map_uuid;
+    }
   }
+  SetGraphNavNavTarget("waypoint", waypoint_id, name, map_id, map_uuid,
+                       has_seed_goal, seed_x, seed_y, seed_yaw_rad);
   last_graph_nav_command_id_ = command_id;
   graphnav_navigation_active_ = true;
   nav_auto_recovered_ = false;
@@ -3833,6 +3999,13 @@ bool Adapter::ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest
   if (!EnsureLeaseForCommand("spot.waypoint.goto_straight")) return false;
   std::string text;
   (void)ExtractCommandText(request, &text);
+  const std::string requested_map_uuid = Trim(ExtractParam(text, {"map_uuid"}));
+  std::string map_id;
+  std::string map_uuid;
+  if (!ValidateGraphNavCommandMapUuid("spot.waypoint.goto_straight", requested_map_uuid, false,
+                                      &map_id, &map_uuid)) {
+    return false;
+  }
   std::string waypoint_id = Trim(ExtractParam(text, {"waypoint_id"}));
   std::string name = Trim(ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"}));
   if (waypoint_id.empty() && name.empty()) {
@@ -3856,11 +4029,24 @@ bool Adapter::ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest
   uint32_t command_id = 0;
   if (!StartNavigateWithRecovery("spot.waypoint.goto_straight", waypoint_id, &command_id, true)) return false;
 
+  bool has_seed_goal = false;
+  double seed_x = 0.0;
+  double seed_y = 0.0;
+  double seed_yaw_rad = 0.0;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
-    nav_target_waypoint_id_ = waypoint_id;
-    nav_target_waypoint_name_ = name;
+    SpotClient::Pose3D waypoint_pose;
+    std::string resolved_map_uuid;
+    if (LookupWaypointSeedPoseLocked(waypoint_id, &waypoint_pose, &resolved_map_uuid)) {
+      has_seed_goal = true;
+      seed_x = waypoint_pose.x;
+      seed_y = waypoint_pose.y;
+      seed_yaw_rad = quaternion_yaw_rad(pose_quaternion(waypoint_pose));
+      if (map_uuid.empty()) map_uuid = resolved_map_uuid;
+    }
   }
+  SetGraphNavNavTarget("waypoint_straight", waypoint_id, name, map_id, map_uuid,
+                       has_seed_goal, seed_x, seed_y, seed_yaw_rad);
   last_graph_nav_command_id_ = command_id;
   graphnav_navigation_active_ = true;
   nav_auto_recovered_ = false;
@@ -3869,6 +4055,147 @@ bool Adapter::ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest
   graphnav_navigation_active_ = false;
   last_graph_nav_command_id_ = 0;
   if (ok) EmitLog(std::string("[graphnav] spot.waypoint.goto_straight success name=") + name);
+  return ok;
+}
+
+bool Adapter::ExecuteGraphNavGotoPoseCommand(const v1::model::CommandRequest& request,
+                                             bool straight) {
+  const std::string action_name =
+      straight ? "spot.graphnav.goto_pose_straight" : "spot.graphnav.goto_pose";
+  if (!EnsureLeaseForCommand(action_name)) return false;
+
+  std::string text;
+  (void)ExtractCommandText(request, &text);
+  std::string map_id;
+  std::string map_uuid;
+  if (!ValidateGraphNavCommandMapUuid(action_name, Trim(ExtractParam(text, {"map_uuid"})), true,
+                                      &map_id, &map_uuid)) {
+    return false;
+  }
+
+  const auto parse_double_value = [](const std::string& raw, double* out_value) -> bool {
+    if (!out_value) return false;
+    const std::string trimmed = Adapter::Trim(raw);
+    if (trimmed.empty()) return false;
+    try {
+      size_t consumed = 0;
+      const double value = std::stod(trimmed, &consumed);
+      if (consumed != trimmed.size()) return false;
+      *out_value = value;
+      return true;
+    } catch (...) {
+      return false;
+    }
+  };
+
+  double seed_x = 0.0;
+  double seed_y = 0.0;
+  if (!parse_double_value(ExtractParam(text, {"x", "seed_x"}), &seed_x) ||
+      !parse_double_value(ExtractParam(text, {"y", "seed_y"}), &seed_y)) {
+    EmitLog("[graphnav] " + action_name + " rejected: missing x/y seed-frame goal");
+    return false;
+  }
+
+  bool has_explicit_yaw = false;
+  double seed_yaw_rad = 0.0;
+  if (parse_double_value(ExtractParam(text, {"yaw_rad", "yaw", "theta", "heading_rad"}),
+                         &seed_yaw_rad)) {
+    has_explicit_yaw = true;
+  } else {
+    double seed_yaw_deg = 0.0;
+    if (parse_double_value(ExtractParam(text, {"yaw_deg", "heading_deg", "degrees"}),
+                           &seed_yaw_deg)) {
+      has_explicit_yaw = true;
+      seed_yaw_rad = seed_yaw_deg * 3.14159265358979323846 / 180.0;
+    }
+  }
+
+  std::string waypoint_id;
+  std::string waypoint_name;
+  double waypoint_seed_x = 0.0;
+  double waypoint_seed_y = 0.0;
+  double waypoint_yaw_rad = 0.0;
+  double waypoint_distance_m = 0.0;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (!graphnav_map_artifacts_ || graphnav_map_artifacts_->map_id != map_id ||
+        graphnav_map_artifacts_->map_uuid != map_uuid) {
+      EmitLog("[graphnav] " + action_name +
+              " rejected: active stitched map artifacts do not match requested map_uuid");
+      return false;
+    }
+    const auto& waypoints = graphnav_map_artifacts_->snapshot.waypoints;
+    if (waypoints.empty()) {
+      EmitLog("[graphnav] " + action_name + " rejected: active map has no anchored waypoints");
+      return false;
+    }
+
+    const SpotClient::GraphNavWaypoint* nearest_waypoint = nullptr;
+    double best_distance_sq = std::numeric_limits<double>::infinity();
+    for (const auto& waypoint : waypoints) {
+      const double dx = seed_x - waypoint.seed_tform_waypoint.x;
+      const double dy = seed_y - waypoint.seed_tform_waypoint.y;
+      const double distance_sq = dx * dx + dy * dy;
+      if (!nearest_waypoint || distance_sq < best_distance_sq) {
+        nearest_waypoint = &waypoint;
+        best_distance_sq = distance_sq;
+      }
+    }
+    if (!nearest_waypoint) {
+      EmitLog("[graphnav] " + action_name + " rejected: failed to resolve nearest waypoint");
+      return false;
+    }
+    waypoint_id = nearest_waypoint->id;
+    waypoint_name = ResolveWaypointNameForIdLocked(waypoint_id);
+    if (waypoint_name.empty()) {
+      waypoint_name = nearest_waypoint->label.empty() ? waypoint_id : nearest_waypoint->label;
+    }
+    waypoint_seed_x = nearest_waypoint->seed_tform_waypoint.x;
+    waypoint_seed_y = nearest_waypoint->seed_tform_waypoint.y;
+    waypoint_yaw_rad = quaternion_yaw_rad(pose_quaternion(nearest_waypoint->seed_tform_waypoint));
+    waypoint_distance_m = std::sqrt(best_distance_sq);
+  }
+
+  if (!has_explicit_yaw) seed_yaw_rad = waypoint_yaw_rad;
+  seed_yaw_rad = normalize_angle_rad(seed_yaw_rad);
+
+  const double dx = seed_x - waypoint_seed_x;
+  const double dy = seed_y - waypoint_seed_y;
+  const double c = std::cos(waypoint_yaw_rad);
+  const double s = std::sin(waypoint_yaw_rad);
+  const double waypoint_goal_x = c * dx + s * dy;
+  const double waypoint_goal_y = -s * dx + c * dy;
+  const double waypoint_goal_yaw_rad = normalize_angle_rad(seed_yaw_rad - waypoint_yaw_rad);
+
+  EmitLog("[graphnav] " + action_name + " target_seed=(" + format_decimal(seed_x, 3) + "," +
+          format_decimal(seed_y, 3) + "," + format_decimal(seed_yaw_rad, 3) +
+          ") via_waypoint=" + waypoint_name + " id=" + waypoint_id +
+          " waypoint_distance_m=" + format_decimal(waypoint_distance_m, 2) +
+          " waypoint_goal=(" + format_decimal(waypoint_goal_x, 3) + "," +
+          format_decimal(waypoint_goal_y, 3) + "," +
+          format_decimal(waypoint_goal_yaw_rad, 3) + ")");
+
+  uint32_t command_id = 0;
+  if (!StartNavigateWithRecovery(action_name, waypoint_id, &command_id, straight, true,
+                                 waypoint_goal_x, waypoint_goal_y,
+                                 waypoint_goal_yaw_rad)) {
+    return false;
+  }
+
+  SetGraphNavNavTarget(straight ? "pose_straight" : "pose",
+                       waypoint_id, waypoint_name, map_id, map_uuid,
+                       true, seed_x, seed_y, seed_yaw_rad,
+                       true, waypoint_goal_x, waypoint_goal_y, waypoint_goal_yaw_rad);
+  last_graph_nav_command_id_ = command_id;
+  graphnav_navigation_active_ = true;
+  nav_auto_recovered_ = false;
+  const bool ok = WaitForGraphNavCommandResult(
+      command_id, static_cast<long long>(std::max(30, cfg_.graphnav_command_timeout_sec)) * 1000LL + 30000LL);
+  graphnav_navigation_active_ = false;
+  last_graph_nav_command_id_ = 0;
+  if (ok) {
+    EmitLog("[graphnav] " + action_name + " success via_waypoint=" + waypoint_name);
+  }
   return ok;
 }
 
@@ -3892,11 +4219,15 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
   if (return_and_dock) {
     std::string dock_waypoint_id;
     std::string map_id;
+    std::string map_uuid;
     {
       std::lock_guard<std::mutex> lk(map_mu_);
       if (!ResolveSavedDockHomeLocked(&map_id, &dock_waypoint_id)) {
         EmitLog("[return_and_dock] failed: no saved docking waypoint for active map");
         return false;
+      }
+      if (graphnav_map_artifacts_ && graphnav_map_artifacts_->map_id == map_id) {
+        map_uuid = graphnav_map_artifacts_->map_uuid;
       }
     }
     EmitLog("[return_and_dock] navigating to dock waypoint map_id=" + map_id +
@@ -3905,11 +4236,7 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
     if (!StartNavigateWithRecovery("spot.return_and_dock", dock_waypoint_id, &nav_command_id)) return false;
     last_graph_nav_command_id_ = nav_command_id;
     graphnav_navigation_active_ = true;
-    {
-      std::lock_guard<std::mutex> lk(map_mu_);
-      nav_target_waypoint_id_ = dock_waypoint_id;
-      nav_target_waypoint_name_ = "dock_home";
-    }
+    SetGraphNavNavTarget("return_and_dock", dock_waypoint_id, "dock_home", map_id, map_uuid);
     const bool nav_ok = WaitForGraphNavCommandResult(
         nav_command_id, static_cast<long long>(std::max(30, cfg_.graphnav_command_timeout_sec)) * 1000LL + 30000LL);
     graphnav_navigation_active_ = false;
@@ -3995,6 +4322,10 @@ bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
   if (command.rfind("spot.map.", 0) == 0) return HandleMapCommand(request);
   if (command == "spot.waypoint.goto") return ExecuteWaypointGotoCommand(request);
   if (command == "spot.waypoint.goto_straight") return ExecuteWaypointGotoStraightCommand(request);
+  if (command == "spot.graphnav.goto_pose") return ExecuteGraphNavGotoPoseCommand(request, false);
+  if (command == "spot.graphnav.goto_pose_straight") {
+    return ExecuteGraphNavGotoPoseCommand(request, true);
+  }
   if (command.rfind("spot.waypoint.", 0) == 0) return HandleWaypointCommand(request);
   return false;
 }
@@ -4403,7 +4734,9 @@ void Adapter::DockLoop() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         continue;
       }
-      QueueStatusText("spot.nav.feedback", nav_feedback_to_json(command_id, fb));
+      if (IsStreamEnabled(kNavFeedbackStream)) {
+        QueueStatusText(kNavFeedbackStream, nav_feedback_to_json(command_id, fb));
+      }
       if (nav_status_in_progress(fb.status)) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         continue;
@@ -4417,13 +4750,9 @@ void Adapter::DockLoop() {
         if (!spot_.RecoverSelfRight()) return false;
         (void)spot_.Stand();
         uint32_t retry_id = 0;
-        std::string waypoint_id;
-        {
-          std::lock_guard<std::mutex> lk(map_mu_);
-          waypoint_id = nav_target_waypoint_id_;
+        if (!RetryActiveGraphNavCommandWithRecovery("return_and_dock.teleop.retry", &retry_id)) {
+          return false;
         }
-        if (waypoint_id.empty()) return false;
-        if (!navigate_with_recovery(waypoint_id, &retry_id)) return false;
         command_id = retry_id;
         last_graph_nav_command_id_ = command_id;
         continue;
@@ -4485,9 +4814,14 @@ void Adapter::DockLoop() {
         desired_body_pitch_ = 0.0;
       }
       {
-        std::lock_guard<std::mutex> lk(map_mu_);
-        nav_target_waypoint_id_ = dock_waypoint_id;
-        nav_target_waypoint_name_ = "dock_home";
+        std::string map_uuid;
+        {
+          std::lock_guard<std::mutex> lk(map_mu_);
+          if (graphnav_map_artifacts_ && graphnav_map_artifacts_->map_id == map_id) {
+            map_uuid = graphnav_map_artifacts_->map_uuid;
+          }
+        }
+        SetGraphNavNavTarget("return_and_dock", dock_waypoint_id, "dock_home", map_id, map_uuid);
       }
       if (!wait_for_navigation(nav_command_id)) {
         graphnav_navigation_active_ = false;
@@ -5233,6 +5567,7 @@ std::string Adapter::EnsureActiveMapIdLocked() {
 }
 
 void Adapter::PublishWaypointsText(bool force) {
+  if (cfg_.waypoint_text_stream.empty()) return;
   const long long kWaypointPeriodicMs = 5000;
   const long long now = now_ms();
   const bool force_flag = force_waypoint_publish_.exchange(false);
@@ -5248,6 +5583,7 @@ void Adapter::PublishWaypointsText(bool force) {
 }
 
 void Adapter::PublishMapsText(bool force) {
+  if (cfg_.maps_text_stream.empty()) return;
   const long long kMapsPeriodicMs = 5000;
   const long long now = now_ms();
   const bool force_flag = force_maps_publish_.exchange(false);
@@ -5326,6 +5662,7 @@ void Adapter::MaybePublishGraphNavMap(long long now) {
 }
 
 void Adapter::PublishCurrentMapText(bool force) {
+  if (!IsStreamEnabled(kCurrentMapStream)) return;
   const long long kPeriodicMs = 10000;
   const long long now = now_ms();
   std::string text;
@@ -5337,11 +5674,12 @@ void Adapter::PublishCurrentMapText(bool force) {
     if (changed) last_current_map_text_payload_ = text;
   }
   if (!force && !changed && (now - last_current_map_pub_ms_.load()) < kPeriodicMs) return;
-  QueueStatusText("spot.map.current", text);
+  QueueStatusText(kCurrentMapStream, text);
   last_current_map_pub_ms_ = now;
 }
 
 void Adapter::PublishDefaultMapText(bool force) {
+  if (!IsStreamEnabled(kDefaultMapStream)) return;
   const long long kPeriodicMs = 10000;
   const long long now = now_ms();
   std::string text;
@@ -5353,11 +5691,12 @@ void Adapter::PublishDefaultMapText(bool force) {
     if (changed) last_default_map_text_payload_ = text;
   }
   if (!force && !changed && (now - last_default_map_pub_ms_.load()) < kPeriodicMs) return;
-  QueueStatusText("spot.map.default", text);
+  QueueStatusText(kDefaultMapStream, text);
   last_default_map_pub_ms_ = now;
 }
 
 void Adapter::PollCurrentWaypointAtStatus(long long now) {
+  if (!IsStreamEnabled(kCurrentWaypointStream)) return;
   if ((now - last_waypoint_at_poll_ms_.load()) < 1000) return;
   last_waypoint_at_poll_ms_ = now;
 
@@ -5381,14 +5720,203 @@ void Adapter::PollCurrentWaypointAtStatus(long long now) {
 }
 
 void Adapter::PublishCurrentWaypointText(long long now) {
+  if (!IsStreamEnabled(kCurrentWaypointStream)) return;
   if ((now - last_waypoint_at_pub_ms_.load()) < 10000) return;
   std::string text;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
     text = current_waypoint_at_text_;
   }
-  QueueStatusText("spot.waypoint.current", text);
+  QueueStatusText(kCurrentWaypointStream, text);
   last_waypoint_at_pub_ms_ = now;
+}
+
+bool Adapter::LookupWaypointSeedPoseLocked(const std::string& waypoint_id,
+                                           SpotClient::Pose3D* out_pose,
+                                           std::string* out_map_uuid) const {
+  if (waypoint_id.empty() || !out_pose || !graphnav_map_artifacts_) return false;
+  const auto* waypoint = find_graphnav_waypoint(graphnav_map_artifacts_->snapshot, waypoint_id);
+  if (!waypoint) return false;
+  *out_pose = waypoint->seed_tform_waypoint;
+  if (out_map_uuid) *out_map_uuid = graphnav_map_artifacts_->map_uuid;
+  return true;
+}
+
+void Adapter::ClearGraphNavNavTargetLocked() {
+  nav_target_mode_.clear();
+  nav_target_waypoint_id_.clear();
+  nav_target_waypoint_name_.clear();
+  nav_target_map_id_.clear();
+  nav_target_map_uuid_.clear();
+  nav_target_has_seed_goal_ = false;
+  nav_target_seed_x_ = 0.0;
+  nav_target_seed_y_ = 0.0;
+  nav_target_seed_yaw_rad_ = 0.0;
+  nav_target_has_waypoint_goal_ = false;
+  nav_target_waypoint_goal_x_ = 0.0;
+  nav_target_waypoint_goal_y_ = 0.0;
+  nav_target_waypoint_goal_yaw_rad_ = 0.0;
+}
+
+void Adapter::SetGraphNavNavTarget(const std::string& mode,
+                                   const std::string& waypoint_id,
+                                   const std::string& waypoint_name,
+                                   const std::string& map_id,
+                                   const std::string& map_uuid,
+                                   bool has_seed_goal,
+                                   double seed_x,
+                                   double seed_y,
+                                   double seed_yaw_rad,
+                                   bool has_waypoint_goal,
+                                   double waypoint_goal_x,
+                                   double waypoint_goal_y,
+                                   double waypoint_goal_yaw_rad) {
+  std::lock_guard<std::mutex> lk(nav_state_mu_);
+  nav_target_mode_ = mode;
+  nav_target_waypoint_id_ = waypoint_id;
+  nav_target_waypoint_name_ = waypoint_name;
+  nav_target_map_id_ = map_id;
+  nav_target_map_uuid_ = map_uuid;
+  nav_target_has_seed_goal_ = has_seed_goal;
+  nav_target_seed_x_ = seed_x;
+  nav_target_seed_y_ = seed_y;
+  nav_target_seed_yaw_rad_ = seed_yaw_rad;
+  nav_target_has_waypoint_goal_ = has_waypoint_goal;
+  nav_target_waypoint_goal_x_ = waypoint_goal_x;
+  nav_target_waypoint_goal_y_ = waypoint_goal_y;
+  nav_target_waypoint_goal_yaw_rad_ = waypoint_goal_yaw_rad;
+  last_nav_feedback_signature_.clear();
+  last_nav_status_ = 0;
+  last_nav_remaining_route_m_ = 0.0;
+  last_nav_progress_change_ms_ = 0;
+}
+
+bool Adapter::ValidateGraphNavCommandMapUuid(const std::string& command_name,
+                                             const std::string& requested_map_uuid,
+                                             bool require_map_uuid,
+                                             std::string* out_map_id,
+                                             std::string* out_map_uuid) {
+  const std::string requested = Trim(requested_map_uuid);
+  std::string active_map_id;
+  std::string active_map_uuid;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    active_map_id = active_map_id_.empty() ? default_map_id_ : active_map_id_;
+    if (graphnav_map_artifacts_ &&
+        (active_map_id.empty() || graphnav_map_artifacts_->map_id == active_map_id)) {
+      active_map_uuid = graphnav_map_artifacts_->map_uuid;
+      if (active_map_id.empty()) active_map_id = graphnav_map_artifacts_->map_id;
+    }
+  }
+
+  if (active_map_id.empty()) {
+    EmitLog("[graphnav] " + command_name + " rejected: no active GraphNav map");
+    return false;
+  }
+  if (require_map_uuid && requested.empty()) {
+    EmitLog("[graphnav] " + command_name + " rejected: missing map_uuid");
+    return false;
+  }
+  if (!requested.empty()) {
+    if (active_map_uuid.empty()) {
+      EmitLog("[graphnav] " + command_name +
+              " rejected: active map has no published map_uuid");
+      return false;
+    }
+    if (requested != active_map_uuid) {
+      EmitLog("[graphnav] " + command_name + " rejected: stale map_uuid requested=" +
+              requested + " active=" + active_map_uuid);
+      return false;
+    }
+  }
+  if (out_map_id) *out_map_id = active_map_id;
+  if (out_map_uuid) *out_map_uuid = active_map_uuid;
+  return true;
+}
+
+std::string Adapter::BuildGraphNavNavStateJson() const {
+  uint32_t command_id = last_graph_nav_command_id_.load();
+  const bool active = graphnav_navigation_active_.load();
+  const bool connected = SpotConnected();
+  const bool auto_recovered = nav_auto_recovered_.load();
+
+  std::string mode;
+  std::string waypoint_id;
+  std::string waypoint_name;
+  std::string map_id;
+  std::string map_uuid;
+  bool has_seed_goal = false;
+  double seed_x = 0.0;
+  double seed_y = 0.0;
+  double seed_yaw_rad = 0.0;
+  bool has_waypoint_goal = false;
+  double waypoint_goal_x = 0.0;
+  double waypoint_goal_y = 0.0;
+  double waypoint_goal_yaw_rad = 0.0;
+  int status = 0;
+  double remaining_route_m = 0.0;
+
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    mode = nav_target_mode_;
+    waypoint_id = nav_target_waypoint_id_;
+    waypoint_name = nav_target_waypoint_name_;
+    map_id = nav_target_map_id_;
+    map_uuid = nav_target_map_uuid_;
+    has_seed_goal = nav_target_has_seed_goal_;
+    seed_x = nav_target_seed_x_;
+    seed_y = nav_target_seed_y_;
+    seed_yaw_rad = nav_target_seed_yaw_rad_;
+    has_waypoint_goal = nav_target_has_waypoint_goal_;
+    waypoint_goal_x = nav_target_waypoint_goal_x_;
+    waypoint_goal_y = nav_target_waypoint_goal_y_;
+    waypoint_goal_yaw_rad = nav_target_waypoint_goal_yaw_rad_;
+    status = last_nav_status_;
+    remaining_route_m = last_nav_remaining_route_m_;
+  }
+
+  std::ostringstream oss;
+  oss << "{\"connected\":" << (connected ? "true" : "false")
+      << ",\"active\":" << (active ? "true" : "false")
+      << ",\"command_id\":" << command_id
+      << ",\"status\":" << status
+      << ",\"status_name\":\"" << nav_status_name(status) << "\""
+      << ",\"remaining_route_length_m\":" << remaining_route_m
+      << ",\"auto_recovered\":" << (auto_recovered ? "true" : "false")
+      << ",\"mode\":\"" << json_escape(mode) << "\""
+      << ",\"target_waypoint_id\":\"" << json_escape(waypoint_id) << "\""
+      << ",\"target_name\":\"" << json_escape(waypoint_name) << "\""
+      << ",\"map_id\":\"" << json_escape(map_id) << "\""
+      << ",\"map_uuid\":\"" << json_escape(map_uuid) << "\""
+      << ",\"has_seed_goal\":" << (has_seed_goal ? "true" : "false")
+      << ",\"has_waypoint_goal\":" << (has_waypoint_goal ? "true" : "false");
+  if (has_seed_goal) {
+    oss << ",\"target_seed_x\":" << seed_x
+        << ",\"target_seed_y\":" << seed_y
+        << ",\"target_seed_yaw_rad\":" << seed_yaw_rad;
+  }
+  if (has_waypoint_goal) {
+    oss << ",\"target_waypoint_goal_x\":" << waypoint_goal_x
+        << ",\"target_waypoint_goal_y\":" << waypoint_goal_y
+        << ",\"target_waypoint_goal_yaw_rad\":" << waypoint_goal_yaw_rad;
+  }
+  oss << "}";
+  return oss.str();
+}
+
+void Adapter::PublishGraphNavNavState(long long now) {
+  if (cfg_.graphnav_nav_state_stream.empty()) return;
+  const long long kPeriodicMs = 1000;
+  const std::string payload = BuildGraphNavNavStateJson();
+  bool changed = false;
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    changed = (payload != last_nav_state_payload_);
+    if (changed) last_nav_state_payload_ = payload;
+  }
+  if (!changed && (now - last_nav_state_pub_ms_.load()) < kPeriodicMs) return;
+  QueueStatusText(cfg_.graphnav_nav_state_stream, payload);
+  last_nav_state_pub_ms_ = now;
 }
 
 bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
@@ -5432,8 +5960,6 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       active_map_id_ = map_id;
       if (default_map_id_.empty()) default_map_id_ = map_id;
       pending_restore_map_id_.clear();
-      nav_target_waypoint_id_.clear();
-      nav_target_waypoint_name_.clear();
       loaded_waypoint_id_to_label_.clear();
       loaded_waypoint_label_to_ids_.clear();
       loaded_waypoint_lower_label_to_ids_.clear();
@@ -5445,6 +5971,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
     nav_auto_recovered_ = false;
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
+      ClearGraphNavNavTargetLocked();
       last_nav_feedback_signature_.clear();
       last_nav_status_ = 0;
       last_nav_remaining_route_m_ = 0.0;
@@ -5482,14 +6009,13 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       std::lock_guard<std::mutex> lk(map_mu_);
       active_map_id_ = map_id;
       pending_restore_map_id_.clear();
-      nav_target_waypoint_id_.clear();
-      nav_target_waypoint_name_.clear();
     }
     last_graph_nav_command_id_ = 0;
     graphnav_navigation_active_ = false;
     nav_auto_recovered_ = false;
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
+      ClearGraphNavNavTargetLocked();
       last_nav_feedback_signature_.clear();
       last_nav_status_ = 0;
       last_nav_remaining_route_m_ = 0.0;
@@ -5563,6 +6089,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       nav_auto_recovered_ = false;
       {
         std::lock_guard<std::mutex> lk(nav_state_mu_);
+        ClearGraphNavNavTargetLocked();
         last_nav_feedback_signature_.clear();
         last_nav_status_ = 0;
         last_nav_remaining_route_m_ = 0.0;
@@ -5581,12 +6108,14 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       if (active_map_id_ == map_id) {
         active_map_id_.clear();
         pending_restore_map_id_.clear();
-        nav_target_waypoint_id_.clear();
-        nav_target_waypoint_name_.clear();
         loaded_waypoint_id_to_label_.clear();
         loaded_waypoint_label_to_ids_.clear();
         loaded_waypoint_lower_label_to_ids_.clear();
       }
+    }
+    if (clear_loaded_graph) {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      ClearGraphNavNavTargetLocked();
     }
     if (!DeleteMapFromDisk(map_id)) {
       EmitLog(std::string("[graphnav] map.delete failed removing map files map_id=") + map_id);

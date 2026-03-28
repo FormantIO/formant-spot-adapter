@@ -1,8 +1,13 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 
 namespace fsa {
+
+struct StreamControl {
+  bool enabled{true};
+};
 
 struct Config {
   std::string spot_host;
@@ -43,13 +48,15 @@ struct Config {
   int front_image_poll_hz{15};
   int front_image_roll_degrees{90};
   bool right_camera_rotate_180{true};
-  std::string localization_image_stream_name{"spot.localization.image"};
+  std::string localization_image_stream_name{"spot.localization.graphnav.image"};
   int localization_image_fps{15};
   int localization_image_poll_hz{2};
   std::string graphnav_global_localization_stream{"spot.localization.graphnav.global"};
+  int graphnav_global_localization_hz{2};
   std::string graphnav_map_stream{"spot.map.graphnav"};
   std::string graphnav_metadata_stream{"spot.graphnav.metadata"};
-  std::string graphnav_map_image_stream_name{"spot.map.graphnav.image"};
+  std::string graphnav_nav_state_stream{"spot.nav.state"};
+  std::string graphnav_map_image_stream_name{"spot.localization.graphnav.global.image"};
   int graphnav_map_image_fps{15};
   int graphnav_map_image_poll_hz{2};
   double twist_deadband{0.08};
@@ -84,6 +91,13 @@ struct Config {
   std::string waypoint_text_stream{"spot.waypoints"};
   std::string maps_text_stream{"spot.maps"};
   int graphnav_command_timeout_sec{60};
+  std::unordered_map<std::string, StreamControl> stream_controls;
+
+  bool IsStreamEnabled(const std::string& stream) const {
+    if (stream.empty()) return false;
+    const auto it = stream_controls.find(stream);
+    return it == stream_controls.end() ? true : it->second.enabled;
+  }
 };
 
 Config load_config_from_env();

@@ -2,6 +2,11 @@
 
 Configure these streams in your Formant teleop view/device config.
 
+Runtime stream enablement is controlled in `config/formant-spot-adapter.json` with
+`streamControls`. Setting `"enabled": false` disables publication for that stream, and image/map
+streams also stop their source polling/render loops so they no longer consume runtime resources.
+If you rename a stream from its default, use the renamed stream name in `streamControls`.
+
 ## Control Streams (Formant -> Adapter)
 
 - `Joystick` (type: `geometry_msgs/Twist` equivalent RTC twist stream)
@@ -107,7 +112,7 @@ Configure these streams in your Formant teleop view/device config.
   Spot live terrain maps.
 - Current implementation is a local patch around the robot, not a stitched global map.
 
-- `spot.localization.image` (type: image/jpeg, default 15 FPS output / 2 Hz Spot refresh)
+- `spot.localization.graphnav.image` (type: image/jpeg, default 15 FPS output / 2 Hz Spot refresh)
 - Rendered 16:9 visualization of the GraphNav local occupancy patch for straightforward image/video
   viewing in Formant.
 - Includes occupancy overlay, robot footprint, heading arrow, scale bar, current waypoint/map
@@ -115,7 +120,27 @@ Configure these streams in your Formant teleop view/device config.
 - The adapter renders only when the Spot localization patch updates, then republishes the cached
   JPEG at the configured output FPS.
 - To behave like a camera/video stream instead of a throttled telemetry image, configure
-  `spot.localization.image` in Formant with video encoding enabled or add it as a realtime stream.
+  `spot.localization.graphnav.image` in Formant with video encoding enabled or add it as a realtime stream.
+
+- `spot.localization.graphnav.global` (type: localization, default 2 Hz)
+- Typed Formant localization stream for the stitched saved GraphNav site map plus live seed-frame
+  robot pose.
+
+- `spot.localization.graphnav.global.image` (type: image/jpeg, default 15 FPS output / 2 Hz refresh)
+- Rendered global GraphNav map image with stitched occupancy, waypoint/edge overlays, and live robot
+  pose when available.
+
+- `spot.map.graphnav` (type: localization payload carrying map-only data, on change)
+- Dedicated stitched GraphNav map payload published without a live pose so the transport can be
+  upgraded to a true top-level map datapoint later without changing upstream map assembly logic.
+
+- `spot.graphnav.metadata` (type: text/json, every 5s + on change)
+- Waypoint, edge, and related GraphNav metadata intended for UI overlays and id-based navigation.
+
+- `spot.nav.state` (type: text/json, 1 Hz + on change)
+- High-level GraphNav navigation state for external map UIs.
+- Includes `active`, `command_id`, `status`, `status_name`, `mode`, `map_id`, `map_uuid`,
+  `target_waypoint_id`, `target_name`, and target pose fields when available.
 
 - `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
 - Key: `Can dock` (boolean)
@@ -154,6 +179,7 @@ Configure these streams in your Formant teleop view/device config.
 
 - `spot.nav.feedback` (type: text/json, ~2 Hz while nav command active)
 - GraphNav feedback snapshot (`status`, `remaining_route_length_m`, route/blockage context).
+- Intended as low-level diagnostics; use `spot.nav.state` as the primary UI state stream.
 
 - `spot.adapter.log` (type: text, 1 Hz batched)
 - Buffered adapter-side operational log lines (command/recovery events).
@@ -276,13 +302,31 @@ Configure these streams in your Formant teleop view/device config.
 - Parameter text: `name=<alias>`.
 
 - `spot.waypoint.goto` (command)
-- Resolves alias (or existing GraphNav waypoint label) and sends NavigateTo command.
-- Parameter text: `name=<alias_or_label>`.
+- Resolves alias/label or accepts `waypoint_id=<id>` directly and sends NavigateTo command.
+- Parameter text: `name=<alias_or_label>` or `waypoint_id=<id>`.
+- Optional `map_uuid=<uuid>` rejects stale UI commands against the wrong loaded map.
+
+- `spot.waypoint.goto_straight` (command)
+- Same target resolution as `spot.waypoint.goto`, but with straight-line-biased travel params.
+- Parameter text: `name=<alias_or_label>` or `waypoint_id=<id>`.
+- Optional `map_uuid=<uuid>`.
+
+- `spot.graphnav.goto_pose` (command)
+- Navigates to a seed-frame pose on the active GraphNav map.
+- Parameter text: `map_uuid=<uuid>, x=<seed_x>, y=<seed_y>`.
+- Optional heading parameters: `yaw_rad=<rad>` or `yaw_deg=<deg>`.
+- Adapter resolves the nearest anchored waypoint, converts the seed-frame goal into that waypoint's
+  flattened SE2 frame, and issues GraphNav navigation with the offset goal.
+
+- `spot.graphnav.goto_pose_straight` (command)
+- Same seed-frame goal contract as `spot.graphnav.goto_pose`, but with straight-line-biased travel params.
 
 Command response behavior:
 - Formant command responses are terminal; success/failure is returned when the action reaches completion.
-- Long-running commands (`spot.camera.calibrate`, `spot.waypoint.goto`, `spot.dock`,
-  `spot.return_and_dock`) keep the response pending until terminal success/failure.
+- Long-running commands (`spot.camera.calibrate`, `spot.waypoint.goto`,
+  `spot.waypoint.goto_straight`, `spot.graphnav.goto_pose`,
+  `spot.graphnav.goto_pose_straight`, `spot.dock`, `spot.return_and_dock`) keep the response
+  pending until terminal success/failure.
 
 ## Recommended Teleop UI Layout
 

@@ -1638,6 +1638,16 @@ bool SpotClient::GetLocalizationMapSnapshot(LocalizationMapSnapshot* out_snapsho
 
 bool SpotClient::NavigateToWaypoint(const std::string& waypoint_id, int command_timeout_sec,
                                     uint32_t* out_command_id) {
+  return NavigateToWaypointPose(waypoint_id, 0.0, 0.0, 0.0, command_timeout_sec,
+                                out_command_id);
+}
+
+bool SpotClient::NavigateToWaypointPose(const std::string& waypoint_id,
+                                        double waypoint_tform_body_goal_x,
+                                        double waypoint_tform_body_goal_y,
+                                        double waypoint_tform_body_goal_yaw_rad,
+                                        int command_timeout_sec,
+                                        uint32_t* out_command_id) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (waypoint_id.empty()) return false;
   if (!EnsureGraphNavClient()) return false;
@@ -1655,6 +1665,14 @@ bool SpotClient::NavigateToWaypoint(const std::string& waypoint_id, int command_
     return false;
   }
   req.set_clock_identifier(*clock_id.response);
+  if (std::abs(waypoint_tform_body_goal_x) > 1e-9 ||
+      std::abs(waypoint_tform_body_goal_y) > 1e-9 ||
+      std::abs(waypoint_tform_body_goal_yaw_rad) > 1e-9) {
+    auto* goal = req.mutable_destination_waypoint_tform_body_goal();
+    goal->mutable_position()->set_x(waypoint_tform_body_goal_x);
+    goal->mutable_position()->set_y(waypoint_tform_body_goal_y);
+    goal->set_angle(waypoint_tform_body_goal_yaw_rad);
+  }
 
   auto r = graph_nav_client_->NavigateTo(req);
   if (!r.status) {
@@ -1671,6 +1689,16 @@ bool SpotClient::NavigateToWaypoint(const std::string& waypoint_id, int command_
 
 bool SpotClient::NavigateToWaypointStraight(const std::string& waypoint_id, int command_timeout_sec,
                                             uint32_t* out_command_id) {
+  return NavigateToWaypointPoseStraight(waypoint_id, 0.0, 0.0, 0.0, command_timeout_sec,
+                                        out_command_id);
+}
+
+bool SpotClient::NavigateToWaypointPoseStraight(const std::string& waypoint_id,
+                                                double waypoint_tform_body_goal_x,
+                                                double waypoint_tform_body_goal_y,
+                                                double waypoint_tform_body_goal_yaw_rad,
+                                                int command_timeout_sec,
+                                                uint32_t* out_command_id) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (waypoint_id.empty()) return false;
   if (!EnsureGraphNavClient()) return false;
@@ -1688,6 +1716,14 @@ bool SpotClient::NavigateToWaypointStraight(const std::string& waypoint_id, int 
     return false;
   }
   req.set_clock_identifier(*clock_id.response);
+  if (std::abs(waypoint_tform_body_goal_x) > 1e-9 ||
+      std::abs(waypoint_tform_body_goal_y) > 1e-9 ||
+      std::abs(waypoint_tform_body_goal_yaw_rad) > 1e-9) {
+    auto* goal = req.mutable_destination_waypoint_tform_body_goal();
+    goal->mutable_position()->set_x(waypoint_tform_body_goal_x);
+    goal->mutable_position()->set_y(waypoint_tform_body_goal_y);
+    goal->set_angle(waypoint_tform_body_goal_yaw_rad);
+  }
 
   auto* travel = req.mutable_travel_params();
   travel->set_ignore_final_yaw(true);

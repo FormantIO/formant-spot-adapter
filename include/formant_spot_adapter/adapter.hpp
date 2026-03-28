@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -50,13 +51,20 @@ class Adapter {
   bool ExecuteCameraCalibrateCommand();
   bool ExecuteWaypointGotoCommand(const v1::model::CommandRequest& request);
   bool ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest& request);
+  bool ExecuteGraphNavGotoPoseCommand(const v1::model::CommandRequest& request, bool straight);
   bool ExecuteDockSequence(bool return_and_dock);
   bool WaitForGraphNavCommandResult(uint32_t command_id, long long timeout_ms);
   bool EnsureLocalizedForNavigation(const std::string& action_name);
   bool StartNavigateWithRecovery(const std::string& action_name,
                                  const std::string& waypoint_id,
                                  uint32_t* out_command_id,
-                                 bool straight = false);
+                                 bool straight = false,
+                                 bool has_waypoint_goal = false,
+                                 double waypoint_goal_x = 0.0,
+                                 double waypoint_goal_y = 0.0,
+                                 double waypoint_goal_yaw_rad = 0.0);
+  bool RetryActiveGraphNavCommandWithRecovery(const std::string& action_name,
+                                              uint32_t* out_command_id);
   void HandleTwist(const v1::model::Twist& twist);
   void DockLoop();
   void ApplyDesiredArmMode(bool force = false);
@@ -98,6 +106,7 @@ class Adapter {
   void PublishDefaultMapText(bool force);
   void PollCurrentWaypointAtStatus(long long now_ms);
   void PublishCurrentWaypointText(long long now_ms);
+  void PublishGraphNavNavState(long long now_ms);
   void MaybeRestoreActiveMap(long long now);
   void PollGraphNavNavigation(long long now);
   bool IsGraphNavNavigationActive() const;
@@ -111,16 +120,42 @@ class Adapter {
   void ResetFaultEventsState();
   bool ResolveWaypointNameLocked(const std::string& name, std::string* out_waypoint_id) const;
   bool ResolveSavedDockHomeLocked(std::string* out_map_id, std::string* out_waypoint_id) const;
+  bool LookupWaypointSeedPoseLocked(const std::string& waypoint_id,
+                                    SpotClient::Pose3D* out_pose,
+                                    std::string* out_map_uuid = nullptr) const;
   void PruneAliasesForLoadedGraphLocked();
   void CaptureDockWaypointCandidate();
   void CommitDockWaypointCandidateOnSuccess();
   void ClearDockWaypointCandidateLocked();
+  void ClearGraphNavNavTargetLocked();
+  void SetGraphNavNavTarget(const std::string& mode,
+                            const std::string& waypoint_id,
+                            const std::string& waypoint_name,
+                            const std::string& map_id,
+                            const std::string& map_uuid,
+                            bool has_seed_goal = false,
+                            double seed_x = 0.0,
+                            double seed_y = 0.0,
+                            double seed_yaw_rad = 0.0,
+                            bool has_waypoint_goal = false,
+                            double waypoint_goal_x = 0.0,
+                            double waypoint_goal_y = 0.0,
+                            double waypoint_goal_yaw_rad = 0.0);
+  bool ValidateGraphNavCommandMapUuid(const std::string& command_name,
+                                      const std::string& requested_map_uuid,
+                                      bool require_map_uuid,
+                                      std::string* out_map_id = nullptr,
+                                      std::string* out_map_uuid = nullptr);
+  bool IsStreamEnabled(const std::string& stream) const;
+  bool AnyStreamEnabled(std::initializer_list<const char*> streams) const;
+  void DisableConfiguredStreamIfDisabled(std::string* stream, const char* label);
   std::string BuildWaypointTextLocked() const;
   std::string BuildMapsText(const std::string& active_map_id,
                             const std::string& default_map_id) const;
   std::string ResolveWaypointNameForIdLocked(const std::string& waypoint_id) const;
   std::string BuildCurrentMapTextLocked() const;
   std::string BuildDefaultMapTextLocked() const;
+  std::string BuildGraphNavNavStateJson() const;
   std::string EnsureActiveMapIdLocked();
   static std::string Trim(const std::string& in);
   static std::string ToLower(const std::string& in);
@@ -239,12 +274,24 @@ class Adapter {
   std::string pending_restore_map_id_;
   std::string pending_dock_candidate_map_id_;
   std::string pending_dock_candidate_waypoint_id_;
-  std::string nav_target_waypoint_id_;
-  std::string nav_target_waypoint_name_;
   std::string last_nav_feedback_signature_;
   int last_nav_status_{0};
   double last_nav_remaining_route_m_{0.0};
   long long last_nav_progress_change_ms_{0};
+  std::string last_nav_state_payload_;
+  std::string nav_target_mode_;
+  std::string nav_target_waypoint_id_;
+  std::string nav_target_waypoint_name_;
+  std::string nav_target_map_id_;
+  std::string nav_target_map_uuid_;
+  bool nav_target_has_seed_goal_{false};
+  double nav_target_seed_x_{0.0};
+  double nav_target_seed_y_{0.0};
+  double nav_target_seed_yaw_rad_{0.0};
+  bool nav_target_has_waypoint_goal_{false};
+  double nav_target_waypoint_goal_x_{0.0};
+  double nav_target_waypoint_goal_y_{0.0};
+  double nav_target_waypoint_goal_yaw_rad_{0.0};
   std::atomic<long long> last_waypoint_pub_ms_{0};
   std::atomic<long long> last_waypoint_at_poll_ms_{0};
   std::atomic<long long> last_waypoint_at_pub_ms_{0};
@@ -255,6 +302,7 @@ class Adapter {
   std::atomic<long long> next_graphnav_map_post_ms_{0};
   std::atomic<long long> next_map_restore_attempt_ms_{0};
   std::atomic<long long> last_nav_feedback_poll_ms_{0};
+  std::atomic<long long> last_nav_state_pub_ms_{0};
   std::atomic<long long> last_nav_hold_log_ms_{0};
   std::atomic<long long> last_nav_diag_log_ms_{0};
   std::atomic<bool> force_waypoint_publish_{true};

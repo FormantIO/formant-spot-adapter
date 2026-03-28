@@ -117,9 +117,15 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_graphnav_global_localization_stream()) {
     c->graphnav_global_localization_stream = j.graphnav_global_localization_stream().value();
   }
+  if (j.has_graphnav_global_localization_hz()) {
+    c->graphnav_global_localization_hz = j.graphnav_global_localization_hz().value();
+  }
   if (j.has_graphnav_map_stream()) c->graphnav_map_stream = j.graphnav_map_stream().value();
   if (j.has_graphnav_metadata_stream()) {
     c->graphnav_metadata_stream = j.graphnav_metadata_stream().value();
+  }
+  if (j.has_graphnav_nav_state_stream()) {
+    c->graphnav_nav_state_stream = j.graphnav_nav_state_stream().value();
   }
   if (j.has_graphnav_map_image_stream_name()) {
     c->graphnav_map_image_stream_name = j.graphnav_map_image_stream_name().value();
@@ -155,6 +161,10 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_maps_text_stream()) c->maps_text_stream = j.maps_text_stream().value();
   if (j.has_graphnav_command_timeout_sec()) {
     c->graphnav_command_timeout_sec = j.graphnav_command_timeout_sec().value();
+  }
+  for (const auto& stream_control : j.stream_controls()) {
+    if (stream_control.stream().empty()) continue;
+    c->stream_controls[stream_control.stream()] = StreamControl{stream_control.enabled()};
   }
 }
 
@@ -213,9 +223,13 @@ Config load_config_from_env() {
       getenv_int_or("LOCALIZATION_IMAGE_POLL_HZ", c.localization_image_poll_hz);
   c.graphnav_global_localization_stream =
       getenv_or("GRAPHNAV_GLOBAL_LOCALIZATION_STREAM", c.graphnav_global_localization_stream);
+  c.graphnav_global_localization_hz =
+      getenv_int_or("GRAPHNAV_GLOBAL_LOCALIZATION_HZ", c.graphnav_global_localization_hz);
   c.graphnav_map_stream = getenv_or("GRAPHNAV_MAP_STREAM", c.graphnav_map_stream);
   c.graphnav_metadata_stream =
       getenv_or("GRAPHNAV_METADATA_STREAM", c.graphnav_metadata_stream);
+  c.graphnav_nav_state_stream =
+      getenv_or("GRAPHNAV_NAV_STATE_STREAM", c.graphnav_nav_state_stream);
   c.graphnav_map_image_stream_name =
       getenv_or("GRAPHNAV_MAP_IMAGE_STREAM_NAME", c.graphnav_map_image_stream_name);
   c.graphnav_map_image_fps =

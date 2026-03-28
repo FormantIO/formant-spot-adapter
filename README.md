@@ -52,7 +52,12 @@ Additional control channels (not streams):
 | `spot.connection` | Text (JSON) | Spot connection health (`state`, `connected`, `degraded_non_estop`, `degraded_reason`, reconnect/attempt timestamps, last error) |
 | `spot.localization` | Text (JSON) | GraphNav localization status (`localized`, `waypoint_id`, `error`) |
 | `spot.localization.graphnav` | Localization | Formant typed localization stream with a live occupancy-grid patch in the GraphNav seed frame; intended for the Formant localization viewer |
-| `spot.localization.image` | Image (JPEG) | Rendered GraphNav occupancy/localization overlay image, published at stable output FPS from cached frames for easy inspection or video-style viewing |
+| `spot.localization.graphnav.image` | Image (JPEG) | Rendered local GraphNav occupancy/localization overlay image, published at stable output FPS from cached frames |
+| `spot.localization.graphnav.global` | Localization | Formant typed global GraphNav localization stream combining live seed-frame robot pose with the stitched saved-site map; default 2 Hz |
+| `spot.localization.graphnav.global.image` | Image (JPEG) | Rendered global GraphNav map image with waypoint overlays and live robot pose when available |
+| `spot.map.graphnav` | Localization payload carrying map-only data | Dedicated stitched GraphNav map payload for future top-level map transport |
+| `spot.graphnav.metadata` | Text (JSON) | Waypoint, edge, and related GraphNav metadata for UI overlays and id-based navigation |
+| `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus latest command status for external map UIs |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |
 | `spot.waypoints` | Text | Newline-separated waypoint names for the active map |
@@ -67,8 +72,14 @@ Additional control channels (not streams):
 | `spot.faults.behavior` | Text (JSON) | Active behavior faults summary |
 | `spot.faults.service` | Text (JSON) | Active service faults summary |
 | `spot.fault.events` | Text | Simplified fault event feed (`FAULT OPEN/CHANGED/CLEARED` only) |
-| `spot.nav.feedback` | Text (JSON) | GraphNav command status/route-following diagnostics |
+| `spot.nav.feedback` | Text (JSON) | Low-level GraphNav command status/route-following diagnostics |
 | `spot.adapter.log` | Text | Buffered adapter event log batches (1 Hz) |
+
+Per-stream enable/disable is configured in `config/formant-spot-adapter.json` via the
+`streamControls` array. When a stream is disabled there, the adapter suppresses publication, and
+for high-cost streams such as cameras/localization/map imagery it also avoids starting the
+associated worker loops entirely. If you rename a stream from its default, use the renamed stream
+value in `streamControls`.
 
 ## Runtime Behavior
 
@@ -81,10 +92,12 @@ Additional control channels (not streams):
   stitched full-site map. See
   [`docs/formant-localization-map-analysis.md`](docs/formant-localization-map-analysis.md)
   for the implementation notes and next steps.
-- `spot.localization.image` is a rendered 16:9 visualization of the same local patch with a robot
+- `spot.localization.graphnav.global`, `spot.map.graphnav`, `spot.graphnav.metadata`, and
+  `spot.nav.state` together form the backend contract for an external GraphNav map UI.
+- `spot.localization.graphnav.image` is a rendered 16:9 visualization of the same local patch with a robot
   footprint, heading arrow, scale bar, and status HUD. The adapter renders only when the Spot data
   changes, then republishes the cached JPEG at a stable output FPS. For camera-like playback in
-  Formant, the `spot.localization.image` stream also needs Formant-side video encoding/realtime
+  Formant, the `spot.localization.graphnav.image` stream also needs Formant-side video encoding/realtime
   stream configuration; otherwise the agent treats it as a throttled telemetry image stream.
 - `spot.left.image`, `spot.right.image`, and `spot.back.image` use the same cached-frame publish
   pattern: the adapter polls Spot at a lower configured rate, then republishes the latest JPEG at a
@@ -131,7 +144,11 @@ Additional non-GraphNav command-channel actions:
   - Parameter examples: `name=dock_entry`
 - `spot.waypoint.delete`: delete alias mapping (does not mutate GraphNav graph topology).
   - Parameter examples: `name=dock_entry`
-- `spot.waypoint.goto`: resolve alias (or GraphNav waypoint label) and navigate to it.
+- `spot.waypoint.goto`: resolve alias/label or accept `waypoint_id=<id>` directly; optional `map_uuid=<uuid>` validation is supported for UI-issued commands.
+- `spot.waypoint.goto_straight`: same as above, but uses straight-line-biased travel params.
+- `spot.graphnav.goto_pose`: accept `map_uuid=<uuid>, x=<seed_x>, y=<seed_y>` and optional
+  `yaw_rad=<rad>` / `yaw_deg=<deg>` to navigate to a seed-frame target on the active map.
+- `spot.graphnav.goto_pose_straight`: same as `spot.graphnav.goto_pose`, with straight-line-biased travel params.
   - Parameter examples: `name=dock_entry`
 
 Note: `spot.waypoint.save`/`spot.waypoint.update` can be called while not actively mapping; the

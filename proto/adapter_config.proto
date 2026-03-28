@@ -4,6 +4,11 @@ package fsa.config;
 
 import "google/protobuf/wrappers.proto";
 
+message StreamControl {
+  string stream = 1;
+  bool enabled = 2;
+}
+
 message AdapterConfig {
   reserved 28, 29;
   google.protobuf.StringValue spot_host = 1;
@@ -64,15 +69,18 @@ message AdapterConfig {
   google.protobuf.Int32Value surround_camera_poll_hz = 58;
   google.protobuf.BoolValue right_camera_rotate_180 = 59;
   google.protobuf.StringValue graphnav_global_localization_stream = 60;
-  google.protobuf.StringValue graphnav_map_stream = 61;
-  google.protobuf.StringValue graphnav_metadata_stream = 62;
-  google.protobuf.StringValue graphnav_map_image_stream_name = 63;
-  google.protobuf.Int32Value graphnav_map_image_fps = 64;
-  google.protobuf.Int32Value graphnav_map_image_poll_hz = 65;
+  google.protobuf.Int32Value graphnav_global_localization_hz = 61;
+  google.protobuf.StringValue graphnav_map_stream = 62;
+  google.protobuf.StringValue graphnav_metadata_stream = 63;
+  google.protobuf.StringValue graphnav_nav_state_stream = 64;
+  google.protobuf.StringValue graphnav_map_image_stream_name = 65;
+  google.protobuf.Int32Value graphnav_map_image_fps = 73;
+  google.protobuf.Int32Value graphnav_map_image_poll_hz = 74;
   google.protobuf.StringValue front_left_camera_source = 66;
   google.protobuf.StringValue front_right_camera_source = 67;
   google.protobuf.StringValue front_image_stream_name = 68;
   google.protobuf.Int32Value front_image_fps = 69;
   google.protobuf.Int32Value front_image_poll_hz = 70;
   google.protobuf.Int32Value front_image_roll_degrees = 71;
+  repeated StreamControl stream_controls = 72;
 }

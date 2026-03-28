@@ -247,6 +247,18 @@ class SpotClient {
                           uint32_t* out_command_id = nullptr);
   bool NavigateToWaypointStraight(const std::string& waypoint_id, int command_timeout_sec,
                                   uint32_t* out_command_id = nullptr);
+  bool NavigateToWaypointPose(const std::string& waypoint_id,
+                              double waypoint_tform_body_goal_x,
+                              double waypoint_tform_body_goal_y,
+                              double waypoint_tform_body_goal_yaw_rad,
+                              int command_timeout_sec,
+                              uint32_t* out_command_id = nullptr);
+  bool NavigateToWaypointPoseStraight(const std::string& waypoint_id,
+                                      double waypoint_tform_body_goal_x,
+                                      double waypoint_tform_body_goal_y,
+                                      double waypoint_tform_body_goal_yaw_rad,
+                                      int command_timeout_sec,
+                                      uint32_t* out_command_id = nullptr);
   bool GetNavigationFeedback(uint32_t command_id, int* out_status);
   bool GetNavigationFeedbackSnapshot(uint32_t command_id, NavigationFeedbackSnapshot* out_feedback);
   bool DiscoverSingleDockId(int* out_dock_id);
