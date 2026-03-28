@@ -82,6 +82,15 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_right_camera_stream_name()) c->right_camera_stream_name = j.right_camera_stream_name().value();
   if (j.has_back_camera_source()) c->back_camera_source = j.back_camera_source().value();
   if (j.has_back_camera_stream_name()) c->back_camera_stream_name = j.back_camera_stream_name().value();
+  if (j.has_front_left_camera_source()) {
+    c->front_left_camera_source = j.front_left_camera_source().value();
+  }
+  if (j.has_front_right_camera_source()) {
+    c->front_right_camera_source = j.front_right_camera_source().value();
+  }
+  if (j.has_front_image_stream_name()) {
+    c->front_image_stream_name = j.front_image_stream_name().value();
+  }
   if (j.has_localization_image_stream_name()) {
     c->localization_image_stream_name = j.localization_image_stream_name().value();
   }
@@ -90,6 +99,13 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_surround_camera_fps()) c->surround_camera_fps = j.surround_camera_fps().value();
   if (j.has_surround_camera_poll_hz()) {
     c->surround_camera_poll_hz = j.surround_camera_poll_hz().value();
+  }
+  if (j.has_front_image_fps()) c->front_image_fps = j.front_image_fps().value();
+  if (j.has_front_image_poll_hz()) {
+    c->front_image_poll_hz = j.front_image_poll_hz().value();
+  }
+  if (j.has_front_image_roll_degrees()) {
+    c->front_image_roll_degrees = j.front_image_roll_degrees().value();
   }
   if (j.has_right_camera_rotate_180()) {
     c->right_camera_rotate_180 = j.right_camera_rotate_180().value();
@@ -174,10 +190,20 @@ Config load_config_from_env() {
   c.right_camera_stream_name = getenv_or("RIGHT_CAMERA_STREAM_NAME", c.right_camera_stream_name);
   c.back_camera_source = getenv_or("BACK_CAMERA_SOURCE", c.back_camera_source);
   c.back_camera_stream_name = getenv_or("BACK_CAMERA_STREAM_NAME", c.back_camera_stream_name);
+  c.front_left_camera_source =
+      getenv_or("FRONT_LEFT_CAMERA_SOURCE", c.front_left_camera_source);
+  c.front_right_camera_source =
+      getenv_or("FRONT_RIGHT_CAMERA_SOURCE", c.front_right_camera_source);
+  c.front_image_stream_name =
+      getenv_or("FRONT_IMAGE_STREAM_NAME", c.front_image_stream_name);
   c.camera_fps = getenv_int_or("CAMERA_FPS", c.camera_fps);
   c.surround_camera_fps = getenv_int_or("SURROUND_CAMERA_FPS", c.surround_camera_fps);
   c.surround_camera_poll_hz =
       getenv_int_or("SURROUND_CAMERA_POLL_HZ", c.surround_camera_poll_hz);
+  c.front_image_fps = getenv_int_or("FRONT_IMAGE_FPS", c.front_image_fps);
+  c.front_image_poll_hz = getenv_int_or("FRONT_IMAGE_POLL_HZ", c.front_image_poll_hz);
+  c.front_image_roll_degrees =
+      getenv_int_or("FRONT_IMAGE_ROLL_DEGREES", c.front_image_roll_degrees);
   c.right_camera_rotate_180 =
       getenv_bool_or("RIGHT_CAMERA_ROTATE_180", c.right_camera_rotate_180);
   c.localization_image_stream_name =

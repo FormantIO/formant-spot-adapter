@@ -74,6 +74,15 @@ Configure these streams in your Formant teleop view/device config.
 - Source camera: `back_fisheye_image` (default configurable)
 - Adapter republishes the latest cached JPEG at the configured surround-camera output FPS.
 
+- `spot.front.image` (type: image/video)
+- Source cameras: `frontleft_fisheye_image` + `frontright_fisheye_image` (default configurable)
+- Adapter fetches both front fisheyes in one Spot image batch, rectifies them into a single
+  forward-looking stitched view, and republishes the cached composite at the configured front-image
+  output FPS.
+- Designed for low-latency teleop use. Default output is 15 FPS with 15 Hz Spot polling.
+- If one front camera is degraded, the adapter keeps publishing a single-camera rectified fallback
+  instead of dropping the stream immediately.
+
 - `spot.status` (type: bitset, 0.2 Hz / every 5s)
 - Published keys:
 - `Has lease`

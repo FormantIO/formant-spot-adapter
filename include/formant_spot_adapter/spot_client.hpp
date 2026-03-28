@@ -44,6 +44,51 @@ class SpotClient {
     int rows{0};
   };
 
+  struct Pose3D {
+    double x{0.0};
+    double y{0.0};
+    double z{0.0};
+    double qx{0.0};
+    double qy{0.0};
+    double qz{0.0};
+    double qw{1.0};
+  };
+
+  struct CameraIntrinsics {
+    enum class ModelType {
+      kUnknown = 0,
+      kPinhole = 1,
+      kKannalaBrandt = 2,
+    };
+
+    ModelType model_type{ModelType::kUnknown};
+    double fx{0.0};
+    double fy{0.0};
+    double cx{0.0};
+    double cy{0.0};
+    double skew_x{0.0};
+    double skew_y{0.0};
+    double k1{0.0};
+    double k2{0.0};
+    double k3{0.0};
+    double k4{0.0};
+  };
+
+  struct ImageFrame {
+    std::string source_name;
+    std::string frame_name_image_sensor;
+    int cols{0};
+    int rows{0};
+    int status{0};
+    bool has_acquisition_time{false};
+    int64_t acquisition_time_sec{0};
+    int32_t acquisition_time_nanos{0};
+    bool has_body_tform_sensor{false};
+    Pose3D body_tform_sensor;
+    CameraIntrinsics intrinsics;
+    std::string encoded_image;
+  };
+
   struct StoredMap {
     ::bosdyn::api::graph_nav::Graph graph;
     std::vector<::bosdyn::api::graph_nav::WaypointSnapshot> waypoint_snapshots;
@@ -104,16 +149,6 @@ class SpotClient {
     double seed_tform_body_qy{0.0};
     double seed_tform_body_qz{0.0};
     double seed_tform_body_qw{1.0};
-  };
-
-  struct Pose3D {
-    double x{0.0};
-    double y{0.0};
-    double z{0.0};
-    double qx{0.0};
-    double qy{0.0};
-    double qz{0.0};
-    double qw{1.0};
   };
 
   struct OccupancyGridMapSnapshot {
@@ -191,6 +226,9 @@ class SpotClient {
   bool ZeroVelocity(int repeats = 1);
 
   bool GetImageJpeg(const std::string& source, std::string* out_bytes);
+  bool GetImageFrames(const std::vector<std::string>& sources,
+                      std::vector<ImageFrame>* out_frames);
+  bool GetRobotClockSkewNanos(int64_t* out_skew_nanos);
   bool ListImageSources(std::vector<ImageSourceInfo>* out_sources);
   bool StartGraphRecording(std::string* out_created_waypoint_id = nullptr);
   bool StopGraphRecording();

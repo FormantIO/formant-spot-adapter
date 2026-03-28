@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <unordered_map>
@@ -247,6 +248,483 @@ bool prepare_jpeg_frame(const std::string& input_bytes,
   return encode_jpeg(decoded, out_bytes);
 }
 
+double dot_vec(const Vec3d& a, const Vec3d& b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+Vec3d cross_vec(const Vec3d& a, const Vec3d& b) {
+  return Vec3d{
+      a.y * b.z - a.z * b.y,
+      a.z * b.x - a.x * b.z,
+      a.x * b.y - a.y * b.x,
+  };
+}
+
+double norm_vec(const Vec3d& v) {
+  return std::sqrt(dot_vec(v, v));
+}
+
+Vec3d scale_vec(const Vec3d& v, double scale) {
+  return Vec3d{v.x * scale, v.y * scale, v.z * scale};
+}
+
+Vec3d add_vec(const Vec3d& a, const Vec3d& b) {
+  return Vec3d{a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+Vec3d normalize_vec(const Vec3d& v, const Vec3d& fallback) {
+  const double norm = norm_vec(v);
+  if (norm <= 1e-9) return fallback;
+  return scale_vec(v, 1.0 / norm);
+}
+
+cv::Matx33d rotation_matrix_from_quaternion(const Quaterniond& q) {
+  const Quaterniond qn = normalize_quaternion(q);
+  const double xx = qn.x * qn.x;
+  const double yy = qn.y * qn.y;
+  const double zz = qn.z * qn.z;
+  const double xy = qn.x * qn.y;
+  const double xz = qn.x * qn.z;
+  const double yz = qn.y * qn.z;
+  const double wx = qn.w * qn.x;
+  const double wy = qn.w * qn.y;
+  const double wz = qn.w * qn.z;
+  return cv::Matx33d(
+      1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy),
+      2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx),
+      2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy));
+}
+
+cv::Matx33d rotation_matrix_from_pose(const SpotClient::Pose3D& pose) {
+  return rotation_matrix_from_quaternion(pose_quaternion(pose));
+}
+
+Vec3d mat_mul(const cv::Matx33d& matrix, const Vec3d& v) {
+  const cv::Vec3d vec(v.x, v.y, v.z);
+  const cv::Vec3d out = matrix * vec;
+  return Vec3d{out[0], out[1], out[2]};
+}
+
+std::string image_status_to_string(int status) {
+  const auto enum_value = static_cast<::bosdyn::api::ImageResponse::Status>(status);
+  const std::string name = ::bosdyn::api::ImageResponse::Status_Name(enum_value);
+  return name.empty() ? std::string("STATUS_UNKNOWN") : name;
+}
+
+bool frame_has_stitch_calibration(const SpotClient::ImageFrame& frame) {
+  return frame.has_body_tform_sensor &&
+         frame.cols > 0 &&
+         frame.rows > 0 &&
+         frame.intrinsics.fx > 0.0 &&
+         frame.intrinsics.fy > 0.0 &&
+         frame.intrinsics.model_type != SpotClient::CameraIntrinsics::ModelType::kUnknown;
+}
+
+std::string build_front_stitch_signature(const SpotClient::ImageFrame& left,
+                                         const SpotClient::ImageFrame& right,
+                                         int roll_quarter_turns) {
+  auto append_frame = [](std::ostringstream* oss, const SpotClient::ImageFrame& frame) {
+    if (!oss) return;
+    oss->setf(std::ios::fixed);
+    oss->precision(12);
+    *oss << frame.source_name << "|" << frame.cols << "x" << frame.rows
+         << "|" << static_cast<int>(frame.intrinsics.model_type)
+         << "|" << frame.intrinsics.fx << "|" << frame.intrinsics.fy
+         << "|" << frame.intrinsics.cx << "|" << frame.intrinsics.cy
+         << "|" << frame.intrinsics.skew_x << "|" << frame.intrinsics.skew_y
+         << "|" << frame.intrinsics.k1 << "|" << frame.intrinsics.k2
+         << "|" << frame.intrinsics.k3 << "|" << frame.intrinsics.k4
+         << "|" << frame.body_tform_sensor.x << "|" << frame.body_tform_sensor.y
+         << "|" << frame.body_tform_sensor.z << "|" << frame.body_tform_sensor.qx
+         << "|" << frame.body_tform_sensor.qy << "|" << frame.body_tform_sensor.qz
+         << "|" << frame.body_tform_sensor.qw;
+  };
+  std::ostringstream oss;
+  append_frame(&oss, left);
+  oss << "#";
+  append_frame(&oss, right);
+  oss << "#roll=" << roll_quarter_turns;
+  return oss.str();
+}
+
+int normalize_front_roll_quarter_turns(int roll_degrees) {
+  const int normalized = ((roll_degrees % 360) + 360) % 360;
+  return ((normalized + 45) / 90) % 4;
+}
+
+std::string front_roll_label(int roll_quarter_turns) {
+  switch ((roll_quarter_turns % 4 + 4) % 4) {
+    case 1:
+      return "cw90";
+    case 2:
+      return "180";
+    case 3:
+      return "ccw90";
+    case 0:
+    default:
+      return "0";
+  }
+}
+
+void rotate_virtual_axes_quarter_turns(const Vec3d& input_right,
+                                       const Vec3d& input_down,
+                                       int roll_quarter_turns,
+                                       Vec3d* out_right,
+                                       Vec3d* out_down) {
+  if (!out_right || !out_down) return;
+  const int normalized = (roll_quarter_turns % 4 + 4) % 4;
+  switch (normalized) {
+    case 1:
+      *out_right = scale_vec(input_down, -1.0);
+      *out_down = input_right;
+      return;
+    case 2:
+      *out_right = scale_vec(input_right, -1.0);
+      *out_down = scale_vec(input_down, -1.0);
+      return;
+    case 3:
+      *out_right = input_down;
+      *out_down = scale_vec(input_right, -1.0);
+      return;
+    case 0:
+    default:
+      *out_right = input_right;
+      *out_down = input_down;
+      return;
+  }
+}
+
+bool write_binary_file(const std::filesystem::path& path, const std::string& bytes) {
+  std::ofstream ofs(path, std::ios::binary);
+  if (!ofs) return false;
+  ofs.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  return static_cast<bool>(ofs);
+}
+
+bool decode_jpeg_mat(const std::string& bytes, cv::Mat* out_image) {
+  if (!out_image || bytes.empty()) return false;
+  std::vector<uchar> compressed(bytes.begin(), bytes.end());
+  cv::Mat decoded = cv::imdecode(compressed, cv::IMREAD_COLOR);
+  if (decoded.empty()) return false;
+  *out_image = std::move(decoded);
+  return true;
+}
+
+bool build_front_camera_status_frame(const std::string& title,
+                                     const std::string& detail,
+                                     std::string* out_jpg) {
+  if (!out_jpg) return false;
+  const cv::Scalar canvas_bg(15, 22, 30);
+  const cv::Scalar grid_minor(32, 41, 54);
+  const cv::Scalar grid_major(46, 58, 74);
+  const cv::Scalar text_primary(234, 239, 244);
+  const cv::Scalar text_secondary(156, 171, 186);
+  cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, canvas_bg);
+  for (int x = 0; x <= canvas.cols; x += 80) {
+    cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1),
+             (x % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
+  }
+  for (int y = 0; y <= canvas.rows; y += 80) {
+    cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y),
+             (y % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
+  }
+  const std::string display_title =
+      title.empty() ? std::string("Waiting for front camera stitch") : title;
+  int baseline = 0;
+  const cv::Size title_size =
+      cv::getTextSize(display_title, cv::FONT_HERSHEY_SIMPLEX, 0.95, 2, &baseline);
+  const cv::Point title_pt((canvas.cols - title_size.width) / 2, (canvas.rows / 2) - 18);
+  cv::putText(canvas, display_title, title_pt, cv::FONT_HERSHEY_SIMPLEX, 0.95, text_primary, 2,
+              cv::LINE_AA);
+  int detail_y = title_pt.y + 42;
+  const std::string display_detail =
+      detail.empty() ? std::string("Waiting for both front fisheye images and calibration data.")
+                     : detail;
+  for (const auto& line : wrap_text(display_detail, 56)) {
+    int detail_baseline = 0;
+    const cv::Size line_size =
+        cv::getTextSize(line, cv::FONT_HERSHEY_SIMPLEX, 0.58, 1, &detail_baseline);
+    cv::putText(canvas, line, cv::Point((canvas.cols - line_size.width) / 2, detail_y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.58, text_secondary, 1, cv::LINE_AA);
+    detail_y += 28;
+  }
+  return encode_jpeg(canvas, out_jpg);
+}
+
+struct FrontStitchArtifacts {
+  std::string signature;
+  cv::Mat left_map_x;
+  cv::Mat left_map_y;
+  cv::Mat right_map_x;
+  cv::Mat right_map_y;
+  cv::Mat left_weight;
+  cv::Mat right_weight;
+};
+
+bool project_camera_ray_to_pixel(const SpotClient::ImageFrame& frame,
+                                 const Vec3d& ray_camera,
+                                 double* out_u,
+                                 double* out_v,
+                                 double* out_weight) {
+  if (!out_u || !out_v) return false;
+  if (ray_camera.z <= 1e-6) return false;
+
+  const auto& intrinsics = frame.intrinsics;
+  const double a = ray_camera.x / ray_camera.z;
+  const double b = ray_camera.y / ray_camera.z;
+  double distorted_x = a;
+  double distorted_y = b;
+
+  if (intrinsics.model_type == SpotClient::CameraIntrinsics::ModelType::kKannalaBrandt) {
+    const double radius = std::sqrt(a * a + b * b);
+    if (radius > 1e-9) {
+      const double theta = std::atan(radius);
+      const double theta2 = theta * theta;
+      const double theta4 = theta2 * theta2;
+      const double theta6 = theta4 * theta2;
+      const double theta8 = theta4 * theta4;
+      const double theta_distorted =
+          theta * (1.0 + intrinsics.k1 * theta2 + intrinsics.k2 * theta4 +
+                   intrinsics.k3 * theta6 + intrinsics.k4 * theta8);
+      const double scale = theta_distorted / radius;
+      distorted_x = a * scale;
+      distorted_y = b * scale;
+    }
+  } else if (intrinsics.model_type != SpotClient::CameraIntrinsics::ModelType::kPinhole) {
+    return false;
+  }
+
+  const double u = intrinsics.fx * distorted_x + intrinsics.skew_x * distorted_y + intrinsics.cx;
+  const double v = intrinsics.skew_y * distorted_x + intrinsics.fy * distorted_y + intrinsics.cy;
+  if (u < 0.0 || v < 0.0 ||
+      u > static_cast<double>(frame.cols - 1) ||
+      v > static_cast<double>(frame.rows - 1)) {
+    return false;
+  }
+
+  *out_u = u;
+  *out_v = v;
+  if (out_weight) {
+    const double cosine = std::max(0.0, ray_camera.z / norm_vec(ray_camera));
+    *out_weight = cosine * cosine;
+  }
+  return true;
+}
+
+bool build_front_stitch_artifacts(const SpotClient::ImageFrame& left,
+                                  const SpotClient::ImageFrame& right,
+                                  int roll_quarter_turns,
+                                  FrontStitchArtifacts* out_artifacts,
+                                  std::string* out_error) {
+  if (!out_artifacts) return false;
+  if (!frame_has_stitch_calibration(left) || !frame_has_stitch_calibration(right)) {
+    if (out_error) *out_error = "front camera calibration is incomplete";
+    return false;
+  }
+
+  const cv::Matx33d body_R_left = rotation_matrix_from_pose(left.body_tform_sensor);
+  const cv::Matx33d body_R_right = rotation_matrix_from_pose(right.body_tform_sensor);
+  const Vec3d body_forward_hint = normalize_vec(
+      add_vec(mat_mul(body_R_left, Vec3d{0.0, 0.0, 1.0}),
+              mat_mul(body_R_right, Vec3d{0.0, 0.0, 1.0})),
+      Vec3d{1.0, 0.0, 0.0});
+  Vec3d body_up_hint = normalize_vec(
+      add_vec(scale_vec(mat_mul(body_R_left, Vec3d{0.0, 1.0, 0.0}), -1.0),
+              scale_vec(mat_mul(body_R_right, Vec3d{0.0, 1.0, 0.0}), -1.0)),
+      Vec3d{0.0, 0.0, 1.0});
+  if (std::fabs(dot_vec(body_forward_hint, body_up_hint)) > 0.95) {
+    body_up_hint = Vec3d{0.0, 0.0, 1.0};
+  }
+  Vec3d body_right = normalize_vec(cross_vec(body_up_hint, body_forward_hint),
+                                   Vec3d{0.0, -1.0, 0.0});
+  Vec3d body_down = normalize_vec(cross_vec(body_forward_hint, body_right),
+                                  Vec3d{0.0, 0.0, 1.0});
+  const Vec3d source_right_hint = normalize_vec(
+      add_vec(mat_mul(body_R_left, Vec3d{1.0, 0.0, 0.0}),
+              mat_mul(body_R_right, Vec3d{1.0, 0.0, 0.0})),
+      body_right);
+  if (dot_vec(body_right, source_right_hint) < 0.0) {
+    body_right = scale_vec(body_right, -1.0);
+    body_down = scale_vec(body_down, -1.0);
+  }
+  rotate_virtual_axes_quarter_turns(body_right, body_down, roll_quarter_turns,
+                                    &body_right, &body_down);
+
+  const cv::Matx33d body_R_virtual(
+      body_right.x, body_down.x, body_forward_hint.x,
+      body_right.y, body_down.y, body_forward_hint.y,
+      body_right.z, body_down.z, body_forward_hint.z);
+  const cv::Matx33d left_R_virtual = body_R_left.t() * body_R_virtual;
+  const cv::Matx33d right_R_virtual = body_R_right.t() * body_R_virtual;
+
+  constexpr int kOutputWidth = 1280;
+  constexpr int kOutputHeight = 720;
+  constexpr double kHorizontalFovDeg = 130.0;
+  const double horizontal_fov_rad = kHorizontalFovDeg * 3.14159265358979323846 / 180.0;
+  const double fx = (static_cast<double>(kOutputWidth) * 0.5) / std::tan(horizontal_fov_rad * 0.5);
+  const double fy = fx;
+  const double cx = (static_cast<double>(kOutputWidth) - 1.0) * 0.5;
+  const double cy = (static_cast<double>(kOutputHeight) - 1.0) * 0.5;
+
+  FrontStitchArtifacts artifacts;
+  artifacts.signature = build_front_stitch_signature(left, right, roll_quarter_turns);
+  artifacts.left_map_x = cv::Mat(kOutputHeight, kOutputWidth, CV_32FC1, cv::Scalar(0));
+  artifacts.left_map_y = cv::Mat(kOutputHeight, kOutputWidth, CV_32FC1, cv::Scalar(0));
+  artifacts.right_map_x = cv::Mat(kOutputHeight, kOutputWidth, CV_32FC1, cv::Scalar(0));
+  artifacts.right_map_y = cv::Mat(kOutputHeight, kOutputWidth, CV_32FC1, cv::Scalar(0));
+  artifacts.left_weight = cv::Mat(kOutputHeight, kOutputWidth, CV_32FC1, cv::Scalar(0));
+  artifacts.right_weight = cv::Mat(kOutputHeight, kOutputWidth, CV_32FC1, cv::Scalar(0));
+
+  for (int y = 0; y < kOutputHeight; ++y) {
+    float* left_map_x_row = artifacts.left_map_x.ptr<float>(y);
+    float* left_map_y_row = artifacts.left_map_y.ptr<float>(y);
+    float* right_map_x_row = artifacts.right_map_x.ptr<float>(y);
+    float* right_map_y_row = artifacts.right_map_y.ptr<float>(y);
+    float* left_weight_row = artifacts.left_weight.ptr<float>(y);
+    float* right_weight_row = artifacts.right_weight.ptr<float>(y);
+    for (int x = 0; x < kOutputWidth; ++x) {
+      const Vec3d ray_virtual = normalize_vec(
+          Vec3d{(static_cast<double>(x) - cx) / fx, (static_cast<double>(y) - cy) / fy, 1.0},
+          Vec3d{0.0, 0.0, 1.0});
+
+      const Vec3d ray_left = mat_mul(left_R_virtual, ray_virtual);
+      double pixel_u = 0.0;
+      double pixel_v = 0.0;
+      double weight = 0.0;
+      if (project_camera_ray_to_pixel(left, ray_left, &pixel_u, &pixel_v, &weight)) {
+        left_map_x_row[x] = static_cast<float>(pixel_u);
+        left_map_y_row[x] = static_cast<float>(pixel_v);
+        left_weight_row[x] = static_cast<float>(weight);
+      }
+
+      const Vec3d ray_right = mat_mul(right_R_virtual, ray_virtual);
+      if (project_camera_ray_to_pixel(right, ray_right, &pixel_u, &pixel_v, &weight)) {
+        right_map_x_row[x] = static_cast<float>(pixel_u);
+        right_map_y_row[x] = static_cast<float>(pixel_v);
+        right_weight_row[x] = static_cast<float>(weight);
+      }
+    }
+  }
+
+  *out_artifacts = std::move(artifacts);
+  return true;
+}
+
+bool render_front_stitched_jpeg(const FrontStitchArtifacts& artifacts,
+                                const cv::Mat* left_image,
+                                const cv::Mat* right_image,
+                                const std::string& status_title,
+                                const std::string& status_detail,
+                                std::string* out_jpg) {
+  if (!out_jpg) return false;
+  const bool have_left = left_image && !left_image->empty();
+  const bool have_right = right_image && !right_image->empty();
+  if (!have_left && !have_right) {
+    return build_front_camera_status_frame(status_title, status_detail, out_jpg);
+  }
+
+  cv::Mat left_rectified;
+  cv::Mat right_rectified;
+  if (have_left) {
+    cv::remap(*left_image, left_rectified, artifacts.left_map_x, artifacts.left_map_y,
+              cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+  }
+  if (have_right) {
+    cv::remap(*right_image, right_rectified, artifacts.right_map_x, artifacts.right_map_y,
+              cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+  }
+
+  cv::Mat composite(artifacts.left_map_x.rows, artifacts.left_map_x.cols, CV_8UC3,
+                    cv::Scalar(10, 14, 18));
+  for (int y = 0; y < composite.rows; ++y) {
+    const cv::Vec3b* left_row = have_left ? left_rectified.ptr<cv::Vec3b>(y) : nullptr;
+    const cv::Vec3b* right_row = have_right ? right_rectified.ptr<cv::Vec3b>(y) : nullptr;
+    const float* left_weight_row = have_left ? artifacts.left_weight.ptr<float>(y) : nullptr;
+    const float* right_weight_row = have_right ? artifacts.right_weight.ptr<float>(y) : nullptr;
+    cv::Vec3b* out_row = composite.ptr<cv::Vec3b>(y);
+    for (int x = 0; x < composite.cols; ++x) {
+      const float wl = left_weight_row ? left_weight_row[x] : 0.0f;
+      const float wr = right_weight_row ? right_weight_row[x] : 0.0f;
+      if (wl <= 0.0f && wr <= 0.0f) continue;
+      if (wr <= 0.0f) {
+        out_row[x] = left_row[x];
+        continue;
+      }
+      if (wl <= 0.0f) {
+        out_row[x] = right_row[x];
+        continue;
+      }
+      const float denom = wl + wr;
+      cv::Vec3b pixel;
+      for (int c = 0; c < 3; ++c) {
+        pixel[c] = cv::saturate_cast<uchar>(
+            (left_row[x][c] * wl + right_row[x][c] * wr) / denom);
+      }
+      out_row[x] = pixel;
+    }
+  }
+
+  if (!status_title.empty() || !status_detail.empty()) {
+    fill_rect_alpha(&composite, cv::Rect(20, 20, 270, status_detail.empty() ? 52 : 82),
+                    cv::Scalar(12, 18, 24), 0.55);
+    cv::putText(composite, status_title, cv::Point(34, 54), cv::FONT_HERSHEY_SIMPLEX, 0.72,
+                cv::Scalar(236, 240, 245), 2, cv::LINE_AA);
+    if (!status_detail.empty()) {
+      cv::putText(composite, status_detail, cv::Point(34, 82), cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                  cv::Scalar(164, 177, 191), 1, cv::LINE_AA);
+    }
+  }
+  return encode_jpeg(composite, out_jpg);
+}
+
+bool write_front_stitch_debug_bundle(const SpotClient::ImageFrame& left_frame,
+                                     const SpotClient::ImageFrame& right_frame,
+                                     const cv::Mat& left_image,
+                                     const cv::Mat& right_image,
+                                     int selected_roll_quarter_turns,
+                                     std::string* out_dir) {
+  const std::filesystem::path debug_dir =
+      std::filesystem::path("logs") / "front-stitch-debug" / std::to_string(now_ms());
+  std::error_code ec;
+  std::filesystem::create_directories(debug_dir, ec);
+  if (ec) return false;
+
+  if (!write_binary_file(debug_dir / "left_raw.jpg", left_frame.encoded_image)) return false;
+  if (!write_binary_file(debug_dir / "right_raw.jpg", right_frame.encoded_image)) return false;
+
+  for (int roll_quarter_turns = 0; roll_quarter_turns < 4; ++roll_quarter_turns) {
+    FrontStitchArtifacts debug_artifacts;
+    std::string error;
+    if (!build_front_stitch_artifacts(left_frame, right_frame, roll_quarter_turns,
+                                      &debug_artifacts, &error)) {
+      continue;
+    }
+    std::string output_jpg;
+    if (!render_front_stitched_jpeg(debug_artifacts, &left_image, &right_image,
+                                    std::string(), std::string(), &output_jpg)) {
+      continue;
+    }
+    const std::string filename = "stitched_roll_" + front_roll_label(roll_quarter_turns) + ".jpg";
+    if (!write_binary_file(debug_dir / filename, output_jpg)) return false;
+  }
+
+  std::ostringstream metadata;
+  metadata << "selected_roll_quarter_turns=" << selected_roll_quarter_turns << "\n";
+  metadata << "selected_roll_label=" << front_roll_label(selected_roll_quarter_turns) << "\n";
+  metadata << "left_source=" << left_frame.source_name << "\n";
+  metadata << "right_source=" << right_frame.source_name << "\n";
+  metadata << "left_frame_name=" << left_frame.frame_name_image_sensor << "\n";
+  metadata << "right_frame_name=" << right_frame.frame_name_image_sensor << "\n";
+  metadata << "left_dims=" << left_frame.cols << "x" << left_frame.rows << "\n";
+  metadata << "right_dims=" << right_frame.cols << "x" << right_frame.rows << "\n";
+  metadata << "left_signature_status=" << left_frame.status << "\n";
+  metadata << "right_signature_status=" << right_frame.status << "\n";
+  if (!write_binary_file(debug_dir / "metadata.txt", metadata.str())) return false;
+
+  if (out_dir) *out_dir = debug_dir.string();
+  return true;
+}
+
 struct CachedImageState {
   std::mutex mu;
   std::condition_variable cv;
@@ -275,6 +753,7 @@ void publish_cached_image_loop(FormantAgentClient* agent,
   long long next_post_allowed_ms = 0;
   long long next_keepalive_ms = now_ms();
   uint64_t last_published_version = 0;
+  uint64_t last_attempted_version = 0;
   while (running->load()) {
     std::shared_ptr<std::string> frame;
     uint64_t version = 0;
@@ -285,18 +764,23 @@ void publish_cached_image_loop(FormantAgentClient* agent,
         version = state->version;
         const long long now = now_ms();
         const bool has_frame = frame && !frame->empty();
-        const bool has_new_frame = has_frame && version != last_published_version;
-        const bool can_post = now >= next_post_allowed_ms;
-        const bool keepalive_due = has_frame && now >= next_keepalive_ms;
-        if ((has_new_frame && can_post) || (keepalive_due && can_post)) break;
+        const bool has_unpublished_frame = has_frame && version != last_published_version;
+        const bool frame_changed_since_attempt =
+            has_unpublished_frame && version != last_attempted_version;
+        const bool can_retry = now >= next_post_allowed_ms;
+        const bool should_post_fresh_frame =
+            has_unpublished_frame && (frame_changed_since_attempt || can_retry);
+        const bool keepalive_due =
+            has_frame && version == last_published_version && now >= next_keepalive_ms && can_retry;
+        if (should_post_fresh_frame || keepalive_due) break;
         if (!running->load()) return;
 
         long long wait_until_ms = 0;
-        if (has_new_frame && !can_post) {
+        if (has_unpublished_frame && !frame_changed_since_attempt) {
           wait_until_ms = next_post_allowed_ms;
         } else if (has_frame) {
           wait_until_ms = next_keepalive_ms;
-          if (!can_post) wait_until_ms = std::min(wait_until_ms, next_post_allowed_ms);
+          if (!can_retry) wait_until_ms = std::min(wait_until_ms, next_post_allowed_ms);
         }
 
         if (wait_until_ms > 0) {
@@ -311,15 +795,19 @@ void publish_cached_image_loop(FormantAgentClient* agent,
     if (!frame || frame->empty()) continue;
 
     const long long now = now_ms();
+    last_attempted_version = version;
     const bool ok = agent->PostImage(stream, "image/jpeg", *frame, post_timeout_ms);
     if (ok) {
       post_backoff_ms = 0;
       next_post_allowed_ms = 0;
+      // Repeat the most recent JPEG at the configured stream cadence so downstream
+      // video/clip generation sees a steady frame rate even when the producer
+      // refreshes more slowly than the publish rate.
       next_keepalive_ms = now + output_period_ms;
       last_published_version = version;
     } else {
       post_backoff_ms =
-          std::min(2000, std::max(100, post_backoff_ms == 0 ? 100 : post_backoff_ms * 2));
+          std::min(500, std::max(100, post_backoff_ms == 0 ? 100 : post_backoff_ms * 2));
       next_post_allowed_ms = now + post_backoff_ms;
     }
   }
@@ -947,6 +1435,36 @@ bool Adapter::Init() {
     validate_configured_source(&cfg_.left_camera_source, &cfg_.left_camera_stream_name);
     validate_configured_source(&cfg_.right_camera_source, &cfg_.right_camera_stream_name);
     validate_configured_source(&cfg_.back_camera_source, &cfg_.back_camera_stream_name);
+
+    if (!cfg_.front_image_stream_name.empty()) {
+      const auto left_it = source_map.find(cfg_.front_left_camera_source);
+      const auto right_it = source_map.find(cfg_.front_right_camera_source);
+      const bool left_ok = left_it != source_map.end() &&
+                           left_it->second.cols > 0 &&
+                           left_it->second.rows > 0;
+      const bool right_ok = right_it != source_map.end() &&
+                            right_it->second.cols > 0 &&
+                            right_it->second.rows > 0;
+      if (!left_ok || !right_ok) {
+        std::cerr << "[camera] stitched front stream disabled:"
+                  << " left_source=" << cfg_.front_left_camera_source
+                  << " right_source=" << cfg_.front_right_camera_source
+                  << " reason=" << (!left_ok ? "left unavailable " : "")
+                  << (!right_ok ? "right unavailable" : "")
+                  << std::endl;
+        cfg_.front_image_stream_name.clear();
+      } else {
+        std::cerr << "[camera] stitched front stream config: stream=" << cfg_.front_image_stream_name
+                  << " left_source=" << cfg_.front_left_camera_source
+                  << " right_source=" << cfg_.front_right_camera_source
+                  << " output_fps=" << std::max(1, cfg_.front_image_fps)
+                  << " data_poll_hz=" << std::max(1, cfg_.front_image_poll_hz)
+                  << " roll_degrees=" << cfg_.front_image_roll_degrees
+                  << " left_size=" << left_it->second.cols << "x" << left_it->second.rows
+                  << " right_size=" << right_it->second.cols << "x" << right_it->second.rows
+                  << std::endl;
+      }
+    }
   } else {
     std::cerr << "[camera] failed to list image sources: " << spot_.LastError() << std::endl;
   }
@@ -958,6 +1476,7 @@ bool Adapter::Init() {
   }
   std::cerr << "[camera] surround stream config: output_fps=" << std::max(1, cfg_.surround_camera_fps)
             << " data_poll_hz=" << std::max(1, cfg_.surround_camera_poll_hz)
+            << " batch_sources=left,right,back"
             << " right_rotate_180=" << (cfg_.right_camera_rotate_180 ? "true" : "false")
             << " normalize_jpeg=true"
             << std::endl;
@@ -1061,12 +1580,20 @@ void Adapter::Run() {
   const int surround_output_fps = std::max(1, cfg_.surround_camera_fps);
   const int surround_poll_hz = std::max(1, cfg_.surround_camera_poll_hz);
   start_camera(cfg_.camera_source, cfg_.camera_stream_name, hand_fps, hand_fps, false, false, 75);
-  start_camera(cfg_.left_camera_source, cfg_.left_camera_stream_name, surround_output_fps,
-               surround_poll_hz, false, true, 250);
-  start_camera(cfg_.right_camera_source, cfg_.right_camera_stream_name, surround_output_fps,
-               surround_poll_hz, cfg_.right_camera_rotate_180, true, 250);
-  start_camera(cfg_.back_camera_source, cfg_.back_camera_stream_name, surround_output_fps,
-               surround_poll_hz, false, true, 250);
+  const bool have_surround_stream =
+      (!cfg_.left_camera_source.empty() && !cfg_.left_camera_stream_name.empty()) ||
+      (!cfg_.right_camera_source.empty() && !cfg_.right_camera_stream_name.empty()) ||
+      (!cfg_.back_camera_source.empty() && !cfg_.back_camera_stream_name.empty());
+  if (have_surround_stream) {
+    surround_image_thread_ = std::thread(&Adapter::SurroundImageLoop, this,
+                                         surround_output_fps, surround_poll_hz);
+  }
+  if (!cfg_.front_image_stream_name.empty()) {
+    front_image_thread_ = std::thread(&Adapter::FrontImageLoop, this,
+                                      cfg_.front_image_stream_name,
+                                      std::max(1, cfg_.front_image_fps),
+                                      std::max(1, cfg_.front_image_poll_hz));
+  }
   if (!cfg_.localization_image_stream_name.empty()) {
     localization_image_thread_ = std::thread(&Adapter::LocalizationImageLoop, this,
                                              cfg_.localization_image_stream_name,
@@ -1228,6 +1755,8 @@ void Adapter::Run() {
     if (t.joinable()) t.join();
   }
   camera_threads_.clear();
+  if (surround_image_thread_.joinable()) surround_image_thread_.join();
+  if (front_image_thread_.joinable()) front_image_thread_.join();
   if (localization_image_thread_.joinable()) localization_image_thread_.join();
   if (graphnav_map_image_thread_.joinable()) graphnav_map_image_thread_.join();
   if (lease_thread_.joinable()) lease_thread_.join();
@@ -1252,6 +1781,7 @@ void Adapter::Stop() {
 void Adapter::CameraLoop(const std::string& source, const std::string& stream, int output_fps,
                          int poll_hz, bool rotate_180, bool normalize_jpeg,
                          int post_timeout_ms) {
+  constexpr int kMaxImageFetchBackoffMs = 1000;
   const int output_period_ms = std::max(1, 1000 / std::max(1, output_fps));
   const int poll_period_ms = std::max(1, 1000 / std::max(1, poll_hz));
   long long last_error_log_ms = 0;
@@ -1291,7 +1821,7 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
           last_error_log_ms = now;
         }
         failure_backoff_ms =
-            std::min(2000, std::max(poll_period_ms, failure_backoff_ms * 2));
+            std::min(kMaxImageFetchBackoffMs, std::max(poll_period_ms, failure_backoff_ms * 2));
       }
     } else {
       const long long now = now_ms();
@@ -1301,9 +1831,352 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
                   << " error=" << spot_.LastError() << std::endl;
         last_error_log_ms = now;
       }
-      failure_backoff_ms = std::min(2000, std::max(poll_period_ms, failure_backoff_ms * 2));
+      failure_backoff_ms =
+          std::min(kMaxImageFetchBackoffMs, std::max(poll_period_ms, failure_backoff_ms * 2));
     }
     const int step_ms = 50;
+    int slept_ms = 0;
+    while (running_ && slept_ms < failure_backoff_ms) {
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(std::min(step_ms, failure_backoff_ms - slept_ms)));
+      slept_ms += step_ms;
+    }
+  }
+  if (sender.joinable()) sender.join();
+}
+
+void Adapter::SurroundImageLoop(int output_fps, int poll_hz) {
+  constexpr int kMaxImageFetchBackoffMs = 1000;
+  const int output_period_ms = std::max(1, 1000 / std::max(1, output_fps));
+  const int poll_period_ms = std::max(1, 1000 / std::max(1, poll_hz));
+  int failure_backoff_ms = poll_period_ms;
+  long long last_batch_error_log_ms = 0;
+  std::unordered_map<std::string, long long> last_stream_error_log_ms;
+
+  struct SurroundStreamState {
+    std::string source;
+    std::string stream;
+    bool rotate_180{false};
+    bool normalize_jpeg{false};
+    int post_timeout_ms{250};
+    CachedImageState cached_image;
+  };
+
+  auto make_stream_state = [](const std::string& source,
+                              const std::string& stream,
+                              bool rotate_180,
+                              bool normalize_jpeg,
+                              int post_timeout_ms) {
+    auto state = std::make_unique<SurroundStreamState>();
+    state->source = source;
+    state->stream = stream;
+    state->rotate_180 = rotate_180;
+    state->normalize_jpeg = normalize_jpeg;
+    state->post_timeout_ms = post_timeout_ms;
+    return state;
+  };
+
+  std::vector<std::unique_ptr<SurroundStreamState>> stream_states;
+  if (!cfg_.left_camera_source.empty() && !cfg_.left_camera_stream_name.empty()) {
+    stream_states.push_back(make_stream_state(
+        cfg_.left_camera_source, cfg_.left_camera_stream_name, false, true, 250));
+  }
+  if (!cfg_.right_camera_source.empty() && !cfg_.right_camera_stream_name.empty()) {
+    stream_states.push_back(make_stream_state(
+        cfg_.right_camera_source, cfg_.right_camera_stream_name, cfg_.right_camera_rotate_180,
+        true, 250));
+  }
+  if (!cfg_.back_camera_source.empty() && !cfg_.back_camera_stream_name.empty()) {
+    stream_states.push_back(make_stream_state(
+        cfg_.back_camera_source, cfg_.back_camera_stream_name, false, true, 250));
+  }
+  if (stream_states.empty()) return;
+
+  std::vector<std::thread> sender_threads;
+  std::vector<std::string> sources;
+  sources.reserve(stream_states.size());
+  sender_threads.reserve(stream_states.size());
+  for (const auto& stream_state : stream_states) {
+    sources.push_back(stream_state->source);
+    auto* raw_state = stream_state.get();
+    sender_threads.emplace_back([this, raw_state, output_period_ms]() {
+      publish_cached_image_loop(&agent_, &running_, &raw_state->cached_image, raw_state->stream,
+                                output_period_ms, raw_state->post_timeout_ms);
+    });
+  }
+
+  auto find_frame = [](const std::vector<SpotClient::ImageFrame>& frames,
+                       const std::string& source_name) -> const SpotClient::ImageFrame* {
+    for (const auto& frame : frames) {
+      if (frame.source_name == source_name) return &frame;
+    }
+    return nullptr;
+  };
+
+  auto log_batch_error = [&last_batch_error_log_ms](const std::string& message) {
+    const long long now = now_ms();
+    if ((now - last_batch_error_log_ms) < 2000) return;
+    std::cerr << message << std::endl;
+    last_batch_error_log_ms = now;
+  };
+
+  auto log_stream_error = [&last_stream_error_log_ms](const std::string& stream_key,
+                                                      const std::string& message) {
+    const long long now = now_ms();
+    long long& last_log_ms = last_stream_error_log_ms[stream_key];
+    if ((now - last_log_ms) < 2000) return;
+    std::cerr << message << std::endl;
+    last_log_ms = now;
+  };
+
+  while (running_) {
+    if (now_ms() < dock_cooldown_until_ms_.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+    if (!SpotConnected()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      continue;
+    }
+
+    std::vector<SpotClient::ImageFrame> frames;
+    bool updated_any_frame = false;
+    if (spot_.GetImageFrames(sources, &frames)) {
+      for (const auto& stream_state : stream_states) {
+        const auto* frame = find_frame(frames, stream_state->source);
+        if (!frame) {
+          log_stream_error(stream_state->stream,
+                           "[camera] surround batch missing source=" + stream_state->source +
+                               " stream=" + stream_state->stream);
+          continue;
+        }
+        if (frame->status != static_cast<int>(::bosdyn::api::ImageResponse::STATUS_OK)) {
+          log_stream_error(stream_state->stream,
+                           "[camera] surround batch bad status source=" + stream_state->source +
+                               " stream=" + stream_state->stream +
+                               " status=" + image_status_to_string(frame->status));
+          continue;
+        }
+        std::string prepared_jpg;
+        if (!prepare_jpeg_frame(frame->encoded_image, stream_state->rotate_180,
+                                stream_state->normalize_jpeg, &prepared_jpg)) {
+          log_stream_error(stream_state->stream,
+                           "[camera] surround batch failed source=" + stream_state->source +
+                               " stream=" + stream_state->stream +
+                               " error=failed to prepare jpeg frame");
+          continue;
+        }
+        auto output_frame = std::make_shared<std::string>();
+        output_frame->swap(prepared_jpg);
+        update_cached_image(&stream_state->cached_image, std::move(output_frame));
+        updated_any_frame = true;
+      }
+      if (updated_any_frame) {
+        failure_backoff_ms = poll_period_ms;
+      } else {
+        failure_backoff_ms =
+            std::min(kMaxImageFetchBackoffMs, std::max(poll_period_ms, failure_backoff_ms * 2));
+      }
+    } else {
+      log_batch_error("[camera] failed fetching surround image batch: " + spot_.LastError());
+      failure_backoff_ms =
+          std::min(kMaxImageFetchBackoffMs, std::max(poll_period_ms, failure_backoff_ms * 2));
+    }
+
+    const int step_ms = 25;
+    int slept_ms = 0;
+    while (running_ && slept_ms < failure_backoff_ms) {
+      const int sleep_ms = std::min(step_ms, failure_backoff_ms - slept_ms);
+      std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+      slept_ms += sleep_ms;
+    }
+  }
+
+  for (auto& sender : sender_threads) {
+    if (sender.joinable()) sender.join();
+  }
+}
+
+void Adapter::FrontImageLoop(const std::string& stream, int fps, int poll_hz) {
+  constexpr int kMaxImageFetchBackoffMs = 1000;
+  const int output_period_ms = std::max(1, 1000 / std::max(1, fps));
+  const int poll_period_ms = std::max(1, 1000 / std::max(1, poll_hz));
+  const int selected_roll_quarter_turns =
+      normalize_front_roll_quarter_turns(cfg_.front_image_roll_degrees);
+  long long last_error_log_ms = 0;
+  long long last_good_frame_ms = 0;
+  int failure_backoff_ms = poll_period_ms;
+  bool have_rendered_frame = false;
+  bool have_artifacts = false;
+  bool debug_capture_attempted = false;
+  FrontStitchArtifacts artifacts;
+  CachedImageState cached_image;
+  const std::vector<std::string> sources{
+      cfg_.front_left_camera_source,
+      cfg_.front_right_camera_source,
+  };
+
+  auto maybe_log_error = [&last_error_log_ms](const std::string& message) {
+    const long long now = now_ms();
+    if ((now - last_error_log_ms) < 2000) return;
+    std::cerr << message << std::endl;
+    last_error_log_ms = now;
+  };
+
+  auto find_frame = [](const std::vector<SpotClient::ImageFrame>& frames,
+                       const std::string& source_name) -> const SpotClient::ImageFrame* {
+    for (const auto& frame : frames) {
+      if (frame.source_name == source_name) return &frame;
+    }
+    return nullptr;
+  };
+
+  auto build_status_detail = [&](const SpotClient::ImageFrame* left_frame,
+                                 const SpotClient::ImageFrame* right_frame,
+                                 const std::string& extra_detail) {
+    std::vector<std::string> parts;
+    if (left_frame) {
+      parts.push_back("left=" + image_status_to_string(left_frame->status));
+    } else {
+      parts.push_back("left=missing");
+    }
+    if (right_frame) {
+      parts.push_back("right=" + image_status_to_string(right_frame->status));
+    } else {
+      parts.push_back("right=missing");
+    }
+    if (!extra_detail.empty()) parts.push_back(extra_detail);
+    std::ostringstream oss;
+    for (size_t i = 0; i < parts.size(); ++i) {
+      if (i > 0) oss << " | ";
+      oss << parts[i];
+    }
+    return oss.str();
+  };
+
+  std::thread sender([this, &cached_image, &stream, output_period_ms]() {
+    publish_cached_image_loop(&agent_, &running_, &cached_image, stream,
+                              output_period_ms, 150);
+  });
+
+  while (running_) {
+    if (now_ms() < dock_cooldown_until_ms_.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+    if (!SpotConnected()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      continue;
+    }
+
+    std::vector<SpotClient::ImageFrame> frames;
+    if (spot_.GetImageFrames(sources, &frames)) {
+      const SpotClient::ImageFrame* left_frame = find_frame(frames, cfg_.front_left_camera_source);
+      const SpotClient::ImageFrame* right_frame = find_frame(frames, cfg_.front_right_camera_source);
+      const bool can_build_artifacts =
+          left_frame && right_frame &&
+          frame_has_stitch_calibration(*left_frame) &&
+          frame_has_stitch_calibration(*right_frame);
+      if (can_build_artifacts) {
+        const std::string signature =
+            build_front_stitch_signature(*left_frame, *right_frame, selected_roll_quarter_turns);
+        if (!have_artifacts || artifacts.signature != signature) {
+          FrontStitchArtifacts new_artifacts;
+          std::string build_error;
+          if (build_front_stitch_artifacts(*left_frame, *right_frame,
+                                           selected_roll_quarter_turns,
+                                           &new_artifacts, &build_error)) {
+            artifacts = std::move(new_artifacts);
+            have_artifacts = true;
+          } else {
+            have_artifacts = false;
+            maybe_log_error("[front-camera] failed building stitch maps: " + build_error);
+          }
+        }
+      }
+
+      cv::Mat left_image;
+      cv::Mat right_image;
+      const bool have_left_image =
+          left_frame &&
+          left_frame->status == static_cast<int>(::bosdyn::api::ImageResponse::STATUS_OK) &&
+          decode_jpeg_mat(left_frame->encoded_image, &left_image);
+      const bool have_right_image =
+          right_frame &&
+          right_frame->status == static_cast<int>(::bosdyn::api::ImageResponse::STATUS_OK) &&
+          decode_jpeg_mat(right_frame->encoded_image, &right_image);
+
+      bool updated_frame = false;
+      if (have_artifacts && (have_left_image || have_right_image)) {
+        if (!debug_capture_attempted && have_left_image && have_right_image &&
+            left_frame && right_frame) {
+          debug_capture_attempted = true;
+          std::string debug_dir;
+          if (write_front_stitch_debug_bundle(*left_frame, *right_frame, left_image, right_image,
+                                              selected_roll_quarter_turns, &debug_dir)) {
+            std::cerr << "[front-camera] wrote stitch debug bundle: " << debug_dir << std::endl;
+          } else {
+            maybe_log_error("[front-camera] failed writing stitch debug bundle");
+          }
+        }
+        std::string output_jpg;
+        if (render_front_stitched_jpeg(artifacts,
+                                       have_left_image ? &left_image : nullptr,
+                                       have_right_image ? &right_image : nullptr,
+                                       std::string(),
+                                       std::string(),
+                                       &output_jpg)) {
+          auto frame = std::make_shared<std::string>();
+          frame->swap(output_jpg);
+          update_cached_image(&cached_image, std::move(frame));
+          updated_frame = true;
+          have_rendered_frame = true;
+          last_good_frame_ms = now_ms();
+          failure_backoff_ms = poll_period_ms;
+        } else {
+          maybe_log_error("[front-camera] failed rendering stitched image");
+        }
+      }
+
+      if (!updated_frame) {
+        const long long now = now_ms();
+        if (!have_rendered_frame || (now - last_good_frame_ms) >= 2000) {
+          std::string output_jpg;
+          const std::string detail = build_status_detail(
+              left_frame, right_frame,
+              have_artifacts ? std::string() : std::string("waiting for stitch calibration"));
+          if (build_front_camera_status_frame("Front stitch unavailable", detail, &output_jpg)) {
+            auto frame = std::make_shared<std::string>();
+            frame->swap(output_jpg);
+            update_cached_image(&cached_image, std::move(frame));
+            updated_frame = true;
+          }
+        }
+        if (!updated_frame) {
+          maybe_log_error("[front-camera] no usable stitched front frame in current batch");
+        }
+        failure_backoff_ms =
+            std::min(kMaxImageFetchBackoffMs, std::max(poll_period_ms, failure_backoff_ms * 2));
+      }
+    } else {
+      maybe_log_error("[front-camera] failed fetching front image batch: " + spot_.LastError());
+      const long long now = now_ms();
+      if (!have_rendered_frame || (now - last_good_frame_ms) >= 2000) {
+        std::string output_jpg;
+        if (build_front_camera_status_frame(
+                "Front stitch unavailable",
+                "Spot image service batch request failed. Waiting for a new front camera batch.",
+                &output_jpg)) {
+          auto frame = std::make_shared<std::string>();
+          frame->swap(output_jpg);
+          update_cached_image(&cached_image, std::move(frame));
+        }
+      }
+      failure_backoff_ms =
+          std::min(kMaxImageFetchBackoffMs, std::max(poll_period_ms, failure_backoff_ms * 2));
+    }
+
+    const int step_ms = 25;
     int slept_ms = 0;
     while (running_ && slept_ms < failure_backoff_ms) {
       std::this_thread::sleep_for(
@@ -1665,17 +2538,16 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
                          artifacts->snapshot.map.height > 0 &&
                          artifacts->snapshot.map.resolution_m > 0.0;
 
-    cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, canvas_bg);
-    for (int x = 0; x <= canvas.cols; x += 80) {
-      cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1),
-               (x % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
-    }
-    for (int y = 0; y <= canvas.rows; y += 80) {
-      cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y),
-               (y % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
-    }
-
     if (!has_map) {
+      cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, canvas_bg);
+      for (int x = 0; x <= canvas.cols; x += 80) {
+        cv::line(canvas, cv::Point(x, 0), cv::Point(x, canvas.rows - 1),
+                 (x % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
+      }
+      for (int y = 0; y <= canvas.rows; y += 80) {
+        cv::line(canvas, cv::Point(0, y), cv::Point(canvas.cols - 1, y),
+                 (y % 240) == 0 ? grid_major : grid_minor, 1, cv::LINE_AA);
+      }
       const cv::Point center(canvas.cols / 2, canvas.rows / 2);
       cv::circle(canvas, center, 54, cv::Scalar(48, 68, 88), 1, cv::LINE_AA);
       cv::circle(canvas, center, 108, cv::Scalar(40, 58, 76), 1, cv::LINE_AA);
@@ -1705,6 +2577,9 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
       return encode_jpeg(canvas, out_jpg);
     }
 
+    (void)display_names;
+
+    cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, map_unknown);
     const auto& map = artifacts->snapshot.map;
     cv::Mat grid_image(map.height, map.width, CV_8UC3, map_unknown);
     cv::Mat occupied_mask(map.height, map.width, CV_8UC1, cv::Scalar(0));
@@ -1732,9 +2607,9 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
       }
     }
 
-    const int pad_x = 40;
-    const int pad_top = 56;
-    const int pad_bottom = 34;
+    const int pad_x = 12;
+    const int pad_top = 12;
+    const int pad_bottom = 12;
     const int available_width = std::max(1, canvas.cols - (pad_x * 2));
     const int available_height = std::max(1, canvas.rows - pad_top - pad_bottom);
     const double scale = std::min(static_cast<double>(available_width) / std::max(1, map.width),
@@ -1762,7 +2637,6 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
       }
       cv::polylines(canvas, shifted, true, map_occupied_edge, 1, cv::LINE_AA);
     }
-    cv::rectangle(canvas, draw_rect, cv::Scalar(90, 110, 128), 1, cv::LINE_AA);
 
     auto local_to_pixel = [&](double local_x_m, double local_y_m) {
       const double grid_x = local_x_m / map.resolution_m;
@@ -1788,13 +2662,9 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
                local_to_pixel(to_it->second.x, to_it->second.y), edge_line, 1, cv::LINE_AA);
     }
 
-    const bool draw_labels = artifacts->snapshot.waypoints.size() <= 28;
     for (const auto& waypoint : artifacts->snapshot.waypoints) {
       const auto pose_it = local_waypoints.find(waypoint.id);
       if (pose_it == local_waypoints.end()) continue;
-      const auto label_it = display_names.find(waypoint.id);
-      const std::string display_name =
-          (label_it == display_names.end()) ? waypoint.label : label_it->second;
       const bool is_dock = dock_waypoints.find(waypoint.id) != dock_waypoints.end();
       const bool is_current =
           localization && !localization->waypoint_id.empty() &&
@@ -1805,12 +2675,6 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
       cv::circle(canvas, point, radius + 2, robot_outline, cv::FILLED, cv::LINE_AA);
       cv::circle(canvas, point, radius, fill_color, cv::FILLED, cv::LINE_AA);
       cv::circle(canvas, point, radius, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-      if (draw_labels && !display_name.empty()) {
-        cv::putText(canvas, display_name, cv::Point(point.x + 8, point.y - 8),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.38, robot_outline, 2, cv::LINE_AA);
-        cv::putText(canvas, display_name, cv::Point(point.x + 8, point.y - 8),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.38, text_primary, 1, cv::LINE_AA);
-      }
     }
 
     if (localization && localization->has_seed_tform_body) {
@@ -1860,19 +2724,6 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
     cv::putText(canvas, format_decimal(scale_bar_m, scale_bar_m >= 5.0 ? 0 : 1) + " m",
                 cv::Point(scale_end.x + 12, scale_start.y + 5), cv::FONT_HERSHEY_SIMPLEX, 0.48,
                 text_primary, 1, cv::LINE_AA);
-
-    fill_rect_alpha(&canvas, cv::Rect(14, 12, canvas.cols - 28, 72), cv::Scalar(10, 15, 22), 0.72);
-    const std::string title = status_title.empty() ? "GraphNav global map" : status_title;
-    cv::putText(canvas, title, cv::Point(28, 42), cv::FONT_HERSHEY_SIMPLEX, 0.82, text_primary, 2,
-                cv::LINE_AA);
-    std::string detail = status_detail;
-    if (detail.empty()) {
-      detail = "map=" + artifacts->map_id + " waypoints=" +
-               std::to_string(artifacts->snapshot.waypoints.size()) + " edges=" +
-               std::to_string(artifacts->snapshot.edges.size());
-    }
-    cv::putText(canvas, detail, cv::Point(28, 68), cv::FONT_HERSHEY_SIMPLEX, 0.48, text_secondary,
-                1, cv::LINE_AA);
 
     return encode_jpeg(canvas, out_jpg);
   };

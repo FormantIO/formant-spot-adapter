@@ -69,4 +69,10 @@ message AdapterConfig {
   google.protobuf.StringValue graphnav_map_image_stream_name = 63;
   google.protobuf.Int32Value graphnav_map_image_fps = 64;
   google.protobuf.Int32Value graphnav_map_image_poll_hz = 65;
+  google.protobuf.StringValue front_left_camera_source = 66;
+  google.protobuf.StringValue front_right_camera_source = 67;
+  google.protobuf.StringValue front_image_stream_name = 68;
+  google.protobuf.Int32Value front_image_fps = 69;
+  google.protobuf.Int32Value front_image_poll_hz = 70;
+  google.protobuf.Int32Value front_image_roll_degrees = 71;
 }

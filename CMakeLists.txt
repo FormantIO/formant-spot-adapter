@@ -142,6 +142,24 @@ target_link_libraries(formant-spot-adapter PRIVATE
   ${OpenCV_LIBS}
 )
 
+add_executable(image-pull-benchmark
+  src/image_pull_benchmark.cpp
+  src/config.cpp
+  src/spot_client.cpp
+  src/spot_check_client.cpp
+)
+
+target_include_directories(image-pull-benchmark PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_BINARY_DIR}/generated
+)
+
+target_link_libraries(image-pull-benchmark PRIVATE
+  formant_proto
+  bosdyn_client_static
+  Threads::Threads
+)
+
 # The supported service deployment path for a source checkout is scripts/deploy.sh,
 # which generates a checkout-specific unit file. Keep cmake --install limited to
 # the binary and example configuration artifacts.

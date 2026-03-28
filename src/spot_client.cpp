@@ -17,6 +17,7 @@
 #include "bosdyn/client/image/image_client.h"
 #include "bosdyn/client/power/power_client_helper.h"
 #include "bosdyn/api/world_object.pb.h"
+#include "bosdyn/common/time.h"
 #include "bosdyn/math/frame_helpers.h"
 #include "bosdyn/math/proto_math.h"
 
@@ -933,6 +934,102 @@ bool SpotClient::GetImageJpeg(const std::string& source, std::string* out_bytes)
 
   *out_bytes = r.response.image_responses(0).shot().image().data();
   return !out_bytes->empty();
+}
+
+bool SpotClient::GetImageFrames(const std::vector<std::string>& sources,
+                                std::vector<ImageFrame>* out_frames) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!image_client_ || !out_frames) return false;
+  out_frames->clear();
+  if (sources.empty()) return true;
+
+  ::bosdyn::api::GetImageRequest request;
+  for (const auto& source : sources) {
+    if (source.empty()) continue;
+    auto* image_request = request.add_image_requests();
+    image_request->set_image_source_name(source);
+    image_request->set_quality_percent(75.0);
+    image_request->set_image_format(::bosdyn::api::Image_Format_FORMAT_JPEG);
+  }
+  if (request.image_requests_size() == 0) return true;
+
+  auto r = image_client_->GetImage(request);
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+  if (r.response.image_responses_size() <= 0) return false;
+
+  out_frames->reserve(static_cast<size_t>(r.response.image_responses_size()));
+  for (int i = 0; i < r.response.image_responses_size(); ++i) {
+    const auto& response = r.response.image_responses(i);
+    ImageFrame frame;
+    frame.status = static_cast<int>(response.status());
+    if (i < static_cast<int>(sources.size())) frame.source_name = sources[static_cast<size_t>(i)];
+    if (!response.source().name().empty()) frame.source_name = response.source().name();
+    frame.cols = response.source().cols();
+    frame.rows = response.source().rows();
+    frame.frame_name_image_sensor = response.shot().frame_name_image_sensor();
+    frame.encoded_image = response.shot().image().data();
+    if (response.shot().has_acquisition_time()) {
+      frame.has_acquisition_time = true;
+      frame.acquisition_time_sec = response.shot().acquisition_time().seconds();
+      frame.acquisition_time_nanos = response.shot().acquisition_time().nanos();
+    }
+
+    if (response.source().has_kannala_brandt()) {
+      const auto& intrinsics = response.source().kannala_brandt().intrinsics();
+      frame.intrinsics.model_type = CameraIntrinsics::ModelType::kKannalaBrandt;
+      frame.intrinsics.fx = intrinsics.pinhole_intrinsics().focal_length().x();
+      frame.intrinsics.fy = intrinsics.pinhole_intrinsics().focal_length().y();
+      frame.intrinsics.cx = intrinsics.pinhole_intrinsics().principal_point().x();
+      frame.intrinsics.cy = intrinsics.pinhole_intrinsics().principal_point().y();
+      frame.intrinsics.skew_x = intrinsics.pinhole_intrinsics().skew().x();
+      frame.intrinsics.skew_y = intrinsics.pinhole_intrinsics().skew().y();
+      frame.intrinsics.k1 = intrinsics.k1();
+      frame.intrinsics.k2 = intrinsics.k2();
+      frame.intrinsics.k3 = intrinsics.k3();
+      frame.intrinsics.k4 = intrinsics.k4();
+    } else if (response.source().has_pinhole()) {
+      const auto& intrinsics = response.source().pinhole().intrinsics();
+      frame.intrinsics.model_type = CameraIntrinsics::ModelType::kPinhole;
+      frame.intrinsics.fx = intrinsics.focal_length().x();
+      frame.intrinsics.fy = intrinsics.focal_length().y();
+      frame.intrinsics.cx = intrinsics.principal_point().x();
+      frame.intrinsics.cy = intrinsics.principal_point().y();
+      frame.intrinsics.skew_x = intrinsics.skew().x();
+      frame.intrinsics.skew_y = intrinsics.skew().y();
+    }
+
+    ::bosdyn::api::SE3Pose body_tform_sensor;
+    if (!frame.frame_name_image_sensor.empty() &&
+        ::bosdyn::api::get_a_tform_b(response.shot().transforms_snapshot(),
+                                     ::bosdyn::api::kBodyFrame,
+                                     frame.frame_name_image_sensor,
+                                     &body_tform_sensor)) {
+      frame.has_body_tform_sensor = true;
+      fill_pose3d(body_tform_sensor, &frame.body_tform_sensor);
+    }
+
+    out_frames->push_back(std::move(frame));
+  }
+  return true;
+}
+
+bool SpotClient::GetRobotClockSkewNanos(int64_t* out_skew_nanos) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!out_skew_nanos) return false;
+  if (!EnsureTimeSync()) return false;
+  if (!time_sync_endpoint_ || !time_sync_endpoint_->HasEstablishedTimeSync()) return false;
+
+  auto result = time_sync_endpoint_->GetClockSkew();
+  if (!result.status || !result.response) {
+    SetLastError(result.status.DebugString());
+    return false;
+  }
+
+  *out_skew_nanos = ::bosdyn::common::DurationToNsec(*result.response);
+  return true;
 }
 
 bool SpotClient::ListImageSources(std::vector<ImageSourceInfo>* out_sources) {

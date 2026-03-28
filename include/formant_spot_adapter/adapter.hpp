@@ -28,6 +28,8 @@ class Adapter {
  private:
   void CameraLoop(const std::string& source, const std::string& stream, int output_fps,
                   int poll_hz, bool rotate_180, bool normalize_jpeg, int post_timeout_ms);
+  void SurroundImageLoop(int output_fps, int poll_hz);
+  void FrontImageLoop(const std::string& stream, int fps, int poll_hz);
   void LocalizationImageLoop(const std::string& stream, int fps, int poll_hz);
   void GraphNavMapImageLoop(const std::string& stream, int fps, int poll_hz);
   void LeaseRetainLoop();
@@ -157,6 +159,8 @@ class Adapter {
   std::string last_logged_control_stream_;
 
   std::vector<std::thread> camera_threads_;
+  std::thread surround_image_thread_;
+  std::thread front_image_thread_;
   std::thread localization_image_thread_;
   std::thread graphnav_map_image_thread_;
   std::thread lease_thread_;

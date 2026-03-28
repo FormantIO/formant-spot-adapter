@@ -30,7 +30,7 @@ ensure_local_file() {
 }
 
 has_placeholder_credentials() {
-  [[ -z "${SPOT_USERNAME:-}" || -z "${SPOT_PASSWORD:-}" || "${SPOT_USERNAME}" == "user" || "${SPOT_PASSWORD}" == "changeme" ]]
+  [[ -z "${SPOT_USERNAME:-}" || -z "${SPOT_PASSWORD:-}" || "${SPOT_PASSWORD}" == "changeme" ]]
 }
 
 if [[ ! -x "${BIN}" ]]; then

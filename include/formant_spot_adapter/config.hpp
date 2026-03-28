@@ -33,9 +33,15 @@ struct Config {
   std::string right_camera_stream_name{"spot.right.image"};
   std::string back_camera_source{"back_fisheye_image"};
   std::string back_camera_stream_name{"spot.back.image"};
+  std::string front_left_camera_source{"frontleft_fisheye_image"};
+  std::string front_right_camera_source{"frontright_fisheye_image"};
+  std::string front_image_stream_name{"spot.front.image"};
   int camera_fps{30};
   int surround_camera_fps{15};
-  int surround_camera_poll_hz{2};
+  int surround_camera_poll_hz{15};
+  int front_image_fps{15};
+  int front_image_poll_hz{15};
+  int front_image_roll_degrees{90};
   bool right_camera_rotate_180{true};
   std::string localization_image_stream_name{"spot.localization.image"};
   int localization_image_fps{15};
