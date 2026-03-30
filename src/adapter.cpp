@@ -539,9 +539,8 @@ bool frame_has_stitch_calibration(const SpotClient::ImageFrame& frame) {
          frame.intrinsics.model_type != SpotClient::CameraIntrinsics::ModelType::kUnknown;
 }
 
-std::string build_front_stitch_signature(const SpotClient::ImageFrame& left,
-                                         const SpotClient::ImageFrame& right,
-                                         int roll_quarter_turns) {
+std::string build_front_stitch_calibration_signature(const SpotClient::ImageFrame& left,
+                                                     const SpotClient::ImageFrame& right) {
   auto append_frame = [](std::ostringstream* oss, const SpotClient::ImageFrame& frame) {
     if (!oss) return;
     oss->setf(std::ios::fixed);
@@ -562,6 +561,14 @@ std::string build_front_stitch_signature(const SpotClient::ImageFrame& left,
   append_frame(&oss, left);
   oss << "#";
   append_frame(&oss, right);
+  return oss.str();
+}
+
+std::string build_front_stitch_signature(const SpotClient::ImageFrame& left,
+                                         const SpotClient::ImageFrame& right,
+                                         int roll_quarter_turns) {
+  std::ostringstream oss;
+  oss << build_front_stitch_calibration_signature(left, right);
   oss << "#roll=" << roll_quarter_turns;
   return oss.str();
 }
@@ -582,6 +589,20 @@ std::string front_roll_label(int roll_quarter_turns) {
     case 0:
     default:
       return "0";
+  }
+}
+
+int front_roll_preference_rank(int roll_quarter_turns) {
+  switch ((roll_quarter_turns % 4 + 4) % 4) {
+    case 0:
+      return 0;
+    case 1:
+      return 1;
+    case 3:
+      return 2;
+    case 2:
+    default:
+      return 3;
   }
 }
 
@@ -678,6 +699,19 @@ struct FrontStitchArtifacts {
   cv::Mat right_map_y;
   cv::Mat left_weight;
   cv::Mat right_weight;
+};
+
+struct FrontRollAutoSelection {
+  bool valid{false};
+  int roll_quarter_turns{0};
+  double score{-std::numeric_limits<double>::infinity()};
+  std::array<double, 4> candidate_scores{
+      -std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+  };
+  FrontStitchArtifacts artifacts;
 };
 
 bool project_camera_ray_to_pixel(const SpotClient::ImageFrame& frame,
@@ -829,18 +863,15 @@ bool build_front_stitch_artifacts(const SpotClient::ImageFrame& left,
   return true;
 }
 
-bool render_front_stitched_jpeg(const FrontStitchArtifacts& artifacts,
-                                const cv::Mat* left_image,
-                                const cv::Mat* right_image,
-                                const std::string& status_title,
-                                const std::string& status_detail,
-                                std::string* out_jpg) {
-  if (!out_jpg) return false;
+bool render_front_stitched_image(const FrontStitchArtifacts& artifacts,
+                                 const cv::Mat* left_image,
+                                 const cv::Mat* right_image,
+                                 cv::Mat* out_image,
+                                 cv::Mat* out_valid_mask) {
+  if (!out_image) return false;
   const bool have_left = left_image && !left_image->empty();
   const bool have_right = right_image && !right_image->empty();
-  if (!have_left && !have_right) {
-    return build_front_camera_status_frame(status_title, status_detail, out_jpg);
-  }
+  if (!have_left && !have_right) return false;
 
   cv::Mat left_rectified;
   cv::Mat right_rectified;
@@ -855,16 +886,20 @@ bool render_front_stitched_jpeg(const FrontStitchArtifacts& artifacts,
 
   cv::Mat composite(artifacts.left_map_x.rows, artifacts.left_map_x.cols, CV_8UC3,
                     cv::Scalar(10, 14, 18));
+  cv::Mat valid_mask(artifacts.left_map_x.rows, artifacts.left_map_x.cols, CV_8UC1,
+                     cv::Scalar(0));
   for (int y = 0; y < composite.rows; ++y) {
     const cv::Vec3b* left_row = have_left ? left_rectified.ptr<cv::Vec3b>(y) : nullptr;
     const cv::Vec3b* right_row = have_right ? right_rectified.ptr<cv::Vec3b>(y) : nullptr;
     const float* left_weight_row = have_left ? artifacts.left_weight.ptr<float>(y) : nullptr;
     const float* right_weight_row = have_right ? artifacts.right_weight.ptr<float>(y) : nullptr;
     cv::Vec3b* out_row = composite.ptr<cv::Vec3b>(y);
+    uchar* mask_row = valid_mask.ptr<uchar>(y);
     for (int x = 0; x < composite.cols; ++x) {
       const float wl = left_weight_row ? left_weight_row[x] : 0.0f;
       const float wr = right_weight_row ? right_weight_row[x] : 0.0f;
       if (wl <= 0.0f && wr <= 0.0f) continue;
+      mask_row[x] = 255;
       if (wr <= 0.0f) {
         out_row[x] = left_row[x];
         continue;
@@ -881,6 +916,124 @@ bool render_front_stitched_jpeg(const FrontStitchArtifacts& artifacts,
       }
       out_row[x] = pixel;
     }
+  }
+
+  *out_image = std::move(composite);
+  if (out_valid_mask) {
+    *out_valid_mask = std::move(valid_mask);
+  }
+  return true;
+}
+
+double score_front_stitched_image(const FrontStitchArtifacts& artifacts,
+                                  const cv::Mat& left_image,
+                                  const cv::Mat& right_image) {
+  cv::Mat composite;
+  cv::Mat valid_mask;
+  if (!render_front_stitched_image(artifacts, &left_image, &right_image, &composite, &valid_mask)) {
+    return -std::numeric_limits<double>::infinity();
+  }
+
+  const int inset_x = std::max(8, composite.cols / 10);
+  const int inset_y = std::max(8, composite.rows / 10);
+  const cv::Rect roi(inset_x, inset_y,
+                     composite.cols - (2 * inset_x),
+                     composite.rows - (2 * inset_y));
+  if (roi.width <= 0 || roi.height <= 0) {
+    return -std::numeric_limits<double>::infinity();
+  }
+
+  const cv::Mat roi_image = composite(roi);
+  const cv::Mat roi_mask = valid_mask(roi);
+  const int valid_pixels = cv::countNonZero(roi_mask);
+  if (valid_pixels <= 0) return -std::numeric_limits<double>::infinity();
+
+  cv::Mat gray;
+  cv::Mat grad_x;
+  cv::Mat grad_y;
+  cv::Mat gradient_magnitude;
+  cv::cvtColor(roi_image, gray, cv::COLOR_BGR2GRAY);
+  cv::Sobel(gray, grad_x, CV_32F, 1, 0, 3);
+  cv::Sobel(gray, grad_y, CV_32F, 0, 1, 3);
+  cv::magnitude(grad_x, grad_y, gradient_magnitude);
+
+  const double coverage =
+      static_cast<double>(valid_pixels) / static_cast<double>(roi.width * roi.height);
+  const double gradient_mean = cv::mean(gradient_magnitude, roi_mask)[0];
+  return gradient_mean + (coverage * 0.01);
+}
+
+bool front_roll_score_is_better(double candidate_score,
+                                int candidate_roll_quarter_turns,
+                                double best_score,
+                                int best_roll_quarter_turns) {
+  if (!std::isfinite(candidate_score)) return false;
+  if (!std::isfinite(best_score)) return true;
+  constexpr double kScoreTieThreshold = 0.02;
+  if (candidate_score > (best_score + kScoreTieThreshold)) return true;
+  if (candidate_score + kScoreTieThreshold < best_score) return false;
+  return front_roll_preference_rank(candidate_roll_quarter_turns) <
+         front_roll_preference_rank(best_roll_quarter_turns);
+}
+
+FrontRollAutoSelection auto_select_front_roll(const SpotClient::ImageFrame& left_frame,
+                                              const SpotClient::ImageFrame& right_frame,
+                                              const cv::Mat& left_image,
+                                              const cv::Mat& right_image) {
+  FrontRollAutoSelection selection;
+  for (int roll_quarter_turns = 0; roll_quarter_turns < 4; ++roll_quarter_turns) {
+    FrontStitchArtifacts candidate_artifacts;
+    std::string error;
+    if (!build_front_stitch_artifacts(left_frame, right_frame, roll_quarter_turns,
+                                      &candidate_artifacts, &error)) {
+      continue;
+    }
+    const double score = score_front_stitched_image(candidate_artifacts, left_image, right_image);
+    selection.candidate_scores[roll_quarter_turns] = score;
+    if (front_roll_score_is_better(score, roll_quarter_turns,
+                                   selection.score, selection.roll_quarter_turns)) {
+      selection.valid = true;
+      selection.roll_quarter_turns = roll_quarter_turns;
+      selection.score = score;
+      selection.artifacts = std::move(candidate_artifacts);
+    }
+  }
+  return selection;
+}
+
+std::string describe_front_roll_scores(const FrontRollAutoSelection& selection) {
+  std::ostringstream oss;
+  oss.setf(std::ios::fixed);
+  oss.precision(3);
+  for (int roll_quarter_turns = 0; roll_quarter_turns < 4; ++roll_quarter_turns) {
+    if (roll_quarter_turns > 0) oss << ", ";
+    oss << front_roll_label(roll_quarter_turns) << "=";
+    const double score = selection.candidate_scores[roll_quarter_turns];
+    if (std::isfinite(score)) {
+      oss << score;
+    } else {
+      oss << "n/a";
+    }
+  }
+  return oss.str();
+}
+
+bool render_front_stitched_jpeg(const FrontStitchArtifacts& artifacts,
+                                const cv::Mat* left_image,
+                                const cv::Mat* right_image,
+                                const std::string& status_title,
+                                const std::string& status_detail,
+                                std::string* out_jpg) {
+  if (!out_jpg) return false;
+  const bool have_left = left_image && !left_image->empty();
+  const bool have_right = right_image && !right_image->empty();
+  if (!have_left && !have_right) {
+    return build_front_camera_status_frame(status_title, status_detail, out_jpg);
+  }
+
+  cv::Mat composite;
+  if (!render_front_stitched_image(artifacts, left_image, right_image, &composite, nullptr)) {
+    return false;
   }
 
   if (!status_title.empty() || !status_detail.empty()) {
@@ -1697,7 +1850,10 @@ bool Adapter::Init() {
                   << " right_source=" << cfg_.front_right_camera_source
                   << " output_fps=" << std::max(1, cfg_.front_image_fps)
                   << " data_poll_hz=" << std::max(1, cfg_.front_image_poll_hz)
-                  << " roll_degrees=" << cfg_.front_image_roll_degrees
+                  << " roll_degrees="
+                  << (cfg_.front_image_roll_degrees_configured
+                          ? std::to_string(cfg_.front_image_roll_degrees)
+                          : std::string("auto"))
                   << " left_size=" << left_it->second.cols << "x" << left_it->second.rows
                   << " right_size=" << right_it->second.cols << "x" << right_it->second.rows
                   << std::endl;
@@ -2271,7 +2427,8 @@ void Adapter::FrontImageLoop(const std::string& stream, int fps, int poll_hz) {
   constexpr int kMaxImageFetchBackoffMs = 1000;
   const int output_period_ms = std::max(1, 1000 / std::max(1, fps));
   const int poll_period_ms = std::max(1, 1000 / std::max(1, poll_hz));
-  const int selected_roll_quarter_turns =
+  const bool manual_roll_override = cfg_.front_image_roll_degrees_configured;
+  const int configured_roll_quarter_turns =
       normalize_front_roll_quarter_turns(cfg_.front_image_roll_degrees);
   long long last_error_log_ms = 0;
   long long last_good_frame_ms = 0;
@@ -2279,6 +2436,8 @@ void Adapter::FrontImageLoop(const std::string& stream, int fps, int poll_hz) {
   bool have_rendered_frame = false;
   bool have_artifacts = false;
   bool debug_capture_attempted = false;
+  int selected_roll_quarter_turns = configured_roll_quarter_turns;
+  std::string selected_calibration_signature;
   FrontStitchArtifacts artifacts;
   CachedImageState cached_image;
   const std::vector<std::string> sources{
@@ -2347,23 +2506,6 @@ void Adapter::FrontImageLoop(const std::string& stream, int fps, int poll_hz) {
           left_frame && right_frame &&
           frame_has_stitch_calibration(*left_frame) &&
           frame_has_stitch_calibration(*right_frame);
-      if (can_build_artifacts) {
-        const std::string signature =
-            build_front_stitch_signature(*left_frame, *right_frame, selected_roll_quarter_turns);
-        if (!have_artifacts || artifacts.signature != signature) {
-          FrontStitchArtifacts new_artifacts;
-          std::string build_error;
-          if (build_front_stitch_artifacts(*left_frame, *right_frame,
-                                           selected_roll_quarter_turns,
-                                           &new_artifacts, &build_error)) {
-            artifacts = std::move(new_artifacts);
-            have_artifacts = true;
-          } else {
-            have_artifacts = false;
-            maybe_log_error("[front-camera] failed building stitch maps: " + build_error);
-          }
-        }
-      }
 
       cv::Mat left_image;
       cv::Mat right_image;
@@ -2375,6 +2517,57 @@ void Adapter::FrontImageLoop(const std::string& stream, int fps, int poll_hz) {
           right_frame &&
           right_frame->status == static_cast<int>(::bosdyn::api::ImageResponse::STATUS_OK) &&
           decode_jpeg_mat(right_frame->encoded_image, &right_image);
+      const std::string calibration_signature =
+          can_build_artifacts
+              ? build_front_stitch_calibration_signature(*left_frame, *right_frame)
+              : std::string();
+
+      if (manual_roll_override && can_build_artifacts) {
+        selected_roll_quarter_turns = configured_roll_quarter_turns;
+        const std::string signature =
+            build_front_stitch_signature(*left_frame, *right_frame, selected_roll_quarter_turns);
+        if (!have_artifacts || artifacts.signature != signature) {
+          FrontStitchArtifacts new_artifacts;
+          std::string build_error;
+          if (build_front_stitch_artifacts(*left_frame, *right_frame,
+                                           selected_roll_quarter_turns,
+                                           &new_artifacts, &build_error)) {
+            artifacts = std::move(new_artifacts);
+            have_artifacts = true;
+            selected_calibration_signature = calibration_signature;
+            debug_capture_attempted = false;
+          } else {
+            have_artifacts = false;
+            maybe_log_error("[front-camera] failed building stitch maps: " + build_error);
+          }
+        }
+      } else if (!manual_roll_override &&
+                 can_build_artifacts &&
+                 have_left_image &&
+                 have_right_image &&
+                 (!have_artifacts || selected_calibration_signature != calibration_signature)) {
+        const FrontRollAutoSelection selection =
+            auto_select_front_roll(*left_frame, *right_frame, left_image, right_image);
+        if (selection.valid) {
+          const bool roll_changed =
+              !have_artifacts || selected_roll_quarter_turns != selection.roll_quarter_turns;
+          artifacts = selection.artifacts;
+          have_artifacts = true;
+          selected_roll_quarter_turns = selection.roll_quarter_turns;
+          selected_calibration_signature = calibration_signature;
+          debug_capture_attempted = false;
+          std::cerr << "[front-camera] auto-selected stitch roll: label="
+                    << front_roll_label(selected_roll_quarter_turns)
+                    << " degrees=" << (selected_roll_quarter_turns * 90)
+                    << " score=" << selection.score
+                    << " scores={" << describe_front_roll_scores(selection) << "}"
+                    << (roll_changed ? "" : " (unchanged)")
+                    << std::endl;
+        } else {
+          have_artifacts = false;
+          maybe_log_error("[front-camera] failed auto-selecting stitch roll");
+        }
+      }
 
       bool updated_frame = false;
       if (have_artifacts && (have_left_image || have_right_image)) {

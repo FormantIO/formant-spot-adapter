@@ -46,7 +46,8 @@ struct Config {
   int surround_camera_poll_hz{15};
   int front_image_fps{15};
   int front_image_poll_hz{15};
-  int front_image_roll_degrees{90};
+  int front_image_roll_degrees{0};
+  bool front_image_roll_degrees_configured{false};
   bool right_camera_rotate_180{true};
   std::string localization_image_stream_name{"spot.localization.graphnav.image"};
   int localization_image_fps{15};

@@ -84,6 +84,8 @@ If you rename a stream from its default, use the renamed stream name in `streamC
 - Adapter fetches both front fisheyes in one Spot image batch, rectifies them into a single
   forward-looking stitched view, and republishes the cached composite at the configured front-image
   output FPS.
+- By default the adapter auto-selects the best 90-degree roll for the active robot calibration.
+  `frontImageRollDegrees` remains available as a manual override when a deployment needs to pin it.
 - Designed for low-latency teleop use. Default output is 15 FPS with 15 Hz Spot polling.
 - If one front camera is degraded, the adapter keeps publishing a single-camera rectified fallback
   instead of dropping the stream immediately.

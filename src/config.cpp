@@ -29,6 +29,18 @@ int getenv_int_or(const char* k, int d) {
   }
 }
 
+bool getenv_int_if_set(const char* k, int* out) {
+  if (!out) return false;
+  const char* v = std::getenv(k);
+  if (!v || !*v) return false;
+  try {
+    *out = std::stoi(v);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 bool getenv_bool_or(const char* k, bool d) {
   const char* v = std::getenv(k);
   if (!v || !*v) return d;
@@ -106,6 +118,7 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   }
   if (j.has_front_image_roll_degrees()) {
     c->front_image_roll_degrees = j.front_image_roll_degrees().value();
+    c->front_image_roll_degrees_configured = true;
   }
   if (j.has_right_camera_rotate_180()) {
     c->right_camera_rotate_180 = j.right_camera_rotate_180().value();
@@ -212,8 +225,8 @@ Config load_config_from_env() {
       getenv_int_or("SURROUND_CAMERA_POLL_HZ", c.surround_camera_poll_hz);
   c.front_image_fps = getenv_int_or("FRONT_IMAGE_FPS", c.front_image_fps);
   c.front_image_poll_hz = getenv_int_or("FRONT_IMAGE_POLL_HZ", c.front_image_poll_hz);
-  c.front_image_roll_degrees =
-      getenv_int_or("FRONT_IMAGE_ROLL_DEGREES", c.front_image_roll_degrees);
+  c.front_image_roll_degrees_configured =
+      getenv_int_if_set("FRONT_IMAGE_ROLL_DEGREES", &c.front_image_roll_degrees);
   c.right_camera_rotate_180 =
       getenv_bool_or("RIGHT_CAMERA_ROTATE_180", c.right_camera_rotate_180);
   c.localization_image_stream_name =
