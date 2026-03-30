@@ -5,6 +5,13 @@ C++ adapter for Spot + Formant Agent teleoperation without ROS.
 This repository is maintained by Formant. It is not affiliated with or endorsed by
 Boston Dynamics.
 
+## Repository Basics
+
+- License: Apache-2.0
+- Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Security reporting: [`SECURITY.md`](SECURITY.md)
+- Conduct expectations: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+
 ## What It Does
 
 - Teleop motion from Formant twist control.
@@ -179,10 +186,11 @@ This repository supports two deployment modes:
 
 Only one deployment mode should be active on a device at a time.
 
-## Quickstart (Ubuntu, Including Jetson)
+## Quickstart (Jetson / Ubuntu)
 
-Current setup scripts target Ubuntu-based systems. Jetson deployments are expected to use Ubuntu as well.
-Other Linux distributions may work, but they are not currently documented or supported by the bootstrap/deploy scripts.
+This repository is intended to run on NVIDIA Jetson devices with an Ubuntu-based
+userspace. Other Linux environments are out of scope for this repository and
+are not documented or supported by the bootstrap or deployment scripts.
 
 1. Install deps and build:
 
@@ -261,7 +269,8 @@ Container deployment notes:
 - `./data` must be persistent if you want GraphNav state and saved map artifacts to survive container recreation.
 - Container logs go to `docker logs`; the container path does not write repo log files by default.
 - `spot.jetson.reboot` is not supported in container deployment because it is a host reboot command.
-- The current Docker build follows the repository's existing aarch64-focused build assumptions. Build it on the same class of target machine that will run it.
+- The current Docker build follows the repository's Jetson/aarch64-focused build
+  assumptions. Build it on the same class of target machine that will run it.
 - Repo-local Docker management scripts use plain `docker`.
 - A sample [`compose.yaml`](compose.yaml) is included only as a reference for larger setups; it is not the canonical management path for this repository.
 
@@ -418,6 +427,7 @@ an E-Stop is active, or `camera_server` still has active init faults.
 
 - Formant agent target default is `localhost:5501`.
 - This project intentionally does not use ROS.
+- The supported target environment is Jetson with an Ubuntu-based userspace.
 - The setup/build flow expects the Boston Dynamics Spot C++ SDK as an external
   dependency under its own license. The repo fetches the pinned SDK automatically
   into `third_party/spot-cpp-sdk` during bootstrap/build if it is missing.
