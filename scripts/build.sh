@@ -8,7 +8,8 @@ SPOT_CPP_SDK_DIR="${SPOT_CPP_SDK_DIR:-${ROOT_DIR}/third_party/spot-cpp-sdk}"
 SPOT_SDK_REF="${SPOT_SDK_REF:-v5.1.0}"
 SPOT_SDK_VERSION="${SPOT_SDK_VERSION:-${SPOT_SDK_REF#v}}"
 GRPC_SHIM_DIR="${GRPC_SHIM_DIR:-${ROOT_DIR}/cmake/grpc-shim}"
-EIGEN3_SHIM_DIR="${EIGEN3_SHIM_DIR:-${ROOT_DIR}/cmake/eigen3-shim}"
+# Prefer distro-provided Eigen discovery; allow explicit overrides for custom installs.
+EIGEN3_DIR="${EIGEN3_DIR:-${EIGEN3_SHIM_DIR:-}}"
 SPOT_SDK_CMAKE_FILE="${SPOT_CPP_SDK_DIR}/cpp/CMakeLists.txt"
 ENABLE_CCACHE="${ENABLE_CCACHE:-1}"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
@@ -23,8 +24,11 @@ cmake_args=(
   -S "${ROOT_DIR}" -B "${BUILD_DIR}" -G Ninja
   -DSPOT_CPP_SDK_DIR="${SPOT_CPP_SDK_DIR}"
   -DgRPC_DIR="${GRPC_SHIM_DIR}"
-  -DEigen3_DIR="${EIGEN3_SHIM_DIR}"
 )
+
+if [[ -n "${EIGEN3_DIR}" ]]; then
+  cmake_args+=(-DEigen3_DIR="${EIGEN3_DIR}")
+fi
 
 if [[ "${ENABLE_CCACHE}" == "1" ]] && command -v ccache >/dev/null 2>&1; then
   cmake_args+=(
