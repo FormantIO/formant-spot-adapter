@@ -1168,8 +1168,8 @@ void publish_cached_image_loop(FormantAgentClient* agent,
 
     const long long now = now_ms();
     last_attempted_version = version;
-    const bool ok = agent->PostImage(stream, "image/jpeg", *frame, post_timeout_ms);
-    if (ok) {
+    const auto result = agent->PostImage(stream, "image/jpeg", *frame, post_timeout_ms);
+    if (result.ok) {
       post_backoff_ms = 0;
       next_post_allowed_ms = 0;
       // Repeat the most recent JPEG at the configured stream cadence so downstream
@@ -1178,9 +1178,14 @@ void publish_cached_image_loop(FormantAgentClient* agent,
       next_keepalive_ms = now + output_period_ms;
       last_published_version = version;
     } else {
-      post_backoff_ms =
-          std::min(500, std::max(100, post_backoff_ms == 0 ? 100 : post_backoff_ms * 2));
-      next_post_allowed_ms = now + post_backoff_ms;
+      if (result.retry_after_ms > now) {
+        post_backoff_ms = 0;
+        next_post_allowed_ms = result.retry_after_ms;
+      } else {
+        post_backoff_ms =
+            std::min(500, std::max(100, post_backoff_ms == 0 ? 100 : post_backoff_ms * 2));
+        next_post_allowed_ms = now + post_backoff_ms;
+      }
     }
   }
 }
@@ -3768,27 +3773,33 @@ void Adapter::FlushQueuedStatus(long long now) {
   }
 
   for (const auto& o : out) {
-    bool ok = false;
+    FormantAgentClient::PostResult result;
     if (o.kind == PendingStatusDatapoint::Kind::kText) {
-      ok = agent_.PostText(o.stream, o.text_value);
+      result = agent_.PostText(o.stream, o.text_value);
     } else if (o.kind == PendingStatusDatapoint::Kind::kNumeric) {
-      ok = agent_.PostNumeric(o.stream, o.numeric_value);
+      result = agent_.PostNumeric(o.stream, o.numeric_value);
     } else {
-      ok = agent_.PostBitset(o.stream, o.bitset_value);
+      result = agent_.PostBitset(o.stream, o.bitset_value);
     }
 
     std::lock_guard<std::mutex> lk(status_queue_mu_);
     auto it = status_queue_.find(o.stream);
     if (it == status_queue_.end()) continue;
     auto& dp = it->second;
-    if (ok) {
+    if (result.ok) {
       dp.pending = false;
       dp.backoff_ms = 1000;
       dp.retry_after_ms = 0;
     } else {
-      const int cur = std::max(250, dp.backoff_ms);
-      dp.retry_after_ms = now + cur;
-      dp.backoff_ms = std::min(10000, cur * 2);
+      if (result.retry_after_ms > now) {
+        const long long retry_delay_ms = result.retry_after_ms - now;
+        dp.retry_after_ms = result.retry_after_ms;
+        dp.backoff_ms = std::min(30000, std::max(1000, static_cast<int>(retry_delay_ms)));
+      } else {
+        const int cur = std::max(250, dp.backoff_ms);
+        dp.retry_after_ms = now + cur;
+        dp.backoff_ms = std::min(10000, cur * 2);
+      }
     }
   }
 
@@ -3846,8 +3857,8 @@ void Adapter::FlushAdapterLogStream(long long now) {
     payload = adapter_log_pending_payload_;
   }
 
-  const bool ok = agent_.PostText(kAdapterLogStream, payload);
-  if (ok) {
+  const auto result = agent_.PostText(kAdapterLogStream, payload);
+  if (result.ok) {
     std::lock_guard<std::mutex> lk(adapter_log_mu_);
     adapter_log_pending_payload_.clear();
     adapter_log_backoff_ms_ = 1000;
@@ -3856,10 +3867,16 @@ void Adapter::FlushAdapterLogStream(long long now) {
     return;
   }
 
-  const int cur_backoff = adapter_log_backoff_ms_.load();
-  const int next_backoff = std::min(10000, cur_backoff * 2);
-  adapter_log_backoff_ms_ = next_backoff;
-  adapter_log_retry_after_ms_ = now + cur_backoff;
+  if (result.retry_after_ms > now) {
+    const long long retry_delay_ms = result.retry_after_ms - now;
+    adapter_log_backoff_ms_ = std::min(30000, std::max(1000, static_cast<int>(retry_delay_ms)));
+    adapter_log_retry_after_ms_ = result.retry_after_ms;
+  } else {
+    const int cur_backoff = adapter_log_backoff_ms_.load();
+    const int next_backoff = std::min(10000, cur_backoff * 2);
+    adapter_log_backoff_ms_ = next_backoff;
+    adapter_log_retry_after_ms_ = now + cur_backoff;
+  }
   last_adapter_log_pub_ms_ = now;
 }
 
@@ -5838,20 +5855,27 @@ void Adapter::MaybePublishGraphNavMap(long long now) {
   // The current vendored datapoint proto has no top-level Datapoint.map field.
   // Keep the dedicated map stream isolated here so switching to agent_.PostMap(...)
   // is a transport-only change when the upstream proto surface catches up.
-  const bool ok = agent_.PostLocalization(
+  const auto result = agent_.PostLocalization(
       cfg_.graphnav_map_stream,
       build_formant_localization(identity_pose, artifacts->snapshot.map,
                                  artifacts->map_uuid + ":map_only"));
-  if (ok) {
+  if (result.ok) {
     last_graphnav_map_posted_version_ = version;
     graphnav_map_post_backoff_ms_ = 1000;
     next_graphnav_map_post_ms_ = 0;
     return;
   }
 
-  const int backoff_ms = std::max(250, graphnav_map_post_backoff_ms_);
-  next_graphnav_map_post_ms_ = now + backoff_ms;
-  graphnav_map_post_backoff_ms_ = std::min(10000, backoff_ms * 2);
+  if (result.retry_after_ms > now) {
+    const long long retry_delay_ms = result.retry_after_ms - now;
+    next_graphnav_map_post_ms_ = result.retry_after_ms;
+    graphnav_map_post_backoff_ms_ =
+        std::min(30000, std::max(1000, static_cast<int>(retry_delay_ms)));
+  } else {
+    const int backoff_ms = std::max(250, graphnav_map_post_backoff_ms_);
+    next_graphnav_map_post_ms_ = now + backoff_ms;
+    graphnav_map_post_backoff_ms_ = std::min(10000, backoff_ms * 2);
+  }
 }
 
 void Adapter::PublishCurrentMapText(bool force) {

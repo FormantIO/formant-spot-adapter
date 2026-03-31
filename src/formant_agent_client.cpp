@@ -6,6 +6,23 @@
 
 namespace fsa {
 
+namespace {
+
+constexpr int kThrottleInitialBackoffMs = 500;
+constexpr int kThrottleMaxBackoffMs = 30000;
+constexpr int kThrottlePaddingMinMs = 100;
+constexpr int kSuccessesBeforeSpeedup = 8;
+constexpr int kSpeedupMinStepMs = 50;
+
+bool is_throttle_status(const grpc::Status& status) {
+  if (status.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED) return true;
+  const std::string message = status.error_message();
+  return message.find("throttl") != std::string::npos ||
+         message.find("rate limit") != std::string::npos;
+}
+
+}  // namespace
+
 FormantAgentClient::FormantAgentClient(const std::string& target)
     : target_(target),
       stub_(v1::agent::Agent::NewStub(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()))) {
@@ -31,8 +48,97 @@ void FormantAgentClient::SleepWithBackoff(int attempt) const {
   }
 }
 
-bool FormantAgentClient::PostImage(const std::string& stream, const std::string& content_type,
-                                   const std::string& bytes, int timeout_ms) {
+FormantAgentClient::PostResult FormantAgentClient::BeginPost(const std::string& stream) {
+  PostResult result;
+  const long long now = NowMs();
+  std::lock_guard<std::mutex> lk(throttle_mu_);
+  auto it = stream_throttle_state_.find(stream);
+  if (it == stream_throttle_state_.end()) return result;
+  if (now < it->second.next_allowed_ms) {
+    result.throttled = true;
+    result.locally_suppressed = true;
+    result.retry_after_ms = it->second.next_allowed_ms;
+  }
+  return result;
+}
+
+void FormantAgentClient::RecordPostSuccess(const std::string& stream) {
+  const long long now = NowMs();
+  std::lock_guard<std::mutex> lk(throttle_mu_);
+  auto& state = stream_throttle_state_[stream];
+  state.last_success_ms = now;
+  if (state.learned_interval_ms > 0) {
+    state.success_streak += 1;
+    if (state.success_streak >= kSuccessesBeforeSpeedup) {
+      const int speedup_ms =
+          std::max(kSpeedupMinStepMs, state.learned_interval_ms / 10);
+      state.learned_interval_ms =
+          std::max(0, state.learned_interval_ms - speedup_ms);
+      state.success_streak = 0;
+    }
+    state.next_allowed_ms = now + state.learned_interval_ms;
+  } else {
+    state.success_streak = 0;
+    state.next_allowed_ms = 0;
+  }
+}
+
+FormantAgentClient::PostResult FormantAgentClient::RecordPostFailure(
+    const std::string& stream, const grpc::Status& status, const char* method_name) {
+  PostResult result;
+  result.grpc_code = static_cast<int>(status.error_code());
+  if (is_throttle_status(status)) {
+    const long long now = NowMs();
+    int learned_interval_ms = kThrottleInitialBackoffMs;
+    {
+      std::lock_guard<std::mutex> lk(throttle_mu_);
+      auto& state = stream_throttle_state_[stream];
+      const int current_interval_ms = std::max(0, state.learned_interval_ms);
+      int candidate_interval_ms =
+          current_interval_ms > 0
+              ? std::min(kThrottleMaxBackoffMs,
+                         current_interval_ms + std::max(kThrottlePaddingMinMs,
+                                                        current_interval_ms / 2))
+              : kThrottleInitialBackoffMs;
+      if (state.last_success_ms > 0 && now > state.last_success_ms) {
+        const int observed_interval_ms = static_cast<int>(now - state.last_success_ms);
+        const int padded_interval_ms =
+            observed_interval_ms +
+            std::max(kThrottlePaddingMinMs, observed_interval_ms / 4);
+        candidate_interval_ms =
+            std::max(candidate_interval_ms, padded_interval_ms);
+      }
+      learned_interval_ms =
+          std::min(kThrottleMaxBackoffMs, candidate_interval_ms);
+      state.learned_interval_ms = learned_interval_ms;
+      state.success_streak = 0;
+      state.next_allowed_ms = now + learned_interval_ms;
+      result.retry_after_ms = state.next_allowed_ms;
+    }
+    result.throttled = true;
+    std::cerr << "[formant] " << method_name
+              << " throttled stream=" << stream
+              << " target=" << target_
+              << " grpc_code=" << result.grpc_code
+              << " learned_interval_ms=" << learned_interval_ms
+              << " msg=" << status.error_message() << std::endl;
+    return result;
+  }
+
+  std::cerr << "[formant] " << method_name
+            << " failed stream=" << stream
+            << " target=" << target_
+            << " grpc_code=" << result.grpc_code
+            << " msg=" << status.error_message() << std::endl;
+  return result;
+}
+
+FormantAgentClient::PostResult FormantAgentClient::PostImage(
+    const std::string& stream, const std::string& content_type,
+    const std::string& bytes, int timeout_ms) {
+  PostResult result = BeginPost(stream);
+  if (result.locally_suppressed) return result;
+
   v1::model::Datapoint dp;
   dp.set_stream(stream);
   dp.set_timestamp(NowMs());
@@ -45,17 +151,19 @@ bool FormantAgentClient::PostImage(const std::string& stream, const std::string&
                    std::chrono::milliseconds(clamped_timeout_ms));
   v1::agent::PostDataResponse resp;
   auto s = stub_->PostData(&ctx, dp, &resp);
-  if (!s.ok()) {
-    std::cerr << "[formant] PostImage failed stream=" << stream
-              << " target=" << target_
-              << " timeout_ms=" << clamped_timeout_ms
-              << " grpc_code=" << static_cast<int>(s.error_code())
-              << " msg=" << s.error_message() << std::endl;
+  if (s.ok()) {
+    RecordPostSuccess(stream);
+    result.ok = true;
+    return result;
   }
-  return s.ok();
+  return RecordPostFailure(stream, s, "PostImage");
 }
 
-bool FormantAgentClient::PostNumeric(const std::string& stream, double value) {
+FormantAgentClient::PostResult FormantAgentClient::PostNumeric(
+    const std::string& stream, double value) {
+  PostResult result = BeginPost(stream);
+  if (result.locally_suppressed) return result;
+
   std::lock_guard<std::mutex> lk(post_mu_);
   v1::model::Datapoint dp;
   dp.set_stream(stream);
@@ -66,16 +174,19 @@ bool FormantAgentClient::PostNumeric(const std::string& stream, double value) {
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
   v1::agent::PostDataResponse resp;
   auto s = stub_->PostData(&ctx, dp, &resp);
-  if (!s.ok()) {
-    std::cerr << "[formant] PostNumeric failed stream=" << stream
-              << " target=" << target_
-              << " grpc_code=" << static_cast<int>(s.error_code())
-              << " msg=" << s.error_message() << std::endl;
+  if (s.ok()) {
+    RecordPostSuccess(stream);
+    result.ok = true;
+    return result;
   }
-  return s.ok();
+  return RecordPostFailure(stream, s, "PostNumeric");
 }
 
-bool FormantAgentClient::PostText(const std::string& stream, const std::string& value) {
+FormantAgentClient::PostResult FormantAgentClient::PostText(
+    const std::string& stream, const std::string& value) {
+  PostResult result = BeginPost(stream);
+  if (result.locally_suppressed) return result;
+
   std::lock_guard<std::mutex> lk(post_mu_);
   v1::model::Datapoint dp;
   dp.set_stream(stream);
@@ -86,17 +197,19 @@ bool FormantAgentClient::PostText(const std::string& stream, const std::string& 
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
   v1::agent::PostDataResponse resp;
   auto s = stub_->PostData(&ctx, dp, &resp);
-  if (!s.ok()) {
-    std::cerr << "[formant] PostText failed stream=" << stream
-              << " target=" << target_
-              << " grpc_code=" << static_cast<int>(s.error_code())
-              << " msg=" << s.error_message() << std::endl;
+  if (s.ok()) {
+    RecordPostSuccess(stream);
+    result.ok = true;
+    return result;
   }
-  return s.ok();
+  return RecordPostFailure(stream, s, "PostText");
 }
 
-bool FormantAgentClient::PostLocalization(const std::string& stream,
-                                          const v1::model::Localization& localization) {
+FormantAgentClient::PostResult FormantAgentClient::PostLocalization(
+    const std::string& stream, const v1::model::Localization& localization) {
+  PostResult result = BeginPost(stream);
+  if (result.locally_suppressed) return result;
+
   std::lock_guard<std::mutex> lk(post_mu_);
   v1::model::Datapoint dp;
   dp.set_stream(stream);
@@ -107,16 +220,19 @@ bool FormantAgentClient::PostLocalization(const std::string& stream,
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(1000));
   v1::agent::PostDataResponse resp;
   auto s = stub_->PostData(&ctx, dp, &resp);
-  if (!s.ok()) {
-    std::cerr << "[formant] PostLocalization failed stream=" << stream
-              << " target=" << target_
-              << " grpc_code=" << static_cast<int>(s.error_code())
-              << " msg=" << s.error_message() << std::endl;
+  if (s.ok()) {
+    RecordPostSuccess(stream);
+    result.ok = true;
+    return result;
   }
-  return s.ok();
+  return RecordPostFailure(stream, s, "PostLocalization");
 }
 
-bool FormantAgentClient::PostBitset(const std::string& stream, const std::vector<std::pair<std::string, bool>>& bits) {
+FormantAgentClient::PostResult FormantAgentClient::PostBitset(
+    const std::string& stream, const std::vector<std::pair<std::string, bool>>& bits) {
+  PostResult result = BeginPost(stream);
+  if (result.locally_suppressed) return result;
+
   std::lock_guard<std::mutex> lk(post_mu_);
   v1::model::Datapoint dp;
   dp.set_stream(stream);
@@ -131,13 +247,12 @@ bool FormantAgentClient::PostBitset(const std::string& stream, const std::vector
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
   v1::agent::PostDataResponse resp;
   auto s = stub_->PostData(&ctx, dp, &resp);
-  if (!s.ok()) {
-    std::cerr << "[formant] PostBitset failed stream=" << stream
-              << " target=" << target_
-              << " grpc_code=" << static_cast<int>(s.error_code())
-              << " msg=" << s.error_message() << std::endl;
+  if (s.ok()) {
+    RecordPostSuccess(stream);
+    result.ok = true;
+    return result;
   }
-  return s.ok();
+  return RecordPostFailure(stream, s, "PostBitset");
 }
 
 bool FormantAgentClient::SendCommandResponse(const std::string& request_id, bool success) {
