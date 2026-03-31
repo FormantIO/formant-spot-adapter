@@ -11,6 +11,7 @@
   "frontImageStreamName": "spot.front.image",
   "frontImageFps": 15,
   "frontImagePollHz": 15,
+  "frontImageRollDegrees": 90,
   "localizationImageStreamName": "spot.localization.graphnav.image",
   "localizationImageFps": 15,
   "localizationImagePollHz": 2,

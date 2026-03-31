@@ -109,9 +109,8 @@ value in `streamControls`.
 - `spot.left.image`, `spot.right.image`, and `spot.back.image` use the same cached-frame publish
   pattern: the adapter polls Spot at a lower configured rate, then republishes the latest JPEG at a
   stable output FPS. The right camera is rotated 180 degrees by default.
-- `spot.front.image` auto-selects the best 90-degree roll for the active front-fisheye calibration
-  when `frontImageRollDegrees` is omitted. Set `frontImageRollDegrees` only to force a manual
-  override for a specific robot.
+- `spot.front.image` is rotated 90 degrees clockwise by default. Set
+  `frontImageRollDegrees` only to override that default for a specific robot.
 - If lease is already held, adapter attempts takeover (`TakeLease`) to recover from stale owners.
 - On teleop inactivity: sends zero velocity, stows arm, then returns lease unless GraphNav nav is active.
 - Heartbeat timeout behavior is zero-velocity only (no auto-sit).
