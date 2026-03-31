@@ -564,15 +564,6 @@ std::string build_front_stitch_calibration_signature(const SpotClient::ImageFram
   return oss.str();
 }
 
-std::string build_front_stitch_signature(const SpotClient::ImageFrame& left,
-                                         const SpotClient::ImageFrame& right,
-                                         int roll_quarter_turns) {
-  std::ostringstream oss;
-  oss << build_front_stitch_calibration_signature(left, right);
-  oss << "#roll=" << roll_quarter_turns;
-  return oss.str();
-}
-
 int normalize_front_roll_quarter_turns(int roll_degrees) {
   const int normalized = ((roll_degrees % 360) + 360) % 360;
   return ((normalized + 45) / 90) % 4;
@@ -603,34 +594,6 @@ int front_roll_preference_rank(int roll_quarter_turns) {
     case 2:
     default:
       return 3;
-  }
-}
-
-void rotate_virtual_axes_quarter_turns(const Vec3d& input_right,
-                                       const Vec3d& input_down,
-                                       int roll_quarter_turns,
-                                       Vec3d* out_right,
-                                       Vec3d* out_down) {
-  if (!out_right || !out_down) return;
-  const int normalized = (roll_quarter_turns % 4 + 4) % 4;
-  switch (normalized) {
-    case 1:
-      *out_right = scale_vec(input_down, -1.0);
-      *out_down = input_right;
-      return;
-    case 2:
-      *out_right = scale_vec(input_right, -1.0);
-      *out_down = scale_vec(input_down, -1.0);
-      return;
-    case 3:
-      *out_right = input_down;
-      *out_down = scale_vec(input_right, -1.0);
-      return;
-    case 0:
-    default:
-      *out_right = input_right;
-      *out_down = input_down;
-      return;
   }
 }
 
@@ -766,7 +729,6 @@ bool project_camera_ray_to_pixel(const SpotClient::ImageFrame& frame,
 
 bool build_front_stitch_artifacts(const SpotClient::ImageFrame& left,
                                   const SpotClient::ImageFrame& right,
-                                  int roll_quarter_turns,
                                   FrontStitchArtifacts* out_artifacts,
                                   std::string* out_error) {
   if (!out_artifacts) return false;
@@ -800,9 +762,6 @@ bool build_front_stitch_artifacts(const SpotClient::ImageFrame& left,
     body_right = scale_vec(body_right, -1.0);
     body_down = scale_vec(body_down, -1.0);
   }
-  rotate_virtual_axes_quarter_turns(body_right, body_down, roll_quarter_turns,
-                                    &body_right, &body_down);
-
   const cv::Matx33d body_R_virtual(
       body_right.x, body_down.x, body_forward_hint.x,
       body_right.y, body_down.y, body_forward_hint.y,
@@ -820,7 +779,7 @@ bool build_front_stitch_artifacts(const SpotClient::ImageFrame& left,
   const double cy = (static_cast<double>(kOutputHeight) - 1.0) * 0.5;
 
   FrontStitchArtifacts artifacts;
-  artifacts.signature = build_front_stitch_signature(left, right, roll_quarter_turns);
+  artifacts.signature = build_front_stitch_calibration_signature(left, right);
   artifacts.left_map_x = cv::Mat(kOutputHeight, kOutputWidth, CV_32FC1, cv::Scalar(0));
   artifacts.left_map_y = cv::Mat(kOutputHeight, kOutputWidth, CV_32FC1, cv::Scalar(0));
   artifacts.right_map_x = cv::Mat(kOutputHeight, kOutputWidth, CV_32FC1, cv::Scalar(0));
@@ -863,9 +822,32 @@ bool build_front_stitch_artifacts(const SpotClient::ImageFrame& left,
   return true;
 }
 
+bool rotate_image_quarter_turns(const cv::Mat& input,
+                                int roll_quarter_turns,
+                                cv::Mat* out_image) {
+  if (!out_image || input.empty()) return false;
+  const int normalized = (roll_quarter_turns % 4 + 4) % 4;
+  switch (normalized) {
+    case 1:
+      cv::rotate(input, *out_image, cv::ROTATE_90_CLOCKWISE);
+      return true;
+    case 2:
+      cv::rotate(input, *out_image, cv::ROTATE_180);
+      return true;
+    case 3:
+      cv::rotate(input, *out_image, cv::ROTATE_90_COUNTERCLOCKWISE);
+      return true;
+    case 0:
+    default:
+      *out_image = input.clone();
+      return true;
+  }
+}
+
 bool render_front_stitched_image(const FrontStitchArtifacts& artifacts,
                                  const cv::Mat* left_image,
                                  const cv::Mat* right_image,
+                                 int roll_quarter_turns,
                                  cv::Mat* out_image,
                                  cv::Mat* out_valid_mask) {
   if (!out_image) return false;
@@ -918,19 +900,21 @@ bool render_front_stitched_image(const FrontStitchArtifacts& artifacts,
     }
   }
 
-  *out_image = std::move(composite);
+  if (!rotate_image_quarter_turns(composite, roll_quarter_turns, out_image)) return false;
   if (out_valid_mask) {
-    *out_valid_mask = std::move(valid_mask);
+    if (!rotate_image_quarter_turns(valid_mask, roll_quarter_turns, out_valid_mask)) return false;
   }
   return true;
 }
 
 double score_front_stitched_image(const FrontStitchArtifacts& artifacts,
                                   const cv::Mat& left_image,
-                                  const cv::Mat& right_image) {
+                                  const cv::Mat& right_image,
+                                  int roll_quarter_turns) {
   cv::Mat composite;
   cv::Mat valid_mask;
-  if (!render_front_stitched_image(artifacts, &left_image, &right_image, &composite, &valid_mask)) {
+  if (!render_front_stitched_image(artifacts, &left_image, &right_image,
+                                   roll_quarter_turns, &composite, &valid_mask)) {
     return -std::numeric_limits<double>::infinity();
   }
 
@@ -981,21 +965,21 @@ FrontRollAutoSelection auto_select_front_roll(const SpotClient::ImageFrame& left
                                               const cv::Mat& left_image,
                                               const cv::Mat& right_image) {
   FrontRollAutoSelection selection;
+  FrontStitchArtifacts base_artifacts;
+  std::string error;
+  if (!build_front_stitch_artifacts(left_frame, right_frame, &base_artifacts, &error)) {
+    return selection;
+  }
   for (int roll_quarter_turns = 0; roll_quarter_turns < 4; ++roll_quarter_turns) {
-    FrontStitchArtifacts candidate_artifacts;
-    std::string error;
-    if (!build_front_stitch_artifacts(left_frame, right_frame, roll_quarter_turns,
-                                      &candidate_artifacts, &error)) {
-      continue;
-    }
-    const double score = score_front_stitched_image(candidate_artifacts, left_image, right_image);
+    const double score =
+        score_front_stitched_image(base_artifacts, left_image, right_image, roll_quarter_turns);
     selection.candidate_scores[roll_quarter_turns] = score;
     if (front_roll_score_is_better(score, roll_quarter_turns,
                                    selection.score, selection.roll_quarter_turns)) {
       selection.valid = true;
       selection.roll_quarter_turns = roll_quarter_turns;
       selection.score = score;
-      selection.artifacts = std::move(candidate_artifacts);
+      selection.artifacts = base_artifacts;
     }
   }
   return selection;
@@ -1021,6 +1005,7 @@ std::string describe_front_roll_scores(const FrontRollAutoSelection& selection) 
 bool render_front_stitched_jpeg(const FrontStitchArtifacts& artifacts,
                                 const cv::Mat* left_image,
                                 const cv::Mat* right_image,
+                                int roll_quarter_turns,
                                 const std::string& status_title,
                                 const std::string& status_detail,
                                 std::string* out_jpg) {
@@ -1032,7 +1017,8 @@ bool render_front_stitched_jpeg(const FrontStitchArtifacts& artifacts,
   }
 
   cv::Mat composite;
-  if (!render_front_stitched_image(artifacts, left_image, right_image, &composite, nullptr)) {
+  if (!render_front_stitched_image(artifacts, left_image, right_image,
+                                   roll_quarter_turns, &composite, nullptr)) {
     return false;
   }
 
@@ -1064,15 +1050,16 @@ bool write_front_stitch_debug_bundle(const SpotClient::ImageFrame& left_frame,
   if (!write_binary_file(debug_dir / "left_raw.jpg", left_frame.encoded_image)) return false;
   if (!write_binary_file(debug_dir / "right_raw.jpg", right_frame.encoded_image)) return false;
 
+  FrontStitchArtifacts debug_artifacts;
+  std::string base_error;
+  if (!build_front_stitch_artifacts(left_frame, right_frame, &debug_artifacts, &base_error)) {
+    return false;
+  }
+
   for (int roll_quarter_turns = 0; roll_quarter_turns < 4; ++roll_quarter_turns) {
-    FrontStitchArtifacts debug_artifacts;
-    std::string error;
-    if (!build_front_stitch_artifacts(left_frame, right_frame, roll_quarter_turns,
-                                      &debug_artifacts, &error)) {
-      continue;
-    }
     std::string output_jpg;
     if (!render_front_stitched_jpeg(debug_artifacts, &left_image, &right_image,
+                                    roll_quarter_turns,
                                     std::string(), std::string(), &output_jpg)) {
       continue;
     }
@@ -2529,13 +2516,10 @@ void Adapter::FrontImageLoop(const std::string& stream, int fps, int poll_hz) {
 
       if (manual_roll_override && can_build_artifacts) {
         selected_roll_quarter_turns = configured_roll_quarter_turns;
-        const std::string signature =
-            build_front_stitch_signature(*left_frame, *right_frame, selected_roll_quarter_turns);
-        if (!have_artifacts || artifacts.signature != signature) {
+        if (!have_artifacts || selected_calibration_signature != calibration_signature) {
           FrontStitchArtifacts new_artifacts;
           std::string build_error;
           if (build_front_stitch_artifacts(*left_frame, *right_frame,
-                                           selected_roll_quarter_turns,
                                            &new_artifacts, &build_error)) {
             artifacts = std::move(new_artifacts);
             have_artifacts = true;
@@ -2591,6 +2575,7 @@ void Adapter::FrontImageLoop(const std::string& stream, int fps, int poll_hz) {
         if (render_front_stitched_jpeg(artifacts,
                                        have_left_image ? &left_image : nullptr,
                                        have_right_image ? &right_image : nullptr,
+                                       selected_roll_quarter_turns,
                                        std::string(),
                                        std::string(),
                                        &output_jpg)) {
