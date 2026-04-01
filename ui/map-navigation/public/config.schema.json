@@ -20,9 +20,9 @@
     },
     "graphnavMetadataStreamName": {
       "title": "GraphNav Metadata Stream",
-      "description": "Waypoint and edge metadata for overlay rendering.",
+      "description": "Optional waypoint and edge overlay stream. Leave blank unless you have a small UI-safe metadata stream.",
       "type": "string",
-      "default": "spot.graphnav.metadata",
+      "default": "",
       "$formant.streams.byType": "text"
     },
     "navStateStreamName": {
@@ -47,7 +47,7 @@
     },
     "showWaypointLabels": {
       "title": "Show Waypoint Labels",
-      "description": "Render waypoint labels on the map overlay.",
+      "description": "Render waypoint labels when an overlay stream is configured.",
       "type": "boolean",
       "default": true
     },

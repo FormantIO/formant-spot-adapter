@@ -56,7 +56,7 @@ const theme = createTheme({
 const defaultConfig: ModuleConfig = {
   mapImageStreamName: "spot.localization.graphnav.global.image",
   mapImageMetadataStreamName: "spot.localization.graphnav.global.image.meta",
-  graphnavMetadataStreamName: "spot.graphnav.metadata",
+  graphnavMetadataStreamName: "",
   navStateStreamName: "spot.nav.state",
   gotoPoseCommandName: "spot.graphnav.goto_pose",
   pollIntervalMs: 2500,
@@ -564,6 +564,14 @@ export default function App() {
                   <Typography variant="body2">
                     Nav state: {formatClock(snapshot.navStateTime)}
                   </Typography>
+                  <Typography variant="body2">
+                    Overlay stream: {config.graphnavMetadataStreamName || "Disabled"}
+                  </Typography>
+                  {snapshot.warnings?.map((warning) => (
+                    <Alert key={warning} severity="warning" sx={{ py: 0 }}>
+                      {warning}
+                    </Alert>
+                  ))}
                   {!commandConfigured ? (
                     <Alert severity="warning" sx={{ py: 0 }}>
                       Missing command <code>{config.gotoPoseCommandName}</code>

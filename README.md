@@ -64,7 +64,7 @@ Additional control channels (not streams):
 | `spot.localization.graphnav.global.image` | Image (JPEG) | Rendered global GraphNav map image with waypoint overlays and live robot pose when available |
 | `spot.localization.graphnav.global.image.meta` | Text (JSON) | Companion metadata for the rendered global GraphNav image including draw rect, render scale, resolution, and `seed_tform_grid` for click-to-go UIs |
 | `spot.map.graphnav` | Localization payload carrying map-only data | Dedicated stitched GraphNav map payload for future top-level map transport |
-| `spot.graphnav.metadata` | Text (JSON) | Waypoint, edge, and related GraphNav metadata for UI overlays and id-based navigation |
+| `spot.graphnav.metadata` | Text (JSON) | Full waypoint/edge/object metadata for GraphNav maps. Useful for diagnostics, but may be too large for some iframe text-query paths; prefer a smaller UI-specific overlay stream if needed |
 | `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus latest command status and current seed-frame robot pose for external map UIs |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |
@@ -100,11 +100,13 @@ value in `streamControls`.
   stitched full-site map. See
   [`docs/formant-localization-map-analysis.md`](docs/formant-localization-map-analysis.md)
   for the implementation notes and next steps.
-- `spot.localization.graphnav.global`, `spot.map.graphnav`,
-  `spot.localization.graphnav.global.image.meta`, `spot.graphnav.metadata`, and `spot.nav.state`
-  together form the backend contract for an external GraphNav map UI.
+- `spot.localization.graphnav.global.image`, `spot.localization.graphnav.global.image.meta`, and
+  `spot.nav.state` form the core backend contract for an external GraphNav map UI.
+- `spot.graphnav.metadata` remains available as a richer diagnostic stream, but iframe-based UIs
+  should treat it as optional unless they use a transport path that safely handles larger JSON
+  payloads.
 - `ui/map-navigation` contains a GitHub Pages-hosted custom module that consumes that backend
-  contract from inside a Formant iframe, renders the global map image with overlays, and issues
+  contract from inside a Formant iframe, renders the global map image, and issues
   `spot.graphnav.goto_pose` commands from click-selected targets.
 - `spot.localization.graphnav.image` is a rendered 16:9 visualization of the same local patch with a robot
   footprint, heading arrow, scale bar, and status HUD. The adapter renders only when the Spot data

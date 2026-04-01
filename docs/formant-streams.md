@@ -144,7 +144,12 @@ If you rename a stream from its default, use the renamed stream name in `streamC
   upgraded to a true top-level map datapoint later without changing upstream map assembly logic.
 
 - `spot.graphnav.metadata` (type: text/json, every 5s + on change)
-- Waypoint, edge, and related GraphNav metadata intended for UI overlays and id-based navigation.
+- Full waypoint, edge, and related GraphNav metadata intended for diagnostics and id-based
+  navigation support.
+- For iframe-based map UIs, this stream can be too large for reliable text query paths. Prefer
+  `spot.localization.graphnav.global.image`, `spot.localization.graphnav.global.image.meta`, and
+  `spot.nav.state` as the core click-to-go contract, plus an optional smaller overlay stream if
+  waypoint rendering is required.
 
 - `spot.nav.state` (type: text/json, 1 Hz + on change)
 - High-level GraphNav navigation state for external map UIs.

@@ -121,4 +121,5 @@ export interface StreamSnapshot {
   graphnavMetadataTime?: number;
   navState?: NavState;
   navStateTime?: number;
+  warnings?: string[];
 }
