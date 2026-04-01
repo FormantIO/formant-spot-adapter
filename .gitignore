@@ -13,6 +13,8 @@ __pycache__/
 *.pyc
 ui/map-navigation/node_modules/
 ui/map-navigation/dist/
+ui/map-navigation/src/*.js
+ui/map-navigation/*.tsbuildinfo
 
 .env
 config/formant-spot-adapter.env
