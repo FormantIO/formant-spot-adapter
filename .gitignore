@@ -11,6 +11,8 @@ build_log*
 /.venv/
 __pycache__/
 *.pyc
+ui/map-navigation/node_modules/
+ui/map-navigation/dist/
 
 .env
 config/formant-spot-adapter.env

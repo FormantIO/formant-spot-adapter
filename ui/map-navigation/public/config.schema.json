@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Spot Map Navigation",
+  "description": "Configuration for the Spot GraphNav map navigation custom module.",
+  "type": "object",
+  "properties": {
+    "mapImageStreamName": {
+      "title": "Global Map Image Stream",
+      "description": "Rendered GraphNav global map image used as the display layer.",
+      "type": "string",
+      "default": "spot.localization.graphnav.global.image",
+      "$formant.streams.byType": "image"
+    },
+    "mapImageMetadataStreamName": {
+      "title": "Global Map Image Metadata Stream",
+      "description": "JSON metadata companion for the rendered global map image.",
+      "type": "string",
+      "default": "spot.localization.graphnav.global.image.meta",
+      "$formant.streams.byType": "text"
+    },
+    "graphnavMetadataStreamName": {
+      "title": "GraphNav Metadata Stream",
+      "description": "Waypoint and edge metadata for overlay rendering.",
+      "type": "string",
+      "default": "spot.graphnav.metadata",
+      "$formant.streams.byType": "text"
+    },
+    "navStateStreamName": {
+      "title": "Navigation State Stream",
+      "description": "Current GraphNav status and live seed-frame pose.",
+      "type": "string",
+      "default": "spot.nav.state",
+      "$formant.streams.byType": "text"
+    },
+    "gotoPoseCommandName": {
+      "title": "Goto Pose Command Name",
+      "description": "Command template used when sending an arbitrary map target.",
+      "type": "string",
+      "default": "spot.graphnav.goto_pose"
+    },
+    "pollIntervalMs": {
+      "title": "Refresh Interval (ms)",
+      "description": "How often the module refreshes image and state data.",
+      "type": "number",
+      "default": 2500,
+      "minimum": 500
+    },
+    "showWaypointLabels": {
+      "title": "Show Waypoint Labels",
+      "description": "Render waypoint labels on the map overlay.",
+      "type": "boolean",
+      "default": true
+    },
+    "defaultYawMode": {
+      "title": "Default Target Heading",
+      "description": "Heading applied when the user clicks a new target.",
+      "type": "string",
+      "default": "current",
+      "enum": ["current", "fixed"]
+    },
+    "defaultYawDeg": {
+      "title": "Fixed Default Heading (deg)",
+      "description": "Fallback heading used when Default Target Heading is fixed.",
+      "type": "number",
+      "default": 0
+    }
+  }
+}

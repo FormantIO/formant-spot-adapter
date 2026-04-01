@@ -103,6 +103,9 @@ value in `streamControls`.
 - `spot.localization.graphnav.global`, `spot.map.graphnav`,
   `spot.localization.graphnav.global.image.meta`, `spot.graphnav.metadata`, and `spot.nav.state`
   together form the backend contract for an external GraphNav map UI.
+- `ui/map-navigation` contains a GitHub Pages-hosted custom module that consumes that backend
+  contract from inside a Formant iframe, renders the global map image with overlays, and issues
+  `spot.graphnav.goto_pose` commands from click-selected targets.
 - `spot.localization.graphnav.image` is a rendered 16:9 visualization of the same local patch with a robot
   footprint, heading arrow, scale bar, and status HUD. The adapter renders only when the Spot data
   changes, then republishes the cached JPEG at a stable output FPS. For camera-like playback in
