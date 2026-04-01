@@ -1,4 +1,11 @@
 declare module "@formant/data-sdk" {
+  export interface RealtimeStreamSource {
+    id?: string;
+    sourceType: "realtime";
+    rosTopicName: string;
+    streamType?: string;
+  }
+
   export interface Device {
     id: string;
     name: string;
@@ -36,4 +43,17 @@ declare module "@formant/data-sdk" {
       end: string;
     }): Promise<IStreamData[]>;
   };
+
+  export class LiveUniverseData {
+    subscribeToJson(
+      deviceId: string,
+      source: RealtimeStreamSource,
+      callback: (data: unknown) => void
+    ): () => void;
+    subscribeToVideo(
+      deviceId: string,
+      source: RealtimeStreamSource,
+      callback: (canvas: HTMLCanvasElement) => void
+    ): () => void;
+  }
 }

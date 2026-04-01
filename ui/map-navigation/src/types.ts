@@ -114,6 +114,8 @@ export interface TargetPose {
 
 export interface StreamSnapshot {
   mapImageUrl?: string;
+  mapImageCanvas?: HTMLCanvasElement;
+  mapImageFrameVersion?: number;
   mapImageTime?: number;
   mapImageMetadata?: GraphNavMapImageMetadata;
   mapImageMetadataTime?: number;

@@ -16,10 +16,10 @@ import {
 import { App as FormantApp } from "@formant/data-sdk";
 import {
   authenticateAndGetDevice,
-  fetchStreamSnapshot,
   formatGotoPosePayload,
   getInitialModuleConfig,
-  parseModuleConfig
+  parseModuleConfig,
+  subscribeRealtimeSnapshot
 } from "./formant";
 import { getCanvasSize, pixelToSeed, seedToPixel } from "./mapMath";
 import {
@@ -128,6 +128,7 @@ interface MapViewProps {
 
 function MapView({ snapshot, config, selectedTarget, onSelectTarget }: MapViewProps) {
   const overlayRef = useRef<SVGSVGElement | null>(null);
+  const realtimeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvas = getCanvasSize(snapshot.mapImageMetadata);
   const waypointsById = new Map<string, { x: number; y: number; dock: boolean; label: string }>();
   if (snapshot.graphnavMetadata) {
@@ -190,6 +191,15 @@ function MapView({ snapshot, config, selectedTarget, onSelectTarget }: MapViewPr
     ? seedToPixel(snapshot.mapImageMetadata, selectedTarget.x, selectedTarget.y)
     : null;
 
+  useEffect(() => {
+    if (!snapshot.mapImageCanvas || !realtimeCanvasRef.current) return;
+    const target = realtimeCanvasRef.current;
+    target.width = snapshot.mapImageCanvas.width;
+    target.height = snapshot.mapImageCanvas.height;
+    const context = target.getContext("2d");
+    context?.drawImage(snapshot.mapImageCanvas, 0, 0);
+  }, [snapshot.mapImageCanvas, snapshot.mapImageFrameVersion]);
+
   return (
     <Box
       sx={{
@@ -201,7 +211,12 @@ function MapView({ snapshot, config, selectedTarget, onSelectTarget }: MapViewPr
           "linear-gradient(180deg, rgba(35,176,255,0.08), rgba(151,255,205,0.03))"
       }}
     >
-      {snapshot.mapImageUrl ? (
+      {snapshot.mapImageCanvas ? (
+        <canvas
+          ref={realtimeCanvasRef}
+          style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
+        />
+      ) : snapshot.mapImageUrl ? (
         <img
           alt="Spot GraphNav map"
           src={snapshot.mapImageUrl}
@@ -379,37 +394,22 @@ export default function App() {
     if (!device) return undefined;
 
     let cancelled = false;
-    let intervalId: number | undefined;
-
-    const refresh = async () => {
-      try {
-        if (!cancelled) {
-          setRefreshing(true);
-          setError(undefined);
-        }
-        const nextSnapshot = await fetchStreamSnapshot(device.id, config);
-        if (cancelled) return;
-        setSnapshot(nextSnapshot);
-      } catch (refreshError) {
-        if (cancelled) return;
-        setError(
-          refreshError instanceof Error ? refreshError.message : "Failed loading GraphNav streams."
-        );
-      } finally {
-        if (!cancelled) setRefreshing(false);
-      }
-    };
-
-    void refresh();
-    intervalId = window.setInterval(() => {
-      void refresh();
-    }, config.pollIntervalMs);
+    setRefreshing(false);
+    setError(undefined);
+    const unsubscribe = subscribeRealtimeSnapshot(device.id, config, (patch) => {
+      if (cancelled) return;
+      setSnapshot((previous) => ({
+        ...previous,
+        ...patch,
+        warnings: Array.from(
+          new Set([...(previous.warnings || []), ...((patch.warnings as string[] | undefined) || [])])
+        )
+      }));
+    });
 
     return () => {
       cancelled = true;
-      if (intervalId !== undefined) {
-        window.clearInterval(intervalId);
-      }
+      unsubscribe();
     };
   }, [device, config]);
 

@@ -6,7 +6,7 @@ This directory contains a static single-page application intended to be hosted o
 
 - Uses Formant iframe auth context via `@formant/data-sdk`
 - Resolves the current device from Formant module context
-- Loads the Spot GraphNav map image and companion metadata streams
+- Opens a Formant realtime connection and subscribes to the Spot GraphNav map image and companion metadata streams
 - Renders the live robot pose and optional waypoint overlays
 - Converts map clicks into seed-frame `(x, y, yaw)` targets
 - Sends `spot.graphnav.goto_pose` commands back through Formant

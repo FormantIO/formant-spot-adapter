@@ -40,7 +40,7 @@
     },
     "pollIntervalMs": {
       "title": "Refresh Interval (ms)",
-      "description": "How often the module refreshes image and state data.",
+      "description": "Legacy telemetry polling interval. Currently unused because the module subscribes to realtime streams.",
       "type": "number",
       "default": 2500,
       "minimum": 500
