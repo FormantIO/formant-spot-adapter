@@ -3,13 +3,10 @@ import {
   Alert,
   Box,
   Button,
-  Card,
-  CardContent,
   Chip,
   CircularProgress,
   CssBaseline,
-  Divider,
-  Link,
+  IconButton,
   Stack,
   TextField,
   ThemeProvider,
@@ -197,11 +194,9 @@ function MapView({ snapshot, config, selectedTarget, onSelectTarget }: MapViewPr
     <Box
       sx={{
         position: "relative",
-        aspectRatio: `${canvas.x} / ${canvas.y}`,
         width: "100%",
+        height: "100%",
         overflow: "hidden",
-        borderRadius: 3,
-        border: "1px solid rgba(151, 255, 205, 0.15)",
         background:
           "linear-gradient(180deg, rgba(35,176,255,0.08), rgba(151,255,205,0.03))"
       }}
@@ -324,22 +319,13 @@ function MapView({ snapshot, config, selectedTarget, onSelectTarget }: MapViewPr
   );
 }
 
-function TelemetryTimestamp({
-  label,
-  time
-}: {
-  label: string;
-  time?: number;
-}) {
-  return (
-    <Stack direction="row" justifyContent="space-between">
-      <Typography variant="body2" color="text.secondary">
-        {label}
-      </Typography>
-      <Typography variant="body2">{formatClock(time)}</Typography>
-    </Stack>
-  );
-}
+const floatingPanelSx = {
+  backdropFilter: "blur(18px)",
+  backgroundColor: "rgba(5, 16, 24, 0.78)",
+  border: "1px solid rgba(255,255,255,0.08)",
+  borderRadius: 3,
+  boxShadow: "0 18px 48px rgba(0,0,0,0.28)"
+} as const;
 
 export default function App() {
   const [device, setDevice] = useState<{ id: string; name: string }>();
@@ -350,6 +336,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [sending, setSending] = useState(false);
+  const [infoOpen, setInfoOpen] = useState(false);
   const [error, setError] = useState<string>();
   const [sendError, setSendError] = useState<string>();
   const [statusMessage, setStatusMessage] = useState<string>();
@@ -473,34 +460,46 @@ export default function App() {
       <CssBaseline />
       <Box
         sx={{
-          minHeight: "100vh",
-          background:
-            "radial-gradient(circle at top left, rgba(35,176,255,0.18), transparent 36%), radial-gradient(circle at bottom right, rgba(151,255,205,0.12), transparent 30%), #08131d",
+          width: "100vw",
+          height: "100vh",
+          backgroundColor: "#08131d",
           color: "text.primary",
-          p: { xs: 2, md: 3 }
+          overflow: "hidden"
         }}
       >
-        <Stack spacing={3}>
+        {loading ? (
           <Stack
-            direction={{ xs: "column", lg: "row" }}
+            alignItems="center"
+            justifyContent="center"
             spacing={2}
-            justifyContent="space-between"
-            alignItems={{ xs: "flex-start", lg: "center" }}
+            sx={{ width: "100%", height: "100%" }}
           >
-            <Box>
-              <Typography variant="overline" color="primary.light">
-                Spot Map Navigation
-              </Typography>
-              <Typography variant="h4">
-                {device ? device.name : "Connecting to Formant"}
-              </Typography>
-              <Typography variant="body1" color="text.secondary">
-                Hosted custom module for GraphNav map inspection and click-to-go targets.
-              </Typography>
-            </Box>
-            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-              <Chip label={device ? `Device ${device.id}` : "No device"} />
-              <Chip label={`Map ${getMapLabel(snapshot)}`} color="primary" variant="outlined" />
+            <CircularProgress size={28} color="primary" />
+            <Typography variant="body2" color="text.secondary">
+              Connecting to Formant
+            </Typography>
+          </Stack>
+        ) : (
+          <Box sx={{ position: "relative", width: "100%", height: "100%" }}>
+            <MapView
+              snapshot={snapshot}
+              config={config}
+              selectedTarget={selectedTarget}
+              onSelectTarget={setSelectedTarget}
+            />
+
+            <Stack
+              direction="row"
+              spacing={1}
+              flexWrap="wrap"
+              useFlexGap
+              sx={{ position: "absolute", top: 12, left: 12, maxWidth: "calc(100% - 80px)" }}
+            >
+              <Chip
+                label={getMapLabel(snapshot)}
+                color="primary"
+                sx={{ backgroundColor: "rgba(35,176,255,0.18)" }}
+              />
               <Chip
                 label={snapshot.navState?.localized ? "Localized" : "Not localized"}
                 color={snapshot.navState?.localized ? "secondary" : "default"}
@@ -511,170 +510,178 @@ export default function App() {
                 color={snapshot.navState?.active ? "warning" : "default"}
                 variant="outlined"
               />
+              <Chip
+                label={refreshing ? "Refreshing" : "Live"}
+                variant="outlined"
+                sx={{ borderColor: "rgba(255,255,255,0.18)" }}
+              />
             </Stack>
-          </Stack>
 
-          {loading ? (
-            <Card>
-              <CardContent>
-                <Stack direction="row" spacing={2} alignItems="center">
-                  <CircularProgress size={24} color="primary" />
-                  <Typography>Authenticating with Formant and loading module context.</Typography>
+            <IconButton
+              onClick={() => setInfoOpen((open) => !open)}
+              sx={{
+                position: "absolute",
+                top: 12,
+                right: 12,
+                width: 42,
+                height: 42,
+                color: "white",
+                ...floatingPanelSx
+              }}
+            >
+              <Typography variant="button">i</Typography>
+            </IconButton>
+
+            {infoOpen ? (
+              <Box
+                sx={{
+                  position: "absolute",
+                  top: 64,
+                  right: 12,
+                  width: { xs: "min(320px, calc(100vw - 24px))", sm: 320 },
+                  p: 1.75,
+                  ...floatingPanelSx
+                }}
+              >
+                <Stack spacing={1.25}>
+                  <Typography variant="subtitle2">Map Details</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    {device?.name || "Current device"}
+                  </Typography>
+                  <Typography variant="body2">Pose: {currentPoseLabel}</Typography>
+                  <Typography variant="body2">
+                    Status: {snapshot.navState?.status_name || "Unknown"}
+                  </Typography>
+                  <Typography variant="body2">
+                    Route: {snapshot.navState?.remaining_route_length_m?.toFixed(2) || "0.00"} m
+                  </Typography>
+                  <Typography variant="body2">
+                    Map image: {formatClock(snapshot.mapImageTime)}
+                  </Typography>
+                  <Typography variant="body2">
+                    Image metadata: {formatClock(snapshot.mapImageMetadataTime)}
+                  </Typography>
+                  <Typography variant="body2">
+                    Nav state: {formatClock(snapshot.navStateTime)}
+                  </Typography>
+                  {!commandConfigured ? (
+                    <Alert severity="warning" sx={{ py: 0 }}>
+                      Missing command <code>{config.gotoPoseCommandName}</code>
+                    </Alert>
+                  ) : null}
                 </Stack>
-              </CardContent>
-            </Card>
-          ) : null}
+              </Box>
+            ) : null}
 
-          {error ? <Alert severity="error">{error}</Alert> : null}
-          {sendError ? <Alert severity="error">{sendError}</Alert> : null}
-          {statusMessage ? <Alert severity="success">{statusMessage}</Alert> : null}
-          {!commandConfigured && device ? (
-            <Alert severity="warning">
-              The configured goto command <code>{config.gotoPoseCommandName}</code> is not in the device’s available command set.
-            </Alert>
-          ) : null}
-
-          <Box
-            sx={{
-              display: "grid",
-              gridTemplateColumns: { xs: "1fr", xl: "360px 1fr" },
-              gap: 3
-            }}
-          >
-            <Stack spacing={3}>
-              <Card>
-                <CardContent>
-                  <Stack spacing={1.5}>
-                    <Typography variant="h6">Navigation State</Typography>
-                    <TelemetryTimestamp label="Map image" time={snapshot.mapImageTime} />
-                    <TelemetryTimestamp label="Image metadata" time={snapshot.mapImageMetadataTime} />
-                    <TelemetryTimestamp label="GraphNav metadata" time={snapshot.graphnavMetadataTime} />
-                    <TelemetryTimestamp label="Nav state" time={snapshot.navStateTime} />
-                    <Divider />
-                    <Stack direction="row" justifyContent="space-between">
-                      <Typography variant="body2" color="text.secondary">
-                        Pose
-                      </Typography>
-                      <Typography variant="body2">{currentPoseLabel}</Typography>
-                    </Stack>
-                    <Stack direction="row" justifyContent="space-between">
-                      <Typography variant="body2" color="text.secondary">
-                        Status
-                      </Typography>
-                      <Typography variant="body2">
-                        {snapshot.navState?.status_name || "Unknown"}
-                      </Typography>
-                    </Stack>
-                    <Stack direction="row" justifyContent="space-between">
-                      <Typography variant="body2" color="text.secondary">
-                        Remaining route
-                      </Typography>
-                      <Typography variant="body2">
-                        {snapshot.navState?.remaining_route_length_m?.toFixed(2) || "0.00"} m
-                      </Typography>
-                    </Stack>
-                  </Stack>
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardContent>
-                  <Stack spacing={2}>
-                    <Typography variant="h6">Selected Target</Typography>
+            {selectedTarget ? (
+              <Box
+                sx={{
+                  position: "absolute",
+                  left: 12,
+                  right: 12,
+                  bottom: 12,
+                  p: 1.5,
+                  ...floatingPanelSx
+                }}
+              >
+                <Stack
+                  direction={{ xs: "column", md: "row" }}
+                  spacing={1.5}
+                  alignItems={{ md: "center" }}
+                  justifyContent="space-between"
+                >
+                  <Stack spacing={0.5} sx={{ minWidth: 0 }}>
+                    <Typography variant="subtitle2">Selected Target</Typography>
                     <Typography variant="body2" color="text.secondary">
-                      Click inside the rendered map bounds to choose a target. The module uses the adapter’s image metadata stream to convert pixels back into seed-frame coordinates.
+                      {formatPose(selectedTarget)}
                     </Typography>
-                    <Typography variant="body2">{formatPose(selectedTarget)}</Typography>
-                    <TextField
-                      label="Target heading (deg)"
-                      type="number"
-                      value={selectedTarget?.yawDeg ?? ""}
-                      onChange={handleYawChange}
-                      disabled={!selectedTarget}
-                      inputProps={{ step: 1 }}
-                    />
-                    <TextField
-                      label="Command payload preview"
-                      value={commandPayload}
-                      disabled
-                      multiline
-                      minRows={3}
-                    />
-                    <Stack direction="row" spacing={1}>
-                      <Button
-                        variant="contained"
-                        onClick={() => void handleSend()}
-                        disabled={!selectedTarget || !mapUuid || sending || !commandConfigured}
-                      >
-                        {sending ? "Sending..." : "Send goto pose"}
-                      </Button>
-                      <Button variant="outlined" onClick={() => setSelectedTarget(undefined)}>
-                        Clear
-                      </Button>
-                    </Stack>
-                  </Stack>
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardContent>
-                  <Stack spacing={1.5}>
-                    <Typography variant="h6">Module Wiring</Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      The app is designed for GitHub Pages hosting and Formant iframe embedding. Authentication comes from Formant via query context and the toolkit’s auth helpers.
-                    </Typography>
-                    <Typography variant="body2">
-                      Streams: <code>{config.mapImageStreamName}</code>, <code>{config.mapImageMetadataStreamName}</code>, <code>{config.graphnavMetadataStreamName}</code>, <code>{config.navStateStreamName}</code>
-                    </Typography>
-                    <Typography variant="body2">
-                      Command: <code>{config.gotoPoseCommandName}</code>
-                    </Typography>
-                    <Typography variant="body2">
-                      Refresh: {config.pollIntervalMs} ms
-                    </Typography>
-                    <Typography variant="body2">
-                      Config schema:{" "}
-                      <Link href="./config.schema.json" target="_blank" rel="noreferrer">
-                        ./config.schema.json
-                      </Link>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ wordBreak: "break-word" }}
+                    >
+                      {commandPayload || "No command payload"}
                     </Typography>
                   </Stack>
-                </CardContent>
-              </Card>
-            </Stack>
 
-            <Card sx={{ minHeight: 600 }}>
-              <CardContent sx={{ height: "100%" }}>
-                <Stack spacing={2} sx={{ height: "100%" }}>
                   <Stack
-                    direction={{ xs: "column", md: "row" }}
-                    justifyContent="space-between"
+                    direction={{ xs: "column", sm: "row" }}
                     spacing={1}
-                    alignItems={{ md: "center" }}
+                    alignItems={{ sm: "center" }}
                   >
-                    <Box>
-                      <Typography variant="h6">GraphNav Map</Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        Waypoints and edges come from <code>{config.graphnavMetadataStreamName}</code>; live pose and active target come from <code>{config.navStateStreamName}</code>.
-                      </Typography>
-                    </Box>
-                    <Stack direction="row" spacing={1}>
-                      <Chip label={refreshing ? "Refreshing" : "Up to date"} color={refreshing ? "warning" : "secondary"} variant="outlined" />
-                      <Chip label={snapshot.graphnavMetadata?.waypoints.length ? `${snapshot.graphnavMetadata.waypoints.length} waypoints` : "No waypoints"} />
-                    </Stack>
+                    <TextField
+                      label="Yaw"
+                      type="number"
+                      size="small"
+                      value={selectedTarget.yawDeg}
+                      onChange={handleYawChange}
+                      inputProps={{ step: 1 }}
+                      sx={{
+                        minWidth: 120,
+                        "& .MuiOutlinedInput-root": {
+                          backgroundColor: "rgba(255,255,255,0.04)"
+                        }
+                      }}
+                    />
+                    <Button
+                      variant="contained"
+                      onClick={() => void handleSend()}
+                      disabled={!mapUuid || sending || !commandConfigured}
+                    >
+                      {sending ? "Sending..." : "Go to target"}
+                    </Button>
+                    <Button variant="outlined" onClick={() => setSelectedTarget(undefined)}>
+                      Clear
+                    </Button>
                   </Stack>
-
-                  <MapView
-                    snapshot={snapshot}
-                    config={config}
-                    selectedTarget={selectedTarget}
-                    onSelectTarget={setSelectedTarget}
-                  />
                 </Stack>
-              </CardContent>
-            </Card>
+              </Box>
+            ) : (
+              <Box
+                sx={{
+                  position: "absolute",
+                  left: "50%",
+                  bottom: 12,
+                  transform: "translateX(-50%)",
+                  px: 1.5,
+                  py: 0.75,
+                  ...floatingPanelSx
+                }}
+              >
+                <Typography variant="body2" color="text.secondary">
+                  Click the map to place a target
+                </Typography>
+              </Box>
+            )}
+
+            {error ? (
+              <Alert
+                severity="error"
+                sx={{ position: "absolute", left: 12, right: 12, top: 64 }}
+              >
+                {error}
+              </Alert>
+            ) : null}
+
+            {sendError ? (
+              <Alert
+                severity="error"
+                sx={{ position: "absolute", left: 12, right: 12, bottom: selectedTarget ? 116 : 64 }}
+              >
+                {sendError}
+              </Alert>
+            ) : null}
+
+            {statusMessage ? (
+              <Alert
+                severity="success"
+                sx={{ position: "absolute", left: 12, right: 12, bottom: selectedTarget ? 116 : 64 }}
+              >
+                {statusMessage}
+              </Alert>
+            ) : null}
           </Box>
-        </Stack>
+        )}
       </Box>
     </ThemeProvider>
   );
