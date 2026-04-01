@@ -15,6 +15,7 @@ import {
 } from "@mui/material";
 import { App as FormantApp } from "@formant/data-sdk";
 import {
+  DEFAULT_MODULE_CONFIG,
   authenticateAndGetDevice,
   formatGotoPosePayload,
   getInitialModuleConfig,
@@ -52,18 +53,6 @@ const theme = createTheme({
     }
   }
 });
-
-const defaultConfig: ModuleConfig = {
-  mapImageStreamName: "spot.localization.graphnav.global.image",
-  mapImageMetadataStreamName: "spot.localization.graphnav.global.image.meta",
-  graphnavMetadataStreamName: "",
-  navStateStreamName: "spot.nav.state",
-  gotoPoseCommandName: "spot.graphnav.goto_pose",
-  pollIntervalMs: 2500,
-  showWaypointLabels: true,
-  defaultYawMode: "current",
-  defaultYawDeg: 0
-};
 
 function formatClock(timestamp?: number): string {
   if (!timestamp) return "No data yet";
@@ -344,12 +333,11 @@ const floatingPanelSx = {
 
 export default function App() {
   const [device, setDevice] = useState<{ id: string; name: string }>();
-  const [config, setConfig] = useState<ModuleConfig>(defaultConfig);
+  const [config, setConfig] = useState<ModuleConfig>(DEFAULT_MODULE_CONFIG);
   const [snapshot, setSnapshot] = useState<StreamSnapshot>({});
   const [selectedTarget, setSelectedTarget] = useState<TargetPose>();
   const [availableCommands, setAvailableCommands] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [sending, setSending] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
   const [error, setError] = useState<string>();
@@ -394,7 +382,6 @@ export default function App() {
     if (!device) return undefined;
 
     let cancelled = false;
-    setRefreshing(false);
     setError(undefined);
     const unsubscribe = subscribeRealtimeSnapshot(device.id, config, (patch) => {
       if (cancelled) return;
@@ -511,7 +498,7 @@ export default function App() {
                 variant="outlined"
               />
               <Chip
-                label={refreshing ? "Refreshing" : "Live"}
+                label="Live"
                 variant="outlined"
                 sx={{ borderColor: "rgba(255,255,255,0.18)" }}
               />

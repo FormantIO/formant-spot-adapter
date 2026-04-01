@@ -4,7 +4,6 @@ export interface ModuleConfig {
   graphnavMetadataStreamName: string;
   navStateStreamName: string;
   gotoPoseCommandName: string;
-  pollIntervalMs: number;
   showWaypointLabels: boolean;
   defaultYawMode: "current" | "fixed";
   defaultYawDeg: number;

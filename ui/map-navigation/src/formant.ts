@@ -3,7 +3,6 @@ import {
   Authentication,
   Device,
   Fleet,
-  IStreamData,
   LiveUniverseData,
   RealtimeStreamSource
 } from "@formant/data-sdk";
@@ -15,13 +14,12 @@ import {
   StreamSnapshot
 } from "./types";
 
-const DEFAULT_CONFIG: ModuleConfig = {
+export const DEFAULT_MODULE_CONFIG: ModuleConfig = {
   mapImageStreamName: "spot.localization.graphnav.global.image",
   mapImageMetadataStreamName: "spot.localization.graphnav.global.image.meta",
   graphnavMetadataStreamName: "",
   navStateStreamName: "spot.nav.state",
   gotoPoseCommandName: "spot.graphnav.goto_pose",
-  pollIntervalMs: 2500,
   showWaypointLabels: true,
   defaultYawMode: "current",
   defaultYawDeg: 0
@@ -43,16 +41,16 @@ function asBoolean(value: unknown, fallback = false): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
-function parseJsonWithFallback<T>(
-  raw: string,
-  parser: (value: Record<string, unknown>) => T
-): T | undefined {
-  try {
-    const value = JSON.parse(raw) as Record<string, unknown>;
-    return parser(value);
-  } catch {
-    return undefined;
-  }
+function asConfiguredName(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  return trimmed.includes(".") ? trimmed : fallback;
+}
+
+function asOptionalConfiguredName(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return trimmed.includes(".") ? trimmed : "";
 }
 
 function parseGraphNavMapImageMetadataValue(
@@ -117,10 +115,6 @@ function parseGraphNavMapImageMetadataValue(
   };
 }
 
-function parseGraphNavMapImageMetadata(raw: string): GraphNavMapImageMetadata | undefined {
-  return parseJsonWithFallback(raw, parseGraphNavMapImageMetadataValue);
-}
-
 function parseGraphNavMetadataValue(value: unknown): GraphNavMetadata | undefined {
   if (!isRecord(value)) return undefined;
   const waypoints = Array.isArray(value.waypoints)
@@ -160,10 +154,6 @@ function parseGraphNavMetadataValue(value: unknown): GraphNavMetadata | undefine
     waypoints,
     edges
   };
-}
-
-function parseGraphNavMetadata(raw: string): GraphNavMetadata | undefined {
-  return parseJsonWithFallback(raw, parseGraphNavMetadataValue);
 }
 
 function parseNavStateValue(value: unknown): NavState {
@@ -222,58 +212,42 @@ function parseNavStateValue(value: unknown): NavState {
   };
 }
 
-function parseNavState(raw: string): NavState {
-  return parseJsonWithFallback(raw, parseNavStateValue) || parseNavStateValue(undefined);
-}
-
-function getLastPoint(stream?: IStreamData): [number, unknown] | undefined {
-  if (!stream || stream.points.length === 0) return undefined;
-  return stream.points[stream.points.length - 1];
-}
-
 export function parseModuleConfig(raw: string | undefined): ModuleConfig {
-  if (!raw) return DEFAULT_CONFIG;
+  if (!raw) return DEFAULT_MODULE_CONFIG;
 
   try {
     const value = JSON.parse(raw) as Partial<ModuleConfig>;
     return {
-      mapImageStreamName:
-        typeof value.mapImageStreamName === "string"
-          ? value.mapImageStreamName
-          : DEFAULT_CONFIG.mapImageStreamName,
-      mapImageMetadataStreamName:
-        typeof value.mapImageMetadataStreamName === "string"
-          ? value.mapImageMetadataStreamName
-          : DEFAULT_CONFIG.mapImageMetadataStreamName,
-      graphnavMetadataStreamName:
-        typeof value.graphnavMetadataStreamName === "string"
-          ? value.graphnavMetadataStreamName
-          : DEFAULT_CONFIG.graphnavMetadataStreamName,
-      navStateStreamName:
-        typeof value.navStateStreamName === "string"
-          ? value.navStateStreamName
-          : DEFAULT_CONFIG.navStateStreamName,
-      gotoPoseCommandName:
-        typeof value.gotoPoseCommandName === "string"
-          ? value.gotoPoseCommandName
-          : DEFAULT_CONFIG.gotoPoseCommandName,
-      pollIntervalMs:
-        typeof value.pollIntervalMs === "number" && value.pollIntervalMs >= 500
-          ? value.pollIntervalMs
-          : DEFAULT_CONFIG.pollIntervalMs,
+      mapImageStreamName: asConfiguredName(
+        value.mapImageStreamName,
+        DEFAULT_MODULE_CONFIG.mapImageStreamName
+      ),
+      mapImageMetadataStreamName: asConfiguredName(
+        value.mapImageMetadataStreamName,
+        DEFAULT_MODULE_CONFIG.mapImageMetadataStreamName
+      ),
+      graphnavMetadataStreamName: asOptionalConfiguredName(value.graphnavMetadataStreamName),
+      navStateStreamName: asConfiguredName(
+        value.navStateStreamName,
+        DEFAULT_MODULE_CONFIG.navStateStreamName
+      ),
+      gotoPoseCommandName: asConfiguredName(
+        value.gotoPoseCommandName,
+        DEFAULT_MODULE_CONFIG.gotoPoseCommandName
+      ),
       showWaypointLabels:
         typeof value.showWaypointLabels === "boolean"
           ? value.showWaypointLabels
-          : DEFAULT_CONFIG.showWaypointLabels,
+          : DEFAULT_MODULE_CONFIG.showWaypointLabels,
       defaultYawMode:
-        value.defaultYawMode === "fixed" ? "fixed" : DEFAULT_CONFIG.defaultYawMode,
+        value.defaultYawMode === "fixed" ? "fixed" : DEFAULT_MODULE_CONFIG.defaultYawMode,
       defaultYawDeg:
         typeof value.defaultYawDeg === "number"
           ? value.defaultYawDeg
-          : DEFAULT_CONFIG.defaultYawDeg
+          : DEFAULT_MODULE_CONFIG.defaultYawDeg
     };
   } catch {
-    return DEFAULT_CONFIG;
+    return DEFAULT_MODULE_CONFIG;
   }
 }
 
@@ -287,74 +261,6 @@ export async function authenticateAndGetDevice(): Promise<Device> {
 
 export async function getInitialModuleConfig(): Promise<ModuleConfig> {
   return parseModuleConfig(await App.getCurrentModuleConfiguration());
-}
-
-export async function fetchStreamSnapshot(
-  deviceId: string,
-  config: ModuleConfig
-): Promise<StreamSnapshot> {
-  const end = new Date();
-  const start = new Date(end.getTime() - (5 * 60 * 1000));
-  const names = [
-    config.mapImageStreamName,
-    config.mapImageMetadataStreamName,
-    config.navStateStreamName
-  ];
-  if (config.graphnavMetadataStreamName) {
-    names.push(config.graphnavMetadataStreamName);
-  }
-  const streams = await Fleet.queryTelemetry({
-    deviceIds: [deviceId],
-    names,
-    types: ["image", "text"],
-    start: start.toISOString(),
-    end: end.toISOString()
-  });
-
-  const byName = new Map<string, IStreamData>(
-    streams.map((stream: IStreamData) => [stream.name, stream])
-  );
-
-  const mapImagePoint = getLastPoint(byName.get(config.mapImageStreamName));
-  const metaPoint = getLastPoint(byName.get(config.mapImageMetadataStreamName));
-  const graphnavPoint = config.graphnavMetadataStreamName
-    ? getLastPoint(byName.get(config.graphnavMetadataStreamName))
-    : undefined;
-  const navStatePoint = getLastPoint(byName.get(config.navStateStreamName));
-  const warnings: string[] = [];
-  const mapImageMetadata =
-    typeof metaPoint?.[1] === "string"
-      ? parseGraphNavMapImageMetadata(metaPoint[1])
-      : undefined;
-  if (typeof metaPoint?.[1] === "string" && !mapImageMetadata) {
-    warnings.push(`Could not parse ${config.mapImageMetadataStreamName}`);
-  }
-  const graphnavMetadata =
-    typeof graphnavPoint?.[1] === "string"
-      ? parseGraphNavMetadata(graphnavPoint[1])
-      : undefined;
-  if (typeof graphnavPoint?.[1] === "string" && !graphnavMetadata) {
-    warnings.push(`Could not parse ${config.graphnavMetadataStreamName}`);
-  }
-  const navState =
-    typeof navStatePoint?.[1] === "string"
-      ? parseNavState(navStatePoint[1])
-      : undefined;
-
-  return {
-    mapImageUrl:
-      isRecord(mapImagePoint?.[1]) && typeof mapImagePoint[1].url === "string"
-        ? mapImagePoint[1].url
-        : undefined,
-    mapImageTime: mapImagePoint?.[0],
-    mapImageMetadata,
-    mapImageMetadataTime: metaPoint?.[0],
-    graphnavMetadata,
-    graphnavMetadataTime: graphnavPoint?.[0],
-    navState,
-    navStateTime: navStatePoint?.[0],
-    warnings
-  };
 }
 
 function buildRealtimeSource(name: string, streamType: string): RealtimeStreamSource {

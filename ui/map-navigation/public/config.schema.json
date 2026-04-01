@@ -38,13 +38,6 @@
       "type": "string",
       "default": "spot.graphnav.goto_pose"
     },
-    "pollIntervalMs": {
-      "title": "Refresh Interval (ms)",
-      "description": "Legacy telemetry polling interval. Currently unused because the module subscribes to realtime streams.",
-      "type": "number",
-      "default": 2500,
-      "minimum": 500
-    },
     "showWaypointLabels": {
       "title": "Show Waypoint Labels",
       "description": "Render waypoint labels when an overlay stream is configured.",

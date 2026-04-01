@@ -17,6 +17,14 @@ By default the module only depends on:
 - `spot.localization.graphnav.global.image.meta`
 - `spot.nav.state`
 
+Recommended module configuration:
+
+- `Global Map Image Stream`: `spot.localization.graphnav.global.image`
+- `Global Map Image Metadata Stream`: `spot.localization.graphnav.global.image.meta`
+- `GraphNav Metadata Stream`: leave blank unless you publish a small UI-safe overlay stream
+- `Navigation State Stream`: `spot.nav.state`
+- `Goto Pose Command Name`: `spot.graphnav.goto_pose`
+
 `spot.graphnav.metadata` is optional and disabled by default because large text/json payloads can
 be truncated by downstream query paths. Only configure an overlay metadata stream if it is kept
 small enough for reliable iframe queries.
