@@ -155,7 +155,8 @@ class Adapter {
   std::string ResolveWaypointNameForIdLocked(const std::string& waypoint_id) const;
   std::string BuildCurrentMapTextLocked() const;
   std::string BuildDefaultMapTextLocked() const;
-  std::string BuildGraphNavNavStateJson() const;
+  std::string BuildGraphNavNavStateJson(
+      const SpotClient::LocalizationSnapshot* localization = nullptr) const;
   std::string EnsureActiveMapIdLocked();
   static std::string Trim(const std::string& in);
   static std::string ToLower(const std::string& in);

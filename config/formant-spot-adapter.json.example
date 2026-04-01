@@ -21,6 +21,7 @@
   "graphnavMetadataStream": "spot.graphnav.metadata",
   "graphnavNavStateStream": "spot.nav.state",
   "graphnavMapImageStreamName": "spot.localization.graphnav.global.image",
+  "graphnavMapImageMetadataStreamName": "spot.localization.graphnav.global.image.meta",
   "graphnavMapImageFps": 15,
   "graphnavMapImagePollHz": 2,
   "streamControls": [
@@ -34,6 +35,7 @@
     { "stream": "spot.localization.graphnav.global", "enabled": true },
     { "stream": "spot.map.graphnav", "enabled": true },
     { "stream": "spot.localization.graphnav.global.image", "enabled": true },
+    { "stream": "spot.localization.graphnav.global.image.meta", "enabled": true },
     { "stream": "spot.graphnav.metadata", "enabled": true },
     { "stream": "spot.nav.state", "enabled": true },
     { "stream": "spot.waypoints", "enabled": true },

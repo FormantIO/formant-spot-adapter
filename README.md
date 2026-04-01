@@ -62,9 +62,10 @@ Additional control channels (not streams):
 | `spot.localization.graphnav.image` | Image (JPEG) | Rendered local GraphNav occupancy/localization overlay image, published at stable output FPS from cached frames |
 | `spot.localization.graphnav.global` | Localization | Formant typed global GraphNav localization stream combining live seed-frame robot pose with the stitched saved-site map; default 2 Hz |
 | `spot.localization.graphnav.global.image` | Image (JPEG) | Rendered global GraphNav map image with waypoint overlays and live robot pose when available |
+| `spot.localization.graphnav.global.image.meta` | Text (JSON) | Companion metadata for the rendered global GraphNav image including draw rect, render scale, resolution, and `seed_tform_grid` for click-to-go UIs |
 | `spot.map.graphnav` | Localization payload carrying map-only data | Dedicated stitched GraphNav map payload for future top-level map transport |
 | `spot.graphnav.metadata` | Text (JSON) | Waypoint, edge, and related GraphNav metadata for UI overlays and id-based navigation |
-| `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus latest command status for external map UIs |
+| `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus latest command status and current seed-frame robot pose for external map UIs |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |
 | `spot.waypoints` | Text | Newline-separated waypoint names for the active map |
@@ -99,8 +100,9 @@ value in `streamControls`.
   stitched full-site map. See
   [`docs/formant-localization-map-analysis.md`](docs/formant-localization-map-analysis.md)
   for the implementation notes and next steps.
-- `spot.localization.graphnav.global`, `spot.map.graphnav`, `spot.graphnav.metadata`, and
-  `spot.nav.state` together form the backend contract for an external GraphNav map UI.
+- `spot.localization.graphnav.global`, `spot.map.graphnav`,
+  `spot.localization.graphnav.global.image.meta`, `spot.graphnav.metadata`, and `spot.nav.state`
+  together form the backend contract for an external GraphNav map UI.
 - `spot.localization.graphnav.image` is a rendered 16:9 visualization of the same local patch with a robot
   footprint, heading arrow, scale bar, and status HUD. The adapter renders only when the Spot data
   changes, then republishes the cached JPEG at a stable output FPS. For camera-like playback in

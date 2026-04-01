@@ -1,4 +1,5 @@
 #include "formant_spot_adapter/adapter.hpp"
+#include "formant_spot_adapter/graphnav_map_render.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1324,6 +1325,21 @@ std::string build_graphnav_map_uuid(const std::string& map_id,
 }
 
 std::string pose3d_to_json(const SpotClient::Pose3D& pose);
+SpotClient::Pose3D pose3d_from_localization_snapshot(
+    const SpotClient::LocalizationSnapshot& snapshot);
+
+GraphNavMapGeometry graphnav_map_geometry_from_snapshot(
+    const SpotClient::OccupancyGridMapSnapshot& map_snapshot) {
+  GraphNavMapGeometry geometry;
+  geometry.width = map_snapshot.width;
+  geometry.height = map_snapshot.height;
+  geometry.resolution_m = map_snapshot.resolution_m;
+  geometry.seed_tform_grid.x = map_snapshot.seed_tform_grid.x;
+  geometry.seed_tform_grid.y = map_snapshot.seed_tform_grid.y;
+  geometry.seed_tform_grid.yaw_rad =
+      quaternion_yaw_rad(pose_quaternion(map_snapshot.seed_tform_grid));
+  return geometry;
+}
 
 std::string build_graphnav_metadata_json(
     const std::string& map_id,
@@ -1388,6 +1404,61 @@ std::string build_graphnav_metadata_json(
              << "}";
   }
   metadata << "]}";
+  return metadata.str();
+}
+
+std::string build_graphnav_map_image_metadata_json(
+    const std::string& image_stream,
+    const std::string& metadata_stream,
+    const std::string& map_id,
+    const std::string& map_uuid,
+    const SpotClient::OccupancyGridMapSnapshot* map_snapshot,
+    const SpotClient::LocalizationSnapshot* localization,
+    const GraphNavMapImageLayout* layout,
+    const std::string& status_title,
+    const std::string& status_detail) {
+  std::ostringstream metadata;
+  metadata << "{\"image_stream\":\"" << json_escape(image_stream)
+           << "\",\"metadata_stream\":\"" << json_escape(metadata_stream)
+           << "\",\"has_map\":"
+           << ((map_snapshot && layout) ? "true" : "false")
+           << ",\"status_title\":\"" << json_escape(status_title)
+           << "\",\"status_detail\":\"" << json_escape(status_detail) << "\"";
+
+  metadata << ",\"map_id\":\"" << json_escape(map_id)
+           << "\",\"map_uuid\":\"" << json_escape(map_uuid) << "\"";
+
+  const bool localized = localization && !localization->waypoint_id.empty();
+  const bool has_seed_pose = localized && localization->has_seed_tform_body;
+  metadata << ",\"localized\":" << (localized ? "true" : "false")
+           << ",\"current_waypoint_id\":\""
+           << json_escape(localized ? localization->waypoint_id : std::string())
+           << "\",\"has_live_pose_overlay\":" << (has_seed_pose ? "true" : "false");
+  if (has_seed_pose) {
+    const SpotClient::Pose3D seed_tform_body = pose3d_from_localization_snapshot(*localization);
+    metadata << ",\"current_seed_x\":" << seed_tform_body.x
+             << ",\"current_seed_y\":" << seed_tform_body.y
+             << ",\"current_seed_z\":" << seed_tform_body.z
+             << ",\"current_seed_yaw_rad\":"
+             << quaternion_yaw_rad(pose_quaternion(seed_tform_body));
+  }
+
+  if (layout && map_snapshot) {
+    metadata << ",\"canvas\":{\"width\":" << layout->canvas_width
+             << ",\"height\":" << layout->canvas_height << "}"
+             << ",\"draw_rect\":{\"x\":" << layout->draw_x
+             << ",\"y\":" << layout->draw_y
+             << ",\"width\":" << layout->draw_width
+             << ",\"height\":" << layout->draw_height << "}"
+             << ",\"render_scale\":" << layout->scale
+             << ",\"map\":{\"width\":" << map_snapshot->width
+             << ",\"height\":" << map_snapshot->height
+             << ",\"resolution_m\":" << map_snapshot->resolution_m
+             << ",\"seed_tform_grid\":" << pose3d_to_json(map_snapshot->seed_tform_grid)
+             << "}";
+  }
+
+  metadata << "}";
   return metadata.str();
 }
 
@@ -1775,6 +1846,8 @@ bool Adapter::Init() {
   DisableConfiguredStreamIfDisabled(&cfg_.graphnav_nav_state_stream, "graphnav_nav_state_stream");
   DisableConfiguredStreamIfDisabled(&cfg_.graphnav_map_image_stream_name,
                                     "graphnav_map_image_stream_name");
+  DisableConfiguredStreamIfDisabled(&cfg_.graphnav_map_image_metadata_stream_name,
+                                    "graphnav_map_image_metadata_stream_name");
   DisableConfiguredStreamIfDisabled(&cfg_.waypoint_text_stream, "waypoint_text_stream");
   DisableConfiguredStreamIfDisabled(&cfg_.maps_text_stream, "maps_text_stream");
 
@@ -1870,6 +1943,20 @@ bool Adapter::Init() {
     std::cerr << "[graphnav] nav state stream config: stream="
               << cfg_.graphnav_nav_state_stream
               << " publish_hz=1"
+              << std::endl;
+  }
+  if (!cfg_.graphnav_map_image_stream_name.empty() ||
+      !cfg_.graphnav_map_image_metadata_stream_name.empty()) {
+    std::cerr << "[graphnav] global map image config: image_stream="
+              << (cfg_.graphnav_map_image_stream_name.empty()
+                      ? std::string("(disabled)")
+                      : cfg_.graphnav_map_image_stream_name)
+              << " metadata_stream="
+              << (cfg_.graphnav_map_image_metadata_stream_name.empty()
+                      ? std::string("(disabled)")
+                      : cfg_.graphnav_map_image_metadata_stream_name)
+              << " output_fps=" << std::max(1, cfg_.graphnav_map_image_fps)
+              << " data_poll_hz=" << std::max(1, cfg_.graphnav_map_image_poll_hz)
               << std::endl;
   }
   std::cerr << "[camera] surround stream config: output_fps=" << std::max(1, cfg_.surround_camera_fps)
@@ -2018,7 +2105,8 @@ void Adapter::Run() {
                                              std::max(1, cfg_.localization_image_fps),
                                              std::max(1, cfg_.localization_image_poll_hz));
   }
-  if (!cfg_.graphnav_map_image_stream_name.empty()) {
+  if (!cfg_.graphnav_map_image_stream_name.empty() ||
+      !cfg_.graphnav_map_image_metadata_stream_name.empty()) {
     graphnav_map_image_thread_ = std::thread(&Adapter::GraphNavMapImageLoop, this,
                                              cfg_.graphnav_map_image_stream_name,
                                              std::max(1, cfg_.graphnav_map_image_fps),
@@ -2862,6 +2950,8 @@ void Adapter::LocalizationImageLoop(const std::string& stream, int fps, int poll
 void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_hz) {
   const int output_period_ms = std::max(1, 1000 / std::max(1, fps));
   const int poll_period_ms = std::max(200, 1000 / std::max(1, poll_hz));
+  const bool publish_image = !stream.empty();
+  const bool publish_metadata = !cfg_.graphnav_map_image_metadata_stream_name.empty();
   CachedImageState cached_image;
 
   auto build_frame = [](const std::shared_ptr<GraphNavMapArtifacts>& artifacts,
@@ -2869,6 +2959,7 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
                         const std::unordered_set<std::string>& dock_waypoints,
                         const std::string& status_title,
                         const std::string& status_detail,
+                        GraphNavMapImageLayout* out_layout,
                         std::string* out_jpg) -> bool {
     if (!out_jpg) return false;
     const auto& palette = graphnav_image_palette();
@@ -2886,6 +2977,16 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
 
     cv::Mat canvas(kLocalizationImageHeight, kLocalizationImageWidth, CV_8UC3, palette.map_unknown);
     const auto& map = artifacts->snapshot.map;
+    const GraphNavMapGeometry geometry = graphnav_map_geometry_from_snapshot(map);
+    GraphNavMapImageLayout layout;
+    if (!BuildGraphNavMapImageLayout(geometry, kLocalizationImageWidth, kLocalizationImageHeight,
+                                     12, 12, 12, &layout)) {
+      return build_graphnav_status_frame("Waiting for saved GraphNav map",
+                                         "Waiting for a stitched GraphNav map to be available.",
+                                         "Saved GraphNav map invalid",
+                                         "The stitched map payload is missing render geometry.",
+                                         out_jpg);
+    }
     cv::Mat grid_image;
     cv::Mat occupied_mask;
     if (!rasterize_occupancy_grid(map, palette, &grid_image, &occupied_mask)) {
@@ -2896,18 +2997,7 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
                                          out_jpg);
     }
 
-    const int pad_x = 12;
-    const int pad_top = 12;
-    const int pad_bottom = 12;
-    const int available_width = std::max(1, canvas.cols - (pad_x * 2));
-    const int available_height = std::max(1, canvas.rows - pad_top - pad_bottom);
-    const double scale = std::min(static_cast<double>(available_width) / std::max(1, map.width),
-                                  static_cast<double>(available_height) / std::max(1, map.height));
-    const int draw_width = std::max(1, cvRound(map.width * scale));
-    const int draw_height = std::max(1, cvRound(map.height * scale));
-    const int draw_x = (canvas.cols - draw_width) / 2;
-    const int draw_y = pad_top + ((available_height - draw_height) / 2);
-    const cv::Rect draw_rect(draw_x, draw_y, draw_width, draw_height);
+    const cv::Rect draw_rect(layout.draw_x, layout.draw_y, layout.draw_width, layout.draw_height);
 
     cv::Mat scaled_grid;
     cv::resize(grid_image, scaled_grid, draw_rect.size(), 0.0, 0.0, cv::INTER_NEAREST);
@@ -2916,10 +3006,9 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
     draw_occupied_contours(&canvas, occupied_mask, draw_rect, palette.map_occupied_edge);
 
     auto local_to_pixel = [&](double local_x_m, double local_y_m) {
-      const double grid_x = local_x_m / map.resolution_m;
-      const double grid_y = local_y_m / map.resolution_m;
-      const double pixel_x = draw_rect.x + (grid_x * scale);
-      const double pixel_y = draw_rect.y + draw_rect.height - (grid_y * scale);
+      double pixel_x = 0.0;
+      double pixel_y = 0.0;
+      (void)GraphNavMapImageLocalToPixel(layout, local_x_m, local_y_m, &pixel_x, &pixel_y);
       return cv::Point(cvRound(pixel_x), cvRound(pixel_y));
     };
 
@@ -2960,7 +3049,7 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
       const SpotClient::Pose3D map_tform_body = compose_pose(map_tform_seed, seed_tform_body);
       const double yaw_rad = quaternion_yaw_rad(pose_quaternion(map_tform_body));
       draw_robot_pose_overlay(&canvas, local_to_pixel, map_tform_body.x, map_tform_body.y,
-                              yaw_rad, scale * 3.5, 0.14, palette.robot_fill,
+                              yaw_rad, layout.scale * 3.5, 0.14, palette.robot_fill,
                               palette.robot_outline);
     }
 
@@ -2969,23 +3058,32 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
     if (span_x_m >= 12.0) scale_bar_m = 2.0;
     if (span_x_m >= 24.0) scale_bar_m = 5.0;
     if (span_x_m >= 60.0) scale_bar_m = 10.0;
-    const int scale_bar_px = std::max(1, cvRound((scale_bar_m / map.resolution_m) * scale));
+    const int scale_bar_px =
+        std::max(1, cvRound((scale_bar_m / map.resolution_m) * layout.scale));
     draw_scale_bar(&canvas, cv::Point(draw_rect.x + 18, draw_rect.y + draw_rect.height - 18),
                    scale_bar_px, scale_bar_m, palette.text_primary, palette.robot_outline, false);
 
+    if (out_layout) *out_layout = layout;
     return encode_jpeg(canvas, out_jpg);
   };
 
-  {
+  if (publish_image) {
     auto initial = std::make_shared<std::string>();
     build_frame(nullptr, nullptr, {}, "Waiting for saved GraphNav map",
-                "Waiting for a stitched GraphNav map to be available.", initial.get());
+                "Waiting for a stitched GraphNav map to be available.",
+                nullptr, initial.get());
     update_cached_image(&cached_image, std::move(initial));
   }
 
-  std::thread sender([this, &cached_image, &stream, output_period_ms]() {
-    publish_cached_image_loop(&agent_, &running_, &cached_image, stream, output_period_ms, 250);
-  });
+  std::thread sender;
+  if (publish_image) {
+    sender = std::thread([this, &cached_image, &stream, output_period_ms]() {
+      publish_cached_image_loop(&agent_, &running_, &cached_image, stream, output_period_ms, 250);
+    });
+  }
+
+  std::string last_metadata_payload;
+  long long last_metadata_pub_ms = 0;
 
   while (running_) {
     std::shared_ptr<GraphNavMapArtifacts> artifacts;
@@ -3020,10 +3118,39 @@ void Adapter::GraphNavMapImageLoop(const std::string& stream, int fps, int poll_
       status_detail = "Stitched map loaded, but live GraphNav pose is unavailable.";
     }
 
-    auto rendered = std::make_shared<std::string>();
-    if (build_frame(artifacts, localization_ptr, dock_waypoints,
-                    status_title, status_detail, rendered.get())) {
-      update_cached_image(&cached_image, std::move(rendered));
+    GraphNavMapImageLayout render_layout;
+    GraphNavMapImageLayout* render_layout_ptr = nullptr;
+    if (publish_image) {
+      auto rendered = std::make_shared<std::string>();
+      if (build_frame(artifacts, localization_ptr, dock_waypoints,
+                      status_title, status_detail, &render_layout, rendered.get())) {
+        update_cached_image(&cached_image, std::move(rendered));
+        if (artifacts && artifacts->snapshot.has_map) render_layout_ptr = &render_layout;
+      }
+    } else if (artifacts && artifacts->snapshot.has_map) {
+      const GraphNavMapGeometry geometry =
+          graphnav_map_geometry_from_snapshot(artifacts->snapshot.map);
+      if (BuildGraphNavMapImageLayout(geometry, kLocalizationImageWidth, kLocalizationImageHeight,
+                                      12, 12, 12, &render_layout)) {
+        render_layout_ptr = &render_layout;
+      }
+    }
+
+    if (publish_metadata) {
+      const long long now = now_ms();
+      const SpotClient::OccupancyGridMapSnapshot* map_snapshot =
+          (artifacts && artifacts->snapshot.has_map) ? &artifacts->snapshot.map : nullptr;
+      const std::string payload = build_graphnav_map_image_metadata_json(
+          stream, cfg_.graphnav_map_image_metadata_stream_name,
+          artifacts ? artifacts->map_id : std::string(),
+          artifacts ? artifacts->map_uuid : std::string(),
+          map_snapshot, localization_ptr, render_layout_ptr, status_title, status_detail);
+      const bool changed = (payload != last_metadata_payload);
+      if (changed || (now - last_metadata_pub_ms) >= 5000) {
+        QueueStatusText(cfg_.graphnav_map_image_metadata_stream_name, payload);
+        last_metadata_payload = payload;
+        last_metadata_pub_ms = now;
+      }
     }
 
     const int step_ms = 50;
@@ -6036,7 +6163,8 @@ bool Adapter::ValidateGraphNavCommandMapUuid(const std::string& command_name,
   return true;
 }
 
-std::string Adapter::BuildGraphNavNavStateJson() const {
+std::string Adapter::BuildGraphNavNavStateJson(
+    const SpotClient::LocalizationSnapshot* localization) const {
   uint32_t command_id = last_graph_nav_command_id_.load();
   const bool active = graphnav_navigation_active_.load();
   const bool connected = SpotConnected();
@@ -6057,6 +6185,20 @@ std::string Adapter::BuildGraphNavNavStateJson() const {
   double waypoint_goal_yaw_rad = 0.0;
   int status = 0;
   double remaining_route_m = 0.0;
+  const bool localized = localization && !localization->waypoint_id.empty();
+  const bool has_current_seed_pose = localized && localization->has_seed_tform_body;
+  double current_seed_x = 0.0;
+  double current_seed_y = 0.0;
+  double current_seed_z = 0.0;
+  double current_seed_yaw_rad = 0.0;
+  if (has_current_seed_pose) {
+    current_seed_x = localization->seed_tform_body_x;
+    current_seed_y = localization->seed_tform_body_y;
+    current_seed_z = localization->seed_tform_body_z;
+    const SpotClient::Pose3D seed_tform_body =
+        pose3d_from_localization_snapshot(*localization);
+    current_seed_yaw_rad = quaternion_yaw_rad(pose_quaternion(seed_tform_body));
+  }
 
   {
     std::lock_guard<std::mutex> lk(nav_state_mu_);
@@ -6090,8 +6232,18 @@ std::string Adapter::BuildGraphNavNavStateJson() const {
       << ",\"target_name\":\"" << json_escape(waypoint_name) << "\""
       << ",\"map_id\":\"" << json_escape(map_id) << "\""
       << ",\"map_uuid\":\"" << json_escape(map_uuid) << "\""
+      << ",\"localized\":" << (localized ? "true" : "false")
+      << ",\"current_waypoint_id\":\""
+      << json_escape(localized ? localization->waypoint_id : std::string()) << "\""
+      << ",\"has_current_seed_pose\":" << (has_current_seed_pose ? "true" : "false")
       << ",\"has_seed_goal\":" << (has_seed_goal ? "true" : "false")
       << ",\"has_waypoint_goal\":" << (has_waypoint_goal ? "true" : "false");
+  if (has_current_seed_pose) {
+    oss << ",\"current_seed_x\":" << current_seed_x
+        << ",\"current_seed_y\":" << current_seed_y
+        << ",\"current_seed_z\":" << current_seed_z
+        << ",\"current_seed_yaw_rad\":" << current_seed_yaw_rad;
+  }
   if (has_seed_goal) {
     oss << ",\"target_seed_x\":" << seed_x
         << ",\"target_seed_y\":" << seed_y
@@ -6109,7 +6261,12 @@ std::string Adapter::BuildGraphNavNavStateJson() const {
 void Adapter::PublishGraphNavNavState(long long now) {
   if (cfg_.graphnav_nav_state_stream.empty()) return;
   const long long kPeriodicMs = 1000;
-  const std::string payload = BuildGraphNavNavStateJson();
+  SpotClient::LocalizationSnapshot localization;
+  SpotClient::LocalizationSnapshot* localization_ptr = nullptr;
+  if (SpotConnected() && spot_.GetLocalizationSnapshot(&localization)) {
+    localization_ptr = &localization;
+  }
+  const std::string payload = BuildGraphNavNavStateJson(localization_ptr);
   bool changed = false;
   {
     std::lock_guard<std::mutex> lk(nav_state_mu_);

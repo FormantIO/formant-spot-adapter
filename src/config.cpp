@@ -143,6 +143,10 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_graphnav_map_image_stream_name()) {
     c->graphnav_map_image_stream_name = j.graphnav_map_image_stream_name().value();
   }
+  if (j.has_graphnav_map_image_metadata_stream_name()) {
+    c->graphnav_map_image_metadata_stream_name =
+        j.graphnav_map_image_metadata_stream_name().value();
+  }
   if (j.has_graphnav_map_image_fps()) c->graphnav_map_image_fps = j.graphnav_map_image_fps().value();
   if (j.has_graphnav_map_image_poll_hz()) {
     c->graphnav_map_image_poll_hz = j.graphnav_map_image_poll_hz().value();
@@ -245,6 +249,9 @@ Config load_config_from_env() {
       getenv_or("GRAPHNAV_NAV_STATE_STREAM", c.graphnav_nav_state_stream);
   c.graphnav_map_image_stream_name =
       getenv_or("GRAPHNAV_MAP_IMAGE_STREAM_NAME", c.graphnav_map_image_stream_name);
+  c.graphnav_map_image_metadata_stream_name =
+      getenv_or("GRAPHNAV_MAP_IMAGE_METADATA_STREAM_NAME",
+                c.graphnav_map_image_metadata_stream_name);
   c.graphnav_map_image_fps =
       getenv_int_or("GRAPHNAV_MAP_IMAGE_FPS", c.graphnav_map_image_fps);
   c.graphnav_map_image_poll_hz =

@@ -58,6 +58,7 @@ struct Config {
   std::string graphnav_metadata_stream{"spot.graphnav.metadata"};
   std::string graphnav_nav_state_stream{"spot.nav.state"};
   std::string graphnav_map_image_stream_name{"spot.localization.graphnav.global.image"};
+  std::string graphnav_map_image_metadata_stream_name{"spot.localization.graphnav.global.image.meta"};
   int graphnav_map_image_fps{15};
   int graphnav_map_image_poll_hz{2};
   double twist_deadband{0.08};

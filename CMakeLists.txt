@@ -125,6 +125,7 @@ add_executable(formant-spot-adapter
   src/main.cpp
   src/config.cpp
   src/formant_agent_client.cpp
+  src/graphnav_map_render.cpp
   src/spot_client.cpp
   src/spot_check_client.cpp
   src/adapter.cpp
@@ -159,6 +160,19 @@ target_link_libraries(image-pull-benchmark PRIVATE
   bosdyn_client_static
   Threads::Threads
 )
+
+enable_testing()
+
+add_executable(graphnav-map-render-test
+  tests/graphnav_map_render_test.cpp
+  src/graphnav_map_render.cpp
+)
+
+target_include_directories(graphnav-map-render-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME graphnav-map-render-test COMMAND graphnav-map-render-test)
 
 # The supported service deployment path for a source checkout is scripts/deploy.sh,
 # which generates a checkout-specific unit file. Keep cmake --install limited to

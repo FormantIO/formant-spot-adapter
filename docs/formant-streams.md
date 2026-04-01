@@ -133,6 +133,12 @@ If you rename a stream from its default, use the renamed stream name in `streamC
 - Rendered global GraphNav map image with stitched occupancy, waypoint/edge overlays, and live robot
   pose when available.
 
+- `spot.localization.graphnav.global.image.meta` (type: text/json, 0.2 Hz / every 5s + on change)
+- Companion metadata for `spot.localization.graphnav.global.image`.
+- Includes `map_id`, `map_uuid`, canvas size, draw rect, render scale, map resolution, and
+  `seed_tform_grid` so a UI can convert image pixels into seed-frame navigation targets without
+  reverse-engineering the server render math.
+
 - `spot.map.graphnav` (type: localization payload carrying map-only data, on change)
 - Dedicated stitched GraphNav map payload published without a live pose so the transport can be
   upgraded to a true top-level map datapoint later without changing upstream map assembly logic.
@@ -143,7 +149,9 @@ If you rename a stream from its default, use the renamed stream name in `streamC
 - `spot.nav.state` (type: text/json, 1 Hz + on change)
 - High-level GraphNav navigation state for external map UIs.
 - Includes `active`, `command_id`, `status`, `status_name`, `mode`, `map_id`, `map_uuid`,
-  `target_waypoint_id`, `target_name`, and target pose fields when available.
+  `target_waypoint_id`, `target_name`, target pose fields when available, plus current
+  localization fields: `localized`, `current_waypoint_id`, `has_current_seed_pose`,
+  `current_seed_x`, `current_seed_y`, `current_seed_z`, and `current_seed_yaw_rad`.
 
 - `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
 - Key: `Can dock` (boolean)
