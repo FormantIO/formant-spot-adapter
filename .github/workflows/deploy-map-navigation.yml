@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/deploy-map-navigation.yml"
       - "ui/map-navigation/**"
+      - "ui/pages-index.html"
   workflow_dispatch:
 
 permissions:
@@ -41,13 +42,21 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Assemble Pages Site
+        run: |
+          rm -rf ../../pages-site
+          mkdir -p ../../pages-site/navigation
+          cp -R dist/. ../../pages-site/navigation/
+          cp ../pages-index.html ../../pages-site/index.html
+          touch ../../pages-site/.nojekyll
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ui/map-navigation/dist
+          path: pages-site
 
   deploy:
     environment:

@@ -476,7 +476,7 @@ export default function App() {
           >
             <CircularProgress size={28} color="primary" />
             <Typography variant="body2" color="text.secondary">
-              Connecting to Formant
+              Connecting
             </Typography>
           </Stack>
         ) : (
