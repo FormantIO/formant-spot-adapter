@@ -57,6 +57,7 @@ Additional control channels (not streams):
 | `spot.back.image` | Image (JPEG) | Back fisheye (`back_fisheye_image`) |
 | `spot.status` | Bitset | `Has lease`, `Robot available`, `Robot degraded`, `Teleop running`, `Teleop active`, `Docking` |
 | `spot.connection` | Text (JSON) | Spot connection health (`state`, `connected`, `degraded_non_estop`, `degraded_reason`, reconnect/attempt timestamps, last error) |
+| `spot.connection_state` | Text | One-word connection state: `disconnected`, `connecting`, `connected` |
 | `spot.localization` | Text (JSON) | GraphNav localization status (`localized`, `waypoint_id`, `error`) |
 | `spot.localization.graphnav` | Localization | Formant typed localization stream with a live occupancy-grid patch in the GraphNav seed frame; intended for the Formant localization viewer |
 | `spot.localization.graphnav.image` | Image (JPEG) | Rendered local GraphNav occupancy/localization overlay image, published at stable output FPS from cached frames |
@@ -68,14 +69,19 @@ Additional control channels (not streams):
 | `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus latest command status and current seed-frame robot pose for external map UIs |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |
+| `spot.commanded_motion_mode` | Text | One-word commanded locomotion mode: `walk`, `stairs`, `crawl` |
+| `spot.docking_state` | Text | One-word docking state: `unknown`, `docked`, `docking`, `undocked`, `undocking` |
 | `spot.waypoints` | Text | Newline-separated waypoint names for the active map |
 | `spot.waypoint.current` | Text | Waypoint name if robot is within 1 ft of a saved waypoint, else empty string; checks every 1s, publishes every 10s |
 | `spot.maps` | Text | Newline-separated saved map IDs |
 | `spot.map.current` | Text | Active/current map ID (`none` if unset); publishes every 10s and on change |
 | `spot.map.default` | Text | Default map ID (`none` if unset); publishes every 10s and on change |
 | `spot.robot_state.power` | Text (JSON) | Motor power state, estop summary, battery availability |
+| `spot.motor_power_state` | Text | One-word motor power state: `off`, `on`, `powering_on`, `powering_off`, `error`, `unknown` |
 | `spot.robot_state.battery` | Numeric | Battery percentage (0-100) when available |
 | `spot.robot_state.body_pitch_rad` | Numeric | Measured body pitch in radians (`odom` frame) |
+| `spot.behavior_state` | Text | One-word behavior state: `not_ready`, `transition`, `standing`, `stepping`, `unknown` |
+| `spot.shore_power_state` | Text | One-word shore-power state: `on`, `off`, `unknown` |
 | `spot.faults.system` | Text (JSON) | Active system faults summary |
 | `spot.faults.behavior` | Text (JSON) | Active behavior faults summary |
 | `spot.faults.service` | Text (JSON) | Active service faults summary |

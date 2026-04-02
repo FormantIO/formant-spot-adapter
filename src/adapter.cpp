@@ -84,10 +84,16 @@ std::string json_escape(const std::string& in) {
 constexpr char kGraphNavLocalizationVizStream[] = "spot.localization.graphnav";
 constexpr char kStatusStream[] = "spot.status";
 constexpr char kConnectionStream[] = "spot.connection";
+constexpr char kConnectionStateStream[] = "spot.connection_state";
 constexpr char kLocalizationStatusStream[] = "spot.localization";
+constexpr char kBehaviorStateStream[] = "spot.behavior_state";
+constexpr char kCommandedMotionModeStream[] = "spot.commanded_motion_mode";
+constexpr char kDockingStateStream[] = "spot.docking_state";
+constexpr char kMotorPowerStateStream[] = "spot.motor_power_state";
 constexpr char kRobotStatePowerStream[] = "spot.robot_state.power";
 constexpr char kRobotStateBatteryStream[] = "spot.robot_state.battery";
 constexpr char kRobotStateBodyPitchStream[] = "spot.robot_state.body_pitch_rad";
+constexpr char kShorePowerStateStream[] = "spot.shore_power_state";
 constexpr char kFaultsSystemStream[] = "spot.faults.system";
 constexpr char kFaultsBehaviorStream[] = "spot.faults.behavior";
 constexpr char kFaultsServiceStream[] = "spot.faults.service";
@@ -104,6 +110,46 @@ constexpr char kMapProgressFiducialsStream[] = "spot.map.progress.fiducials";
 
 constexpr int kLocalizationImageWidth = 1280;
 constexpr int kLocalizationImageHeight = 720;
+
+const char* connection_state_name(int raw_state) {
+  switch (raw_state) {
+    case 1:
+      return "connecting";
+    case 2:
+      return "connected";
+    case 0:
+    default:
+      return "disconnected";
+  }
+}
+
+const char* motion_mode_state_name(int raw_mode) {
+  switch (raw_mode) {
+    case kMotionModeStairs:
+      return "stairs";
+    case kMotionModeCrawl:
+      return "crawl";
+    case kMotionModeWalk:
+    default:
+      return "walk";
+  }
+}
+
+const char* docking_state_name(int status) {
+  switch (status) {
+    case ::bosdyn::api::docking::DockState_DockedStatus_DOCK_STATUS_DOCKED:
+      return "docked";
+    case ::bosdyn::api::docking::DockState_DockedStatus_DOCK_STATUS_DOCKING:
+      return "docking";
+    case ::bosdyn::api::docking::DockState_DockedStatus_DOCK_STATUS_UNDOCKED:
+      return "undocked";
+    case ::bosdyn::api::docking::DockState_DockedStatus_DOCK_STATUS_UNDOCKING:
+      return "undocking";
+    case ::bosdyn::api::docking::DockState_DockedStatus_DOCK_STATUS_UNKNOWN:
+    default:
+      return "unknown";
+  }
+}
 
 struct Quaterniond {
   double x{0.0};
@@ -3191,17 +3237,31 @@ void Adapter::LeaseRetainLoop() {
       last_retain_ms = now;
     }
 
-    if (!cfg_.can_dock_stream.empty() &&
+    if ((!cfg_.can_dock_stream.empty() || IsStreamEnabled(kDockingStateStream)) &&
         (now - last_can_dock_pub_ms) >= periodic_publish_ms) {
       int dock_id = resolved_dock_id_.load();
       if (dock_id <= 0) dock_id = ResolveDockId();
       bool can_dock = false;
+      std::string docking_state = "unknown";
       if (SpotConnected() && dock_id > 0) {
-        bool ok = spot_.CanDock(dock_id, &can_dock);
-        if (!ok) can_dock = false;
+        if (!cfg_.can_dock_stream.empty()) {
+          bool ok = spot_.CanDock(dock_id, &can_dock);
+          if (!ok) can_dock = false;
+        }
+      }
+      if (SpotConnected()) {
+        int dock_status = 0;
+        if (spot_.GetDockingStatus(&dock_status)) {
+          docking_state = docking_state_name(dock_status);
+        }
       }
       can_dock_ = can_dock;
-      QueueStatusBitset(cfg_.can_dock_stream, {{"Can dock", can_dock_.load()}});
+      if (!cfg_.can_dock_stream.empty()) {
+        QueueStatusBitset(cfg_.can_dock_stream, {{"Can dock", can_dock_.load()}});
+      }
+      if (IsStreamEnabled(kDockingStateStream)) {
+        QueueStatusText(kDockingStateStream, docking_state);
+      }
       last_can_dock_pub_ms = now;
     }
 
@@ -3215,6 +3275,13 @@ void Adapter::LeaseRetainLoop() {
           {"Teleop active", TeleopSessionActive()},
           {"Docking", docking_in_progress_.load()},
         });
+      }
+      if (IsStreamEnabled(kConnectionStateStream)) {
+        QueueStatusText(kConnectionStateStream, connection_state_name(spot_connection_state_.load()));
+      }
+      if (IsStreamEnabled(kCommandedMotionModeStream)) {
+        QueueStatusText(kCommandedMotionModeStream,
+                        motion_mode_state_name(desired_motion_mode_.load()));
       }
       if (IsStreamEnabled(kConnectionStream)) {
         QueueStatusText(kConnectionStream, BuildSpotConnectionJson());
@@ -3233,32 +3300,63 @@ void Adapter::LeaseRetainLoop() {
     }
 
     const bool need_robot_diag = AnyStreamEnabled({
+        kBehaviorStateStream,
+        kMotorPowerStateStream,
         kRobotStatePowerStream,
         kRobotStateBatteryStream,
         kRobotStateBodyPitchStream,
+        kShorePowerStateStream,
         kFaultsSystemStream,
         kFaultsBehaviorStream,
         kFaultsServiceStream,
         kFaultEventsStream,
     });
-    if (need_robot_diag &&
-        (now - last_robot_diag_pub_ms) >= periodic_publish_ms && SpotConnected()) {
-      SpotClient::RobotStateSnapshot snap;
-      if (spot_.GetRobotStateSnapshot(&snap)) {
-        ApplySoftRecoveryForRobotState(snap);
-        QueueStatusText(kRobotStatePowerStream, robot_state_to_json(snap));
-        if (snap.has_battery_pct) {
-          QueueStatusNumeric(kRobotStateBatteryStream, snap.battery_pct);
+    if (need_robot_diag && (now - last_robot_diag_pub_ms) >= periodic_publish_ms) {
+      if (SpotConnected()) {
+        SpotClient::RobotStateSnapshot snap;
+        if (spot_.GetRobotStateSnapshot(&snap)) {
+          ApplySoftRecoveryForRobotState(snap);
+          if (IsStreamEnabled(kBehaviorStateStream)) {
+            QueueStatusText(kBehaviorStateStream, snap.behavior_state);
+          }
+          if (IsStreamEnabled(kMotorPowerStateStream)) {
+            QueueStatusText(kMotorPowerStateStream, snap.motor_power_state);
+          }
+          if (IsStreamEnabled(kRobotStatePowerStream)) {
+            QueueStatusText(kRobotStatePowerStream, robot_state_to_json(snap));
+          }
+          if (snap.has_battery_pct && IsStreamEnabled(kRobotStateBatteryStream)) {
+            QueueStatusNumeric(kRobotStateBatteryStream, snap.battery_pct);
+          }
+          if (snap.has_body_pitch_rad && IsStreamEnabled(kRobotStateBodyPitchStream)) {
+            QueueStatusNumeric(kRobotStateBodyPitchStream, snap.body_pitch_rad);
+          }
+          if (IsStreamEnabled(kShorePowerStateStream)) {
+            QueueStatusText(kShorePowerStateStream, snap.shore_power_state);
+          }
+          if (IsStreamEnabled(kFaultsSystemStream)) {
+            QueueStatusText(kFaultsSystemStream, fault_list_to_json(snap.system_faults));
+          }
+          if (IsStreamEnabled(kFaultsBehaviorStream)) {
+            QueueStatusText(kFaultsBehaviorStream, fault_list_to_json(snap.behavior_faults));
+          }
+          if (IsStreamEnabled(kFaultsServiceStream)) {
+            QueueStatusText(kFaultsServiceStream, fault_list_to_json(snap.service_faults));
+          }
+          if (IsStreamEnabled(kFaultEventsStream)) PublishFaultEvents(snap);
+        } else {
+          std::cerr << "[state] failed to fetch robot state: " << spot_.LastError() << std::endl;
         }
-        if (snap.has_body_pitch_rad) {
-          QueueStatusNumeric(kRobotStateBodyPitchStream, snap.body_pitch_rad);
-        }
-        QueueStatusText(kFaultsSystemStream, fault_list_to_json(snap.system_faults));
-        QueueStatusText(kFaultsBehaviorStream, fault_list_to_json(snap.behavior_faults));
-        QueueStatusText(kFaultsServiceStream, fault_list_to_json(snap.service_faults));
-        PublishFaultEvents(snap);
       } else {
-        std::cerr << "[state] failed to fetch robot state: " << spot_.LastError() << std::endl;
+        if (IsStreamEnabled(kBehaviorStateStream)) {
+          QueueStatusText(kBehaviorStateStream, "unknown");
+        }
+        if (IsStreamEnabled(kMotorPowerStateStream)) {
+          QueueStatusText(kMotorPowerStateStream, "unknown");
+        }
+        if (IsStreamEnabled(kShorePowerStateStream)) {
+          QueueStatusText(kShorePowerStateStream, "unknown");
+        }
       }
       last_robot_diag_pub_ms = now;
     }

@@ -105,6 +105,10 @@ If you rename a stream from its default, use the renamed stream name in `streamC
 - Fields include `state`, `connected`, `degraded_non_estop`, `degraded_reason`,
   `reconnect_attempt`, `last_success_ms`, `last_attempt_ms`, and `error`.
 
+- `spot.connection_state` (type: text, 0.2 Hz / every 5s)
+- One-word Spot connection state for teleop/UI bindings.
+- Values: `disconnected`, `connecting`, `connected`.
+
 - `spot.localization` (type: text/json, 0.2 Hz / every 5s)
 - GraphNav localization status.
 - Fields: `localized`, `waypoint_id`, `error`.
@@ -168,14 +172,34 @@ If you rename a stream from its default, use the renamed stream name in `streamC
 - `Stairs`
 - `Crawl`
 
+- `spot.commanded_motion_mode` (type: text, 0.2 Hz / every 5s)
+- One-word commanded locomotion mode used for future teleop velocity commands.
+- Values: `walk`, `stairs`, `crawl`.
+
+- `spot.docking_state` (type: text, 0.2 Hz / every 5s)
+- One-word docking state from the Spot docking service.
+- Values: `unknown`, `docked`, `docking`, `undocked`, `undocking`.
+
 - `spot.robot_state.power` (type: text/json, 0.2 Hz / every 5s)
 - Fields include motor power state, estop aggregate, and battery availability.
+
+- `spot.motor_power_state` (type: text, 0.2 Hz / every 5s)
+- One-word motor power state.
+- Values: `off`, `on`, `powering_on`, `powering_off`, `error`, `unknown`.
 
 - `spot.robot_state.battery` (type: numeric, 0.2 Hz / every 5s)
 - Battery percentage in range 0-100 when available from robot state.
 
 - `spot.robot_state.body_pitch_rad` (type: numeric, 0.2 Hz / every 5s)
 - Measured body pitch in radians (derived from `odom` -> `body` transform).
+
+- `spot.behavior_state` (type: text, 0.2 Hz / every 5s)
+- One-word high-level robot behavior state from Spot robot state.
+- Values: `not_ready`, `transition`, `standing`, `stepping`, `unknown`.
+
+- `spot.shore_power_state` (type: text, 0.2 Hz / every 5s)
+- One-word shore-power state.
+- Values: `on`, `off`, `unknown`.
 
 - `spot.faults.system` (type: text/json, 0.2 Hz / every 5s)
 - Active system fault summary (`count`, list of `id`, `severity`, `message`).
