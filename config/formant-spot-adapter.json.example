@@ -2,6 +2,7 @@
   "spotHost": "192.168.50.3",
   "formantAgentTarget": "localhost:5501",
   "graphnavStoreDir": "data/graphnav",
+  "armPresent": true,
   "teleopIdleTimeoutMs": 1000,
   "waypointTextStream": "spot.waypoints",
   "mapsTextStream": "spot.maps",

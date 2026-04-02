@@ -61,6 +61,7 @@ struct Config {
   std::string graphnav_map_image_metadata_stream_name{"spot.localization.graphnav.global.image.meta"};
   int graphnav_map_image_fps{15};
   int graphnav_map_image_poll_hz{2};
+  int arm_present_override{-1};  // -1 => auto-detect, 0 => no arm, 1 => arm present
   double twist_deadband{0.08};
   int teleop_idle_timeout_ms{300};
 

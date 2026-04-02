@@ -202,6 +202,9 @@ class SpotClient {
   SpotClient() = default;
 
   bool Connect(const std::string& host, const std::string& username, const std::string& password);
+  void SetArmPresentOverride(int override_state);
+  bool HasArm();
+  bool ArmPresenceKnown() const;
 
   bool AcquireBodyLease();
   bool TryAcquireBodyLeaseNoTakeover();
@@ -279,6 +282,7 @@ class SpotClient {
   bool EnsureRobotStateClient();
   bool EnsureWorldObjectClient();
   bool EnsurePowered();
+  bool DetectArmPresenceLocked(bool* out_has_arm);
   void SetLastError(const std::string& msg);
 
   std::unique_ptr<::bosdyn::client::ClientSdk> sdk_;
@@ -297,6 +301,8 @@ class SpotClient {
   ::bosdyn::client::WorldObjectClient* world_object_client_{nullptr};
   ::bosdyn::api::Lease body_lease_;
   std::atomic<bool> cancel_docking_{false};
+  std::atomic<int> arm_present_override_{-1};
+  std::atomic<int> arm_presence_state_{-1};
   mutable std::recursive_mutex api_mu_;
   mutable std::mutex err_mu_;
   std::string last_error_;

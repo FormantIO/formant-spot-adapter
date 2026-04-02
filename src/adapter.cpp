@@ -1867,6 +1867,7 @@ bool Adapter::Init() {
   spot_degraded_non_estop_ = false;
   last_soft_recovery_log_ms_ = 0;
   ResetFaultEventsState();
+  spot_.SetArmPresentOverride(cfg_.arm_present_override);
 
   if (!spot_.Connect(cfg_.spot_host, cfg_.spot_username, cfg_.spot_password)) {
     std::cerr << "Initial Spot connect failed; adapter will continue and retry in background: "
@@ -3485,6 +3486,13 @@ void Adapter::SetSpotConnected() {
   if (!was_connected) {
     EmitLog("[spot] connection established");
   }
+  const bool has_arm = spot_.HasArm();
+  if (spot_.ArmPresenceKnown()) {
+    EmitLog(has_arm ? "[spot] manipulator detected"
+                    : "[spot] no manipulator detected; arm actions disabled");
+  } else {
+    EmitLog("[spot] manipulator presence unavailable; arm actions disabled until detected");
+  }
 }
 
 void Adapter::SetSpotDisconnected(const std::string& reason) {
@@ -4969,6 +4977,11 @@ bool Adapter::ExecuteResetArmAction(bool require_teleop, bool auto_acquire_lease
     EmitLog("[arm] reset rejected: session inactive");
     return false;
   }
+  if (!spot_.HasArm()) {
+    EmitLog(std::string(require_teleop ? "[arm] reset rejected: no manipulator detected"
+                                       : "[command] spot.reset_arm rejected: no manipulator detected"));
+    return false;
+  }
   if (!lease_owned_.load() && (!auto_acquire_lease || !EnsureLeaseForCommand("spot.reset_arm"))) {
     if (require_teleop) EmitLog("[arm] reset rejected: no body lease");
     return false;
@@ -5043,6 +5056,7 @@ void Adapter::ApplyDesiredArmMode(bool force) {
   const int min_interval_ms = std::max(250, cfg_.arm_hold_interval_ms);
   if (!force && (now - last_arm_hold_cmd_ms_.load()) < min_interval_ms) return;
   if (!lease_owned_) return;
+  if (!spot_.HasArm()) return;
 
   const bool ok = spot_.ResetArmToStow();
   if (ok) {
@@ -5060,6 +5074,7 @@ void Adapter::ApplyDesiredArmMode(bool force) {
 }
 
 bool Adapter::IsArmLikelyStowed() {
+  if (!spot_.HasArm()) return true;
   double sh1 = 0.0;
   double el0 = 0.0;
   double el1 = 0.0;
@@ -5078,6 +5093,7 @@ bool Adapter::IsArmLikelyStowed() {
 }
 
 bool Adapter::WaitForArmStow(int timeout_ms) {
+  if (!spot_.HasArm()) return true;
   const auto start = std::chrono::steady_clock::now();
   const auto timeout = std::chrono::milliseconds(std::max(500, timeout_ms));
   while (lease_owned_) {

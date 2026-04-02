@@ -472,6 +472,7 @@ std::string SpotClient::LastError() const {
 bool SpotClient::Connect(const std::string& host, const std::string& username, const std::string& password) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   body_lease_.Clear();
+  arm_presence_state_ = -1;
   robot_command_client_ = nullptr;
   lease_client_ = nullptr;
   time_sync_endpoint_ = nullptr;
@@ -523,7 +524,40 @@ bool SpotClient::Connect(const std::string& host, const std::string& username, c
   }
   image_client_ = image_client.response;
 
+  bool has_arm = false;
+  if (DetectArmPresenceLocked(&has_arm)) {
+    arm_presence_state_ = has_arm ? 1 : 0;
+  }
+
   return true;
+}
+
+void SpotClient::SetArmPresentOverride(int override_state) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (override_state < 0) {
+    arm_present_override_ = -1;
+    return;
+  }
+  arm_present_override_ = override_state > 0 ? 1 : 0;
+  arm_presence_state_ = arm_present_override_.load();
+}
+
+bool SpotClient::HasArm() {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  const int override_state = arm_present_override_.load();
+  if (override_state >= 0) return override_state > 0;
+
+  const int cached_state = arm_presence_state_.load();
+  if (cached_state >= 0) return cached_state > 0;
+
+  bool has_arm = false;
+  if (!DetectArmPresenceLocked(&has_arm)) return false;
+  arm_presence_state_ = has_arm ? 1 : 0;
+  return has_arm;
+}
+
+bool SpotClient::ArmPresenceKnown() const {
+  return arm_present_override_.load() >= 0 || arm_presence_state_.load() >= 0;
 }
 
 bool SpotClient::AcquireBodyLease() {
@@ -579,6 +613,18 @@ bool SpotClient::ReturnBodyLease() {
   if (!r.status) SetLastError(r.status.DebugString());
   body_lease_.Clear();
   return r.status;
+}
+
+bool SpotClient::DetectArmPresenceLocked(bool* out_has_arm) {
+  if (!out_has_arm) return false;
+  if (!EnsureRobotStateClient()) return false;
+  auto state = robot_state_client_->GetRobotState();
+  if (!state.status) {
+    SetLastError(state.status.DebugString());
+    return false;
+  }
+  *out_has_arm = state.response.robot_state().has_manipulator_state();
+  return true;
 }
 
 bool SpotClient::Stand() {

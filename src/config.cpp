@@ -51,6 +51,23 @@ bool getenv_bool_or(const char* k, bool d) {
   return d;
 }
 
+bool getenv_bool_if_set(const char* k, bool* out) {
+  if (!out) return false;
+  const char* v = std::getenv(k);
+  if (!v || !*v) return false;
+  std::string value(v);
+  for (char& ch : value) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  if (value == "1" || value == "true" || value == "yes" || value == "on") {
+    *out = true;
+    return true;
+  }
+  if (value == "0" || value == "false" || value == "no" || value == "off") {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
 double getenv_double_or(const char* k, double d) {
   const char* v = std::getenv(k);
   if (!v || !*v) return d;
@@ -151,6 +168,7 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_graphnav_map_image_poll_hz()) {
     c->graphnav_map_image_poll_hz = j.graphnav_map_image_poll_hz().value();
   }
+  if (j.has_arm_present()) c->arm_present_override = j.arm_present().value() ? 1 : 0;
   if (j.has_twist_deadband()) c->twist_deadband = j.twist_deadband().value();
   if (j.has_teleop_idle_timeout_ms()) c->teleop_idle_timeout_ms = j.teleop_idle_timeout_ms().value();
   if (j.has_max_vx_mps()) c->max_vx_mps = j.max_vx_mps().value();
@@ -256,6 +274,10 @@ Config load_config_from_env() {
       getenv_int_or("GRAPHNAV_MAP_IMAGE_FPS", c.graphnav_map_image_fps);
   c.graphnav_map_image_poll_hz =
       getenv_int_or("GRAPHNAV_MAP_IMAGE_POLL_HZ", c.graphnav_map_image_poll_hz);
+  bool arm_present = false;
+  if (getenv_bool_if_set("ARM_PRESENT", &arm_present)) {
+    c.arm_present_override = arm_present ? 1 : 0;
+  }
   c.max_body_pitch_rad = getenv_double_or("MAX_BODY_PITCH_RAD", c.max_body_pitch_rad);
   c.twist_deadband = getenv_double_or("TWIST_DEADBAND", c.twist_deadband);
   c.teleop_idle_timeout_ms = getenv_int_or("TELEOP_IDLE_TIMEOUT_MS", c.teleop_idle_timeout_ms);
@@ -316,6 +338,10 @@ Config load_config() {
   c.spot_username = getenv_or("SPOT_USERNAME", c.spot_username);
   c.spot_password = getenv_or("SPOT_PASSWORD", c.spot_password);
   c.formant_agent_target = getenv_or("FORMANT_AGENT_TARGET", c.formant_agent_target);
+  bool arm_present = false;
+  if (getenv_bool_if_set("ARM_PRESENT", &arm_present)) {
+    c.arm_present_override = arm_present ? 1 : 0;
+  }
   return c;
 }
 

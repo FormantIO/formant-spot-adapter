@@ -84,4 +84,5 @@ message AdapterConfig {
   google.protobuf.Int32Value front_image_poll_hz = 70;
   google.protobuf.Int32Value front_image_roll_degrees = 71;
   repeated StreamControl stream_controls = 72;
+  google.protobuf.BoolValue arm_present = 76;
 }
