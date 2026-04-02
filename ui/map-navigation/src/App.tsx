@@ -407,6 +407,17 @@ export default function App() {
       ? formatGotoPosePayload(mapUuid, selectedTarget.x, selectedTarget.y, selectedTarget.yawDeg)
       : "";
 
+  const handleSelectTarget = (target: TargetPose) => {
+    setSelectedTarget(target);
+    setSendError(undefined);
+    setStatusMessage(undefined);
+  };
+
+  const handleCancelTarget = () => {
+    setSelectedTarget(undefined);
+    setSendError(undefined);
+  };
+
   const handleSend = async () => {
     if (!device || !selectedTarget || !mapUuid) return;
     setSending(true);
@@ -417,6 +428,7 @@ export default function App() {
       await currentDevice.sendCommand(config.gotoPoseCommandName, commandPayload);
       setStatusMessage(`Sent ${config.gotoPoseCommandName} to ${device.name}`);
       FormantApp.showMessage?.(`Sent ${config.gotoPoseCommandName}`);
+      setSelectedTarget(undefined);
     } catch (commandError) {
       setSendError(
         commandError instanceof Error ? commandError.message : "Failed sending goto pose command."
@@ -472,7 +484,7 @@ export default function App() {
               snapshot={snapshot}
               config={config}
               selectedTarget={selectedTarget}
-              onSelectTarget={setSelectedTarget}
+              onSelectTarget={handleSelectTarget}
             />
 
             <Stack
@@ -492,16 +504,13 @@ export default function App() {
                 color={snapshot.navState?.localized ? "secondary" : "default"}
                 variant={snapshot.navState?.localized ? "filled" : "outlined"}
               />
-              <Chip
-                label={snapshot.navState?.active ? snapshot.navState.status_name : "Idle"}
-                color={snapshot.navState?.active ? "warning" : "default"}
-                variant="outlined"
-              />
-              <Chip
-                label="Live"
-                variant="outlined"
-                sx={{ borderColor: "rgba(255,255,255,0.18)" }}
-              />
+              {snapshot.navState?.active && snapshot.navState.status_name ? (
+                <Chip
+                  label={snapshot.navState.status_name}
+                  color="warning"
+                  variant="outlined"
+                />
+              ) : null}
             </Stack>
 
             <IconButton
@@ -586,9 +595,12 @@ export default function App() {
                   justifyContent="space-between"
                 >
                   <Stack spacing={0.5} sx={{ minWidth: 0 }}>
-                    <Typography variant="subtitle2">Selected Target</Typography>
+                    <Typography variant="subtitle2">Confirm Target</Typography>
                     <Typography variant="body2" color="text.secondary">
                       {formatPose(selectedTarget)}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Review the target, then confirm or cancel.
                     </Typography>
                     <Typography
                       variant="caption"
@@ -623,10 +635,10 @@ export default function App() {
                       onClick={() => void handleSend()}
                       disabled={!mapUuid || sending || !commandConfigured}
                     >
-                      {sending ? "Sending..." : "Go to target"}
+                      {sending ? "Sending..." : "Confirm"}
                     </Button>
-                    <Button variant="outlined" onClick={() => setSelectedTarget(undefined)}>
-                      Clear
+                    <Button variant="outlined" onClick={handleCancelTarget} disabled={sending}>
+                      Cancel
                     </Button>
                   </Stack>
                 </Stack>
@@ -644,7 +656,7 @@ export default function App() {
                 }}
               >
                 <Typography variant="body2" color="text.secondary">
-                  Click the map to place a target
+                  Click the map to select a target
                 </Typography>
               </Box>
             )}
