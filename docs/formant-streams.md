@@ -260,6 +260,11 @@ If you rename a stream from its default, use the renamed stream name in `streamC
 - Runs autodock procedure.
 - Does not require active teleop session.
 
+- `spot.undock` (command)
+- Undocks from the current dock and moves Spot to the prep pose.
+- Does not require active teleop session.
+- Fails if the robot is not currently docked.
+
 - `spot.return_and_dock` (command)
 - Navigates to the saved dock waypoint for the active/default map, then runs autodock.
 - Does not require active teleop session.
@@ -341,7 +346,7 @@ Command response behavior:
 - Formant command responses are terminal; success/failure is returned when the action reaches completion.
 - Long-running commands (`spot.camera.calibrate`, `spot.waypoint.goto`,
   `spot.waypoint.goto_straight`, `spot.graphnav.goto_pose`,
-  `spot.graphnav.goto_pose_straight`, `spot.dock`, `spot.return_and_dock`) keep the response
+  `spot.graphnav.goto_pose_straight`, `spot.dock`, `spot.undock`, `spot.return_and_dock`) keep the response
   pending until terminal success/failure.
 
 ## Recommended Teleop UI Layout

@@ -44,7 +44,7 @@ Boston Dynamics.
 Additional control channels (not streams):
 - Teleop heartbeat from Formant agent controls session active/inactive behavior.
 - Command channel supports `spot.jetson.reboot`, `spot.robot.reboot`, `spot.camera.calibrate`,
-  `spot.stand`, `spot.sit`, `spot.recover`, `spot.dock`, `spot.reset_arm`,
+  `spot.stand`, `spot.sit`, `spot.recover`, `spot.dock`, `spot.undock`, `spot.reset_arm`,
   `spot.map.*`, and `spot.waypoint.*`.
 
 ### Streams published by adapter (adapter -> Formant)
@@ -136,6 +136,9 @@ Additional non-GraphNav command-channel actions:
 - `spot.sit`: sit command; command path does not require active teleop heartbeat.
 - `spot.recover`: self-right command; command path does not require active teleop heartbeat.
 - `spot.dock`: run autodock procedure; command path does not require active teleop heartbeat.
+- `spot.undock`: undock from the current dock and move to prep pose; command path does not require active teleop heartbeat.
+  - No parameters.
+  - Fails if the robot is not currently docked.
 - `spot.return_and_dock`: navigate to saved dock waypoint for active map, then run dock.
   - No parameters.
   - Fails if no dock waypoint is saved yet for the active/default map.
@@ -173,7 +176,7 @@ adapter runs a temporary start/create/stop recording sequence.
 Command responses:
 - Responses are terminal: success/failure is returned after the action reaches a terminal state.
 - Long-running commands (`spot.camera.calibrate`, `spot.waypoint.goto`, `spot.dock`,
-  `spot.return_and_dock`) keep the response pending until completion.
+  `spot.undock`, `spot.return_and_dock`) keep the response pending until completion.
 
 ## Configuration Model
 

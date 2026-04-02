@@ -1870,6 +1870,21 @@ bool SpotClient::CanDock(int dock_id, bool* out_can_dock) {
   return true;
 }
 
+bool SpotClient::GetDockingStatus(int* out_status) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!out_status) return false;
+  if (!EnsureDockingClient()) return false;
+
+  auto state = docking_client_->GetDockingState();
+  if (!state.status) {
+    SetLastError(state.status.DebugString());
+    return false;
+  }
+
+  *out_status = static_cast<int>(state.response.dock_state().status());
+  return true;
+}
+
 bool SpotClient::AutoDock(int dock_id, int attempts, int poll_ms, int command_timeout_sec) {
   if (dock_id <= 0) return false;
   if (!EnsureDockingClient()) return false;
@@ -1960,6 +1975,90 @@ bool SpotClient::AutoDock(int dock_id, int attempts, int poll_ms, int command_ti
 
   if (last_err.empty()) last_err = "Docking failed after retries";
   SetLastError(last_err);
+  return false;
+}
+
+bool SpotClient::Undock(int poll_ms, int command_timeout_sec) {
+  if (!EnsureDockingClient()) return false;
+  if (!EnsureTimeSync()) return false;
+
+  cancel_docking_ = false;
+  const int feedback_sleep_ms = std::max(100, poll_ms);
+  const int command_timeout_ms = std::max(5000, command_timeout_sec * 1000);
+
+  ::bosdyn::api::docking::DockingCommandRequest request;
+  {
+    std::lock_guard<std::recursive_mutex> lk(api_mu_);
+    if (!docking_client_ || !time_sync_endpoint_) {
+      SetLastError("Docking client or time sync endpoint unavailable");
+      return false;
+    }
+    auto clock_id = time_sync_endpoint_->GetClockIdentifier();
+    if (!clock_id.status) {
+      SetLastError(clock_id.status.DebugString());
+      return false;
+    }
+    request.set_clock_identifier(*clock_id.response);
+    *request.mutable_end_time() =
+        time_sync_endpoint_->RobotTimestampFromLocal(std::chrono::system_clock::now() +
+                                                     std::chrono::milliseconds(command_timeout_ms));
+    request.set_prep_pose_behavior(::bosdyn::api::docking::PREP_POSE_UNDOCK);
+  }
+
+  decltype(docking_client_->DockingCommand(request)) start;
+  {
+    std::lock_guard<std::recursive_mutex> lk(api_mu_);
+    if (!docking_client_) {
+      SetLastError("Docking client unavailable");
+      return false;
+    }
+    start = docking_client_->DockingCommand(request);
+  }
+  if (!start.status) {
+    SetLastError(std::string("Undock command failed: ") + start.status.DebugString());
+    return false;
+  }
+  if (start.response.status() != ::bosdyn::api::docking::DockingCommandResponse::STATUS_OK) {
+    SetLastError("Undock command rejected status=" +
+                 std::to_string(static_cast<int>(start.response.status())));
+    return false;
+  }
+
+  const uint32_t cmd_id = start.response.docking_command_id();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(command_timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (cancel_docking_.load()) {
+      SetLastError("Undock canceled");
+      return false;
+    }
+
+    decltype(docking_client_->DockingCommandFeedback(cmd_id)) feedback;
+    {
+      std::lock_guard<std::recursive_mutex> lk(api_mu_);
+      if (!docking_client_) {
+        SetLastError("Docking client unavailable");
+        return false;
+      }
+      feedback = docking_client_->DockingCommandFeedback(cmd_id);
+    }
+    if (!feedback.status) {
+      SetLastError(std::string("Undock feedback failed: ") + feedback.status.DebugString());
+      return false;
+    }
+
+    const auto status = feedback.response.status();
+    if (status == ::bosdyn::api::docking::DockingCommandFeedbackResponse::STATUS_AT_PREP_POSE) {
+      return true;
+    }
+    if (status != ::bosdyn::api::docking::DockingCommandFeedbackResponse::STATUS_IN_PROGRESS) {
+      SetLastError("Undock feedback status=" + std::to_string(static_cast<int>(status)));
+      return false;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(feedback_sleep_ms));
+  }
+
+  SetLastError("Undock timed out");
   return false;
 }
 

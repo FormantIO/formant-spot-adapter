@@ -53,6 +53,7 @@ class Adapter {
   bool ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest& request);
   bool ExecuteGraphNavGotoPoseCommand(const v1::model::CommandRequest& request, bool straight);
   bool ExecuteDockSequence(bool return_and_dock);
+  bool ExecuteUndockCommand();
   bool WaitForGraphNavCommandResult(uint32_t command_id, long long timeout_ms);
   bool EnsureLocalizedForNavigation(const std::string& action_name);
   bool StartNavigateWithRecovery(const std::string& action_name,

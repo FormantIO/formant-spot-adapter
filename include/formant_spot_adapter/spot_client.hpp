@@ -262,8 +262,10 @@ class SpotClient {
   bool GetNavigationFeedback(uint32_t command_id, int* out_status);
   bool GetNavigationFeedbackSnapshot(uint32_t command_id, NavigationFeedbackSnapshot* out_feedback);
   bool DiscoverSingleDockId(int* out_dock_id);
+  bool GetDockingStatus(int* out_status);
   bool CanDock(int dock_id, bool* out_can_dock);
   bool AutoDock(int dock_id, int attempts, int poll_ms, int command_timeout_sec);
+  bool Undock(int poll_ms, int command_timeout_sec);
   void RequestDockCancel();
   std::string LastError() const;
 

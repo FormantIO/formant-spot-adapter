@@ -2061,6 +2061,7 @@ void Adapter::Run() {
                          [this](const v1::model::ControlDatapoint& dp) { HandleTeleop(dp); });
   agent_.StartCommandLoop({"spot.jetson.reboot", "spot.robot.reboot", "spot.camera.calibrate",
                            "spot.stand", "spot.sit", "spot.recover", "spot.dock",
+                           "spot.undock",
                            "spot.return_and_dock", "spot.rotate_left", "spot.rotate_right",
                            "spot.reset_arm",
                            "spot.map.create", "spot.map.load", "spot.map.set_default", "spot.map.delete",
@@ -4606,6 +4607,56 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
   return true;
 }
 
+bool Adapter::ExecuteUndockCommand() {
+  if (docking_in_progress_.load()) {
+    EmitLog("[undock] request ignored: dock operation already in progress");
+    return false;
+  }
+  if (!SpotConnected()) {
+    EmitLog("[undock] failed: robot unavailable");
+    return false;
+  }
+  if (spot_degraded_non_estop_.load()) {
+    EmitLog("[undock] failed: robot degraded (non-estop)");
+    return false;
+  }
+  if (!EnsureLeaseForCommand("spot.undock")) return false;
+
+  int dock_status = 0;
+  if (!spot_.GetDockingStatus(&dock_status)) {
+    EmitLog(std::string("[undock] failed: unable to query dock state: ") + spot_.LastError());
+    return false;
+  }
+
+  if (dock_status == ::bosdyn::api::docking::DockState_DockedStatus_DOCK_STATUS_UNDOCKED) {
+    EmitLog("[undock] rejected: robot is already undocked");
+    return false;
+  }
+  if (dock_status == ::bosdyn::api::docking::DockState_DockedStatus_DOCK_STATUS_UNDOCKING) {
+    EmitLog("[undock] rejected: robot is already undocking");
+    return false;
+  }
+  if (dock_status != ::bosdyn::api::docking::DockState_DockedStatus_DOCK_STATUS_DOCKED) {
+    EmitLog("[undock] rejected: unexpected dock state=" + std::to_string(dock_status));
+    return false;
+  }
+
+  docking_in_progress_ = true;
+  moving_ = false;
+  spot_.ZeroVelocity(1);
+  const int dock_poll_ms = std::max(250, cfg_.dock_poll_ms);
+  EmitLog("[undock] starting");
+  const bool ok = spot_.Undock(dock_poll_ms, cfg_.dock_command_timeout_sec);
+  docking_in_progress_ = false;
+  if (!ok) {
+    EmitLog(std::string("[undock] failed: ") + spot_.LastError());
+    return false;
+  }
+  dock_cooldown_until_ms_ = now_ms() + 5000;
+  EmitLog("[undock] success");
+  return true;
+}
+
 bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
   const std::string& command = request.command();
   if (command != "spot.jetson.reboot" && !SpotConnected()) {
@@ -4634,6 +4685,7 @@ bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
   if (command == "spot.sit") return ExecuteSitAction(false, true);
   if (command == "spot.recover") return ExecuteRecoverAction(false, true);
   if (command == "spot.dock") return ExecuteDockSequence(false);
+  if (command == "spot.undock") return ExecuteUndockCommand();
   if (command == "spot.return_and_dock") return ExecuteDockSequence(true);
   if (command == "spot.rotate_left") return ExecuteRotateCommand(request, true);
   if (command == "spot.rotate_right") return ExecuteRotateCommand(request, false);
