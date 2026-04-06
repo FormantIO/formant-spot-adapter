@@ -8,7 +8,7 @@ import {
 } from "@formant/data-sdk";
 import {
   GraphNavMapImageMetadata,
-  GraphNavMetadata,
+  GraphNavOverlay,
   ModuleConfig,
   NavState,
   StreamSnapshot
@@ -17,9 +17,17 @@ import {
 export const DEFAULT_MODULE_CONFIG: ModuleConfig = {
   mapImageStreamName: "spot.localization.graphnav.global.image",
   mapImageMetadataStreamName: "spot.localization.graphnav.global.image.meta",
-  graphnavMetadataStreamName: "",
+  overlayStreamName: "spot.graphnav.overlay",
   navStateStreamName: "spot.nav.state",
+  connectionStateStreamName: "spot.connection_state",
+  dockingStateStreamName: "spot.docking_state",
+  motorPowerStateStreamName: "spot.motor_power_state",
+  behaviorStateStreamName: "spot.behavior_state",
+  waypointGotoCommandName: "spot.waypoint.goto",
   gotoPoseCommandName: "spot.graphnav.goto_pose",
+  cancelNavCommandName: "spot.graphnav.cancel",
+  returnAndDockCommandName: "spot.return_and_dock",
+  undockCommandName: "spot.undock",
   showWaypointLabels: true,
   defaultYawMode: "current",
   defaultYawDeg: 0
@@ -45,12 +53,6 @@ function asConfiguredName(value: unknown, fallback: string): string {
   if (typeof value !== "string") return fallback;
   const trimmed = value.trim();
   return trimmed.includes(".") ? trimmed : fallback;
-}
-
-function asOptionalConfiguredName(value: unknown): string {
-  if (typeof value !== "string") return "";
-  const trimmed = value.trim();
-  return trimmed.includes(".") ? trimmed : "";
 }
 
 function parseGraphNavMapImageMetadataValue(
@@ -115,30 +117,20 @@ function parseGraphNavMapImageMetadataValue(
   };
 }
 
-function parseGraphNavMetadataValue(value: unknown): GraphNavMetadata | undefined {
+function parseGraphNavOverlayValue(value: unknown): GraphNavOverlay | undefined {
   if (!isRecord(value)) return undefined;
   const waypoints = Array.isArray(value.waypoints)
     ? value.waypoints
         .filter(isRecord)
         .map((waypoint) => ({
           id: asString(waypoint.id),
+          name: asString(waypoint.name),
           label: asString(waypoint.label),
-          display_name: asString(waypoint.display_name),
-          is_dock: asBoolean(waypoint.is_dock),
-          seed_tform_waypoint: isRecord(waypoint.seed_tform_waypoint)
-            ? {
-                x: asNumber(waypoint.seed_tform_waypoint.x),
-                y: asNumber(waypoint.seed_tform_waypoint.y),
-                z: asNumber(waypoint.seed_tform_waypoint.z),
-                qw: asNumber(waypoint.seed_tform_waypoint.qw, 1),
-                qx: asNumber(waypoint.seed_tform_waypoint.qx),
-                qy: asNumber(waypoint.seed_tform_waypoint.qy),
-                qz: asNumber(waypoint.seed_tform_waypoint.qz)
-              }
-            : { x: 0, y: 0, z: 0, qw: 1, qx: 0, qy: 0, qz: 0 }
+          x: asNumber(waypoint.x),
+          y: asNumber(waypoint.y),
+          is_dock: asBoolean(waypoint.is_dock)
         }))
     : [];
-
   const edges = Array.isArray(value.edges)
     ? value.edges
         .filter(isRecord)
@@ -147,10 +139,11 @@ function parseGraphNavMetadataValue(value: unknown): GraphNavMetadata | undefine
           to_waypoint_id: asString(edge.to_waypoint_id)
         }))
     : [];
-
   return {
     map_id: asString(value.map_id),
     map_uuid: asString(value.map_uuid),
+    current_waypoint_id: asString(value.current_waypoint_id),
+    dock_waypoint_id: asString(value.dock_waypoint_id),
     waypoints,
     edges
   };
@@ -203,12 +196,25 @@ function parseNavStateValue(value: unknown): NavState {
     current_seed_yaw_rad:
       typeof value.current_seed_yaw_rad === "number" ? value.current_seed_yaw_rad : undefined,
     has_seed_goal: asBoolean(value.has_seed_goal),
+    has_waypoint_goal: asBoolean(value.has_waypoint_goal),
     target_seed_x:
       typeof value.target_seed_x === "number" ? value.target_seed_x : undefined,
     target_seed_y:
       typeof value.target_seed_y === "number" ? value.target_seed_y : undefined,
     target_seed_yaw_rad:
-      typeof value.target_seed_yaw_rad === "number" ? value.target_seed_yaw_rad : undefined
+      typeof value.target_seed_yaw_rad === "number" ? value.target_seed_yaw_rad : undefined,
+    target_waypoint_goal_x:
+      typeof value.target_waypoint_goal_x === "number"
+        ? value.target_waypoint_goal_x
+        : undefined,
+    target_waypoint_goal_y:
+      typeof value.target_waypoint_goal_y === "number"
+        ? value.target_waypoint_goal_y
+        : undefined,
+    target_waypoint_goal_yaw_rad:
+      typeof value.target_waypoint_goal_yaw_rad === "number"
+        ? value.target_waypoint_goal_yaw_rad
+        : undefined
   };
 }
 
@@ -216,7 +222,9 @@ export function parseModuleConfig(raw: string | undefined): ModuleConfig {
   if (!raw) return DEFAULT_MODULE_CONFIG;
 
   try {
-    const value = JSON.parse(raw) as Partial<ModuleConfig>;
+    const value = JSON.parse(raw) as Partial<ModuleConfig> & {
+      graphnavMetadataStreamName?: string;
+    };
     return {
       mapImageStreamName: asConfiguredName(
         value.mapImageStreamName,
@@ -226,14 +234,49 @@ export function parseModuleConfig(raw: string | undefined): ModuleConfig {
         value.mapImageMetadataStreamName,
         DEFAULT_MODULE_CONFIG.mapImageMetadataStreamName
       ),
-      graphnavMetadataStreamName: asOptionalConfiguredName(value.graphnavMetadataStreamName),
+      overlayStreamName: asConfiguredName(
+        value.overlayStreamName ?? value.graphnavMetadataStreamName,
+        DEFAULT_MODULE_CONFIG.overlayStreamName
+      ),
       navStateStreamName: asConfiguredName(
         value.navStateStreamName,
         DEFAULT_MODULE_CONFIG.navStateStreamName
       ),
+      connectionStateStreamName: asConfiguredName(
+        value.connectionStateStreamName,
+        DEFAULT_MODULE_CONFIG.connectionStateStreamName
+      ),
+      dockingStateStreamName: asConfiguredName(
+        value.dockingStateStreamName,
+        DEFAULT_MODULE_CONFIG.dockingStateStreamName
+      ),
+      motorPowerStateStreamName: asConfiguredName(
+        value.motorPowerStateStreamName,
+        DEFAULT_MODULE_CONFIG.motorPowerStateStreamName
+      ),
+      behaviorStateStreamName: asConfiguredName(
+        value.behaviorStateStreamName,
+        DEFAULT_MODULE_CONFIG.behaviorStateStreamName
+      ),
+      waypointGotoCommandName: asConfiguredName(
+        value.waypointGotoCommandName,
+        DEFAULT_MODULE_CONFIG.waypointGotoCommandName
+      ),
       gotoPoseCommandName: asConfiguredName(
         value.gotoPoseCommandName,
         DEFAULT_MODULE_CONFIG.gotoPoseCommandName
+      ),
+      cancelNavCommandName: asConfiguredName(
+        value.cancelNavCommandName,
+        DEFAULT_MODULE_CONFIG.cancelNavCommandName
+      ),
+      returnAndDockCommandName: asConfiguredName(
+        value.returnAndDockCommandName,
+        DEFAULT_MODULE_CONFIG.returnAndDockCommandName
+      ),
+      undockCommandName: asConfiguredName(
+        value.undockCommandName,
+        DEFAULT_MODULE_CONFIG.undockCommandName
       ),
       showWaypointLabels:
         typeof value.showWaypointLabels === "boolean"
@@ -254,7 +297,9 @@ export function parseModuleConfig(raw: string | undefined): ModuleConfig {
 export async function authenticateAndGetDevice(): Promise<Device> {
   const authenticated = await Authentication.waitTilAuthenticated();
   if (!authenticated) {
-    throw new Error("Authentication failed. Open this module from Formant or include auth context in the URL.");
+    throw new Error(
+      "Authentication failed. Open this module from Formant or include auth context in the URL."
+    );
   }
   return Fleet.getCurrentDevice();
 }
@@ -270,6 +315,19 @@ function buildRealtimeSource(name: string, streamType: string): RealtimeStreamSo
     rosTopicName: name,
     streamType
   };
+}
+
+function patchTextValue(
+  key: keyof StreamSnapshot,
+  timeKey: keyof StreamSnapshot,
+  value: string | symbol,
+  onPatch: (patch: Partial<StreamSnapshot>) => void
+): void {
+  if (typeof value !== "string") return;
+  onPatch({
+    [key]: value.trim(),
+    [timeKey]: Date.now()
+  });
 }
 
 export function subscribeRealtimeSnapshot(
@@ -314,6 +372,26 @@ export function subscribeRealtimeSnapshot(
   );
 
   cleanups.push(
+    live.subscribeToJson(
+      deviceId,
+      buildRealtimeSource(config.overlayStreamName, "json"),
+      (value) => {
+        const overlay = parseGraphNavOverlayValue(value);
+        if (!overlay) {
+          onPatch({
+            warnings: [`Could not parse ${config.overlayStreamName}`]
+          });
+          return;
+        }
+        onPatch({
+          overlay,
+          overlayTime: Date.now()
+        });
+      }
+    )
+  );
+
+  cleanups.push(
     live.subscribeToVideo(
       deviceId,
       buildRealtimeSource(config.mapImageStreamName, "video"),
@@ -327,34 +405,44 @@ export function subscribeRealtimeSnapshot(
     )
   );
 
-  if (config.graphnavMetadataStreamName) {
-    cleanups.push(
-      live.subscribeToJson(
-        deviceId,
-        buildRealtimeSource(config.graphnavMetadataStreamName, "json"),
-        (value) => {
-          const graphnavMetadata = parseGraphNavMetadataValue(value);
-          if (!graphnavMetadata) {
-            onPatch({
-              warnings: [`Could not parse ${config.graphnavMetadataStreamName}`]
-            });
-            return;
-          }
-          onPatch({
-            graphnavMetadata,
-            graphnavMetadataTime: Date.now()
-          });
-        }
-      )
-    );
-  }
+  cleanups.push(
+    live.subscribeToText(
+      deviceId,
+      buildRealtimeSource(config.connectionStateStreamName, "text"),
+      (value) => patchTextValue("connectionState", "connectionStateTime", value, onPatch)
+    )
+  );
+
+  cleanups.push(
+    live.subscribeToText(
+      deviceId,
+      buildRealtimeSource(config.dockingStateStreamName, "text"),
+      (value) => patchTextValue("dockingState", "dockingStateTime", value, onPatch)
+    )
+  );
+
+  cleanups.push(
+    live.subscribeToText(
+      deviceId,
+      buildRealtimeSource(config.motorPowerStateStreamName, "text"),
+      (value) => patchTextValue("motorPowerState", "motorPowerStateTime", value, onPatch)
+    )
+  );
+
+  cleanups.push(
+    live.subscribeToText(
+      deviceId,
+      buildRealtimeSource(config.behaviorStateStreamName, "text"),
+      (value) => patchTextValue("behaviorState", "behaviorStateTime", value, onPatch)
+    )
+  );
 
   return () => {
     cleanups.forEach((cleanup) => {
       try {
         cleanup();
       } catch {
-        // ignore cleanup errors from stale realtime subscriptions
+        // Ignore stale realtime cleanup errors.
       }
     });
   };
@@ -367,4 +455,8 @@ export function formatGotoPosePayload(
   yawDeg: number
 ): string {
   return `map_uuid=${mapUuid}, x=${x.toFixed(3)}, y=${y.toFixed(3)}, yaw_deg=${yawDeg.toFixed(1)}`;
+}
+
+export function formatWaypointGotoPayload(mapUuid: string, waypointId: string): string {
+  return `map_uuid=${mapUuid}, waypoint_id=${waypointId}`;
 }

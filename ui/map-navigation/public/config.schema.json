@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Spot Map Navigation",
-  "description": "Configuration for the Spot GraphNav map navigation custom module.",
+  "title": "Spot Navigation",
+  "description": "Configuration for the production Spot navigation custom module.",
   "type": "object",
   "properties": {
     "mapImageStreamName": {
@@ -18,11 +18,11 @@
       "default": "spot.localization.graphnav.global.image.meta",
       "$formant.streams.byType": "text"
     },
-    "graphnavMetadataStreamName": {
-      "title": "GraphNav Metadata Stream",
-      "description": "Optional waypoint and edge overlay stream. Leave blank unless you have a small UI-safe metadata stream.",
+    "overlayStreamName": {
+      "title": "Waypoint Overlay Stream",
+      "description": "Small JSON overlay stream with waypoint and edge data for the current map.",
       "type": "string",
-      "default": "",
+      "default": "spot.graphnav.overlay",
       "$formant.streams.byType": "text"
     },
     "navStateStreamName": {
@@ -32,28 +32,80 @@
       "default": "spot.nav.state",
       "$formant.streams.byType": "text"
     },
+    "connectionStateStreamName": {
+      "title": "Connection State Stream",
+      "description": "One-word Spot connection state.",
+      "type": "string",
+      "default": "spot.connection_state",
+      "$formant.streams.byType": "text"
+    },
+    "dockingStateStreamName": {
+      "title": "Docking State Stream",
+      "description": "One-word Spot docking state.",
+      "type": "string",
+      "default": "spot.docking_state",
+      "$formant.streams.byType": "text"
+    },
+    "motorPowerStateStreamName": {
+      "title": "Motor Power State Stream",
+      "description": "One-word motor power state.",
+      "type": "string",
+      "default": "spot.motor_power_state",
+      "$formant.streams.byType": "text"
+    },
+    "behaviorStateStreamName": {
+      "title": "Behavior State Stream",
+      "description": "One-word robot behavior state.",
+      "type": "string",
+      "default": "spot.behavior_state",
+      "$formant.streams.byType": "text"
+    },
+    "waypointGotoCommandName": {
+      "title": "Waypoint Goto Command Name",
+      "description": "Command template used for waypoint-first navigation.",
+      "type": "string",
+      "default": "spot.waypoint.goto"
+    },
     "gotoPoseCommandName": {
-      "title": "Goto Pose Command Name",
-      "description": "Command template used when sending an arbitrary map target.",
+      "title": "Point Goto Command Name",
+      "description": "Command template used for arbitrary point navigation.",
       "type": "string",
       "default": "spot.graphnav.goto_pose"
     },
+    "cancelNavCommandName": {
+      "title": "Cancel Navigation Command Name",
+      "description": "Command template used to override active navigation and hold the current localized pose.",
+      "type": "string",
+      "default": "spot.graphnav.cancel"
+    },
+    "returnAndDockCommandName": {
+      "title": "Return And Dock Command Name",
+      "description": "Command template used to return to dock.",
+      "type": "string",
+      "default": "spot.return_and_dock"
+    },
+    "undockCommandName": {
+      "title": "Undock Command Name",
+      "description": "Command template used to undock the robot.",
+      "type": "string",
+      "default": "spot.undock"
+    },
     "showWaypointLabels": {
       "title": "Show Waypoint Labels",
-      "description": "Render waypoint labels when an overlay stream is configured.",
+      "description": "Render waypoint labels on the map.",
       "type": "boolean",
       "default": true
     },
     "defaultYawMode": {
-      "title": "Default Target Heading",
-      "description": "Heading applied when the user clicks a new target.",
+      "title": "Default Point Heading",
+      "description": "Initial heading for new point selections before the operator changes it.",
       "type": "string",
       "default": "current",
       "enum": ["current", "fixed"]
     },
     "defaultYawDeg": {
       "title": "Fixed Default Heading (deg)",
-      "description": "Fallback heading used when Default Target Heading is fixed.",
+      "description": "Used when Default Point Heading is fixed.",
       "type": "number",
       "default": 0
     }

@@ -1,9 +1,17 @@
 export interface ModuleConfig {
   mapImageStreamName: string;
   mapImageMetadataStreamName: string;
-  graphnavMetadataStreamName: string;
+  overlayStreamName: string;
   navStateStreamName: string;
+  connectionStateStreamName: string;
+  dockingStateStreamName: string;
+  motorPowerStateStreamName: string;
+  behaviorStateStreamName: string;
+  waypointGotoCommandName: string;
   gotoPoseCommandName: string;
+  cancelNavCommandName: string;
+  returnAndDockCommandName: string;
+  undockCommandName: string;
   showWaypointLabels: boolean;
   defaultYawMode: "current" | "fixed";
   defaultYawDeg: number;
@@ -59,24 +67,27 @@ export interface GraphNavMapImageMetadata {
   map?: GraphNavMapJson;
 }
 
-export interface GraphNavWaypoint {
+export interface GraphNavOverlayWaypoint {
   id: string;
-  label?: string;
-  display_name?: string;
-  is_dock?: boolean;
-  seed_tform_waypoint: Pose3DJson;
+  name: string;
+  label: string;
+  x: number;
+  y: number;
+  is_dock: boolean;
 }
 
-export interface GraphNavEdge {
+export interface GraphNavOverlayEdge {
   from_waypoint_id: string;
   to_waypoint_id: string;
 }
 
-export interface GraphNavMetadata {
+export interface GraphNavOverlay {
   map_id: string;
   map_uuid: string;
-  waypoints: GraphNavWaypoint[];
-  edges: GraphNavEdge[];
+  current_waypoint_id: string;
+  dock_waypoint_id: string;
+  waypoints: GraphNavOverlayWaypoint[];
+  edges: GraphNavOverlayEdge[];
 }
 
 export interface NavState {
@@ -100,9 +111,13 @@ export interface NavState {
   current_seed_z?: number;
   current_seed_yaw_rad?: number;
   has_seed_goal: boolean;
+  has_waypoint_goal?: boolean;
   target_seed_x?: number;
   target_seed_y?: number;
   target_seed_yaw_rad?: number;
+  target_waypoint_goal_x?: number;
+  target_waypoint_goal_y?: number;
+  target_waypoint_goal_yaw_rad?: number;
 }
 
 export interface TargetPose {
@@ -112,15 +127,22 @@ export interface TargetPose {
 }
 
 export interface StreamSnapshot {
-  mapImageUrl?: string;
   mapImageCanvas?: HTMLCanvasElement;
   mapImageFrameVersion?: number;
   mapImageTime?: number;
   mapImageMetadata?: GraphNavMapImageMetadata;
   mapImageMetadataTime?: number;
-  graphnavMetadata?: GraphNavMetadata;
-  graphnavMetadataTime?: number;
+  overlay?: GraphNavOverlay;
+  overlayTime?: number;
   navState?: NavState;
   navStateTime?: number;
+  connectionState?: string;
+  connectionStateTime?: number;
+  dockingState?: string;
+  dockingStateTime?: number;
+  motorPowerState?: string;
+  motorPowerStateTime?: number;
+  behaviorState?: string;
+  behaviorStateTime?: number;
   warnings?: string[];
 }

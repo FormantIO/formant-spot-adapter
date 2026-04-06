@@ -1453,6 +1453,47 @@ std::string build_graphnav_metadata_json(
   return metadata.str();
 }
 
+std::string build_graphnav_overlay_json(
+    const std::string& map_id,
+    const std::string& map_uuid,
+    const SpotClient::GraphNavMapSnapshot& graphnav_snapshot,
+    const std::unordered_map<std::string, std::vector<std::string>>& aliases_by_waypoint,
+    const std::string& dock_waypoint_id,
+    const std::string& current_waypoint_id) {
+  std::ostringstream overlay;
+  overlay << "{\"map_id\":\"" << json_escape(map_id)
+          << "\",\"map_uuid\":\"" << json_escape(map_uuid)
+          << "\",\"current_waypoint_id\":\"" << json_escape(current_waypoint_id)
+          << "\",\"dock_waypoint_id\":\"" << json_escape(dock_waypoint_id)
+          << "\",\"waypoints\":[";
+  for (size_t i = 0; i < graphnav_snapshot.waypoints.size(); ++i) {
+    const auto& waypoint = graphnav_snapshot.waypoints[i];
+    const auto alias_it = aliases_by_waypoint.find(waypoint.id);
+    const std::vector<std::string>* aliases =
+        (alias_it == aliases_by_waypoint.end()) ? nullptr : &alias_it->second;
+    const std::string display_name =
+        (aliases && !aliases->empty()) ? aliases->front()
+                                       : (waypoint.label.empty() ? waypoint.id : waypoint.label);
+    if (i > 0) overlay << ",";
+    overlay << "{\"id\":\"" << json_escape(waypoint.id)
+            << "\",\"name\":\"" << json_escape(display_name)
+            << "\",\"label\":\"" << json_escape(waypoint.label)
+            << "\",\"x\":" << waypoint.seed_tform_waypoint.x
+            << ",\"y\":" << waypoint.seed_tform_waypoint.y
+            << ",\"is_dock\":"
+            << (waypoint.id == dock_waypoint_id ? "true" : "false") << "}";
+  }
+  overlay << "],\"edges\":[";
+  for (size_t i = 0; i < graphnav_snapshot.edges.size(); ++i) {
+    const auto& edge = graphnav_snapshot.edges[i];
+    if (i > 0) overlay << ",";
+    overlay << "{\"from_waypoint_id\":\"" << json_escape(edge.from_waypoint_id)
+            << "\",\"to_waypoint_id\":\"" << json_escape(edge.to_waypoint_id) << "\"}";
+  }
+  overlay << "]}";
+  return overlay.str();
+}
+
 std::string build_graphnav_map_image_metadata_json(
     const std::string& image_stream,
     const std::string& metadata_stream,
@@ -1890,6 +1931,7 @@ bool Adapter::Init() {
                                     "graphnav_global_localization_stream");
   DisableConfiguredStreamIfDisabled(&cfg_.graphnav_map_stream, "graphnav_map_stream");
   DisableConfiguredStreamIfDisabled(&cfg_.graphnav_metadata_stream, "graphnav_metadata_stream");
+  DisableConfiguredStreamIfDisabled(&cfg_.graphnav_overlay_stream, "graphnav_overlay_stream");
   DisableConfiguredStreamIfDisabled(&cfg_.graphnav_nav_state_stream, "graphnav_nav_state_stream");
   DisableConfiguredStreamIfDisabled(&cfg_.graphnav_map_image_stream_name,
                                     "graphnav_map_image_stream_name");
@@ -1990,6 +2032,12 @@ bool Adapter::Init() {
     std::cerr << "[graphnav] nav state stream config: stream="
               << cfg_.graphnav_nav_state_stream
               << " publish_hz=1"
+              << std::endl;
+  }
+  if (!cfg_.graphnav_overlay_stream.empty()) {
+    std::cerr << "[graphnav] overlay stream config: stream="
+              << cfg_.graphnav_overlay_stream
+              << " publish_hz=0.2 + on_change"
               << std::endl;
   }
   if (!cfg_.graphnav_map_image_stream_name.empty() ||
@@ -2116,7 +2164,8 @@ void Adapter::Run() {
                            "spot.waypoint.save",
                            "spot.waypoint.delete", "spot.waypoint.goto",
                            "spot.waypoint.goto_straight",
-                           "spot.graphnav.goto_pose", "spot.graphnav.goto_pose_straight"},
+                           "spot.graphnav.goto_pose", "spot.graphnav.goto_pose_straight",
+                           "spot.graphnav.cancel"},
                           [this](const v1::model::CommandRequest& request) { HandleCommand(request); });
   agent_.StartHeartbeatLoop(
       [this](const v1::agent::GetTeleopHeartbeatStreamResponse& hb) { HandleHeartbeat(hb); });
@@ -2175,6 +2224,7 @@ void Adapter::Run() {
     PublishWaypointsText(false);
     PublishMapsText(false);
     PublishGraphNavMetadataText(false);
+    PublishGraphNavOverlayText(false);
     PublishCurrentMapText(false);
     PublishDefaultMapText(false);
     MaybePublishGraphNavMap(now);
@@ -4628,6 +4678,87 @@ bool Adapter::ExecuteGraphNavGotoPoseCommand(const v1::model::CommandRequest& re
   return ok;
 }
 
+bool Adapter::ExecuteGraphNavCancelCommand() {
+  const std::string action_name = "spot.graphnav.cancel";
+  if (!EnsureLeaseForCommand(action_name)) return false;
+
+  const uint32_t active_command_id = last_graph_nav_command_id_.load();
+  if (active_command_id == 0 && !graphnav_navigation_active_.load()) {
+    EmitLog("[graphnav] spot.graphnav.cancel ignored: no active navigation command");
+    return true;
+  }
+
+  SpotClient::LocalizationSnapshot localization;
+  if (!SpotConnected() || !spot_.GetLocalizationSnapshot(&localization)) {
+    EmitLog("[graphnav] spot.graphnav.cancel rejected: localization unavailable");
+    return false;
+  }
+  if (localization.waypoint_id.empty() || !localization.has_waypoint_tform_body ||
+      !localization.has_seed_tform_body) {
+    EmitLog("[graphnav] spot.graphnav.cancel rejected: current localized pose unavailable");
+    return false;
+  }
+
+  std::string map_id;
+  std::string map_uuid;
+  std::string waypoint_name;
+  double current_seed_yaw_rad = 0.0;
+  double waypoint_yaw_rad = 0.0;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    SpotClient::Pose3D waypoint_pose;
+    if (!LookupWaypointSeedPoseLocked(localization.waypoint_id, &waypoint_pose, &map_uuid)) {
+      EmitLog("[graphnav] spot.graphnav.cancel rejected: current waypoint not found in active map");
+      return false;
+    }
+    const auto* waypoint =
+        graphnav_map_artifacts_ ? find_graphnav_waypoint(graphnav_map_artifacts_->snapshot,
+                                                         localization.waypoint_id)
+                                : nullptr;
+    if (!waypoint) {
+      EmitLog("[graphnav] spot.graphnav.cancel rejected: failed resolving current waypoint pose");
+      return false;
+    }
+    map_id = graphnav_map_artifacts_->map_id;
+    waypoint_name = ResolveWaypointNameForIdLocked(localization.waypoint_id);
+    if (waypoint_name.empty()) {
+      waypoint_name = waypoint->label.empty() ? localization.waypoint_id : waypoint->label;
+    }
+    waypoint_yaw_rad = quaternion_yaw_rad(pose_quaternion(waypoint_pose));
+    current_seed_yaw_rad =
+        quaternion_yaw_rad(pose_quaternion(pose3d_from_localization_snapshot(localization)));
+  }
+
+  const double waypoint_goal_yaw_rad =
+      normalize_angle_rad(current_seed_yaw_rad - waypoint_yaw_rad);
+  const double seed_x = localization.seed_tform_body_x;
+  const double seed_y = localization.seed_tform_body_y;
+  const double waypoint_goal_x = localization.waypoint_tform_body_x;
+  const double waypoint_goal_y = localization.waypoint_tform_body_y;
+
+  EmitLog("[graphnav] spot.graphnav.cancel overriding active navigation to current pose at waypoint=" +
+          waypoint_name);
+
+  uint32_t command_id = 0;
+  if (!StartNavigateWithRecovery(action_name, localization.waypoint_id, &command_id, false, true,
+                                 waypoint_goal_x, waypoint_goal_y, waypoint_goal_yaw_rad)) {
+    return false;
+  }
+
+  SetGraphNavNavTarget("cancel", localization.waypoint_id, waypoint_name, map_id, map_uuid,
+                       true, seed_x, seed_y, current_seed_yaw_rad, true, waypoint_goal_x,
+                       waypoint_goal_y, waypoint_goal_yaw_rad);
+  last_graph_nav_command_id_ = command_id;
+  graphnav_navigation_active_ = true;
+  nav_auto_recovered_ = false;
+  const bool ok = WaitForGraphNavCommandResult(
+      command_id, static_cast<long long>(std::max(15, cfg_.graphnav_command_timeout_sec)) * 1000LL);
+  graphnav_navigation_active_ = false;
+  last_graph_nav_command_id_ = 0;
+  if (ok) EmitLog("[graphnav] spot.graphnav.cancel success");
+  return ok;
+}
+
 bool Adapter::ExecuteDockSequence(bool return_and_dock) {
   if (docking_in_progress_.load()) {
     EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
@@ -4806,6 +4937,7 @@ bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
   if (command == "spot.graphnav.goto_pose_straight") {
     return ExecuteGraphNavGotoPoseCommand(request, true);
   }
+  if (command == "spot.graphnav.cancel") return ExecuteGraphNavCancelCommand();
   if (command.rfind("spot.waypoint.", 0) == 0) return HandleWaypointCommand(request);
   return false;
 }
@@ -5715,6 +5847,7 @@ void Adapter::ClearGraphNavMapArtifacts() {
   graphnav_map_post_backoff_ms_ = 1000;
   last_graphnav_map_posted_version_ = 0;
   force_graphnav_metadata_publish_ = true;
+  force_graphnav_overlay_publish_ = true;
 }
 
 bool Adapter::RefreshGraphNavMapArtifacts(const std::string& map_id,
@@ -5763,6 +5896,7 @@ bool Adapter::RefreshGraphNavMapArtifacts(const std::string& map_id,
   next_graphnav_map_post_ms_ = 0;
   graphnav_map_post_backoff_ms_ = 1000;
   force_graphnav_metadata_publish_ = true;
+  force_graphnav_overlay_publish_ = true;
   return true;
 }
 
@@ -5823,6 +5957,7 @@ void Adapter::RefreshGraphNavMetadataForMap(const std::string& map_id) {
     graphnav_map_artifacts_ = std::move(updated_artifacts);
   }
   force_graphnav_metadata_publish_ = true;
+  force_graphnav_overlay_publish_ = true;
 }
 
 void Adapter::RefreshGraphWaypointIndex() {
@@ -6113,6 +6248,63 @@ void Adapter::PublishGraphNavMetadataText(bool force) {
   }
   QueueStatusText(cfg_.graphnav_metadata_stream, payload);
   last_graphnav_metadata_pub_ms_ = now;
+}
+
+void Adapter::PublishGraphNavOverlayText(bool force) {
+  if (cfg_.graphnav_overlay_stream.empty()) return;
+  const long long kPeriodicMs = 5000;
+  const long long now = now_ms();
+  const bool force_flag = force_graphnav_overlay_publish_.exchange(false);
+
+  std::shared_ptr<GraphNavMapArtifacts> artifacts;
+  std::unordered_map<std::string, std::vector<std::string>> aliases_by_waypoint;
+  std::string dock_waypoint_id;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    artifacts = graphnav_map_artifacts_;
+    if (artifacts) {
+      const auto alias_it = waypoint_aliases_by_map_.find(artifacts->map_id);
+      if (alias_it != waypoint_aliases_by_map_.end()) {
+        for (const auto& alias : alias_it->second) {
+          aliases_by_waypoint[alias.second].push_back(alias.first);
+        }
+      }
+      const auto dock_it = dock_waypoint_by_map_.find(artifacts->map_id);
+      if (dock_it != dock_waypoint_by_map_.end()) {
+        dock_waypoint_id = dock_it->second;
+      }
+    }
+  }
+  for (auto& kv : aliases_by_waypoint) {
+    std::sort(kv.second.begin(), kv.second.end());
+    kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+  }
+
+  std::string current_waypoint_id;
+  if (SpotConnected()) {
+    SpotClient::LocalizationSnapshot localization;
+    if (spot_.GetLocalizationSnapshot(&localization)) {
+      current_waypoint_id = localization.waypoint_id;
+    }
+  }
+
+  const std::string payload =
+      artifacts ? build_graphnav_overlay_json(artifacts->map_id, artifacts->map_uuid,
+                                              artifacts->snapshot, aliases_by_waypoint,
+                                              dock_waypoint_id, current_waypoint_id)
+                : "";
+  bool changed = false;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    changed = (payload != last_graphnav_overlay_payload_);
+    if (changed) last_graphnav_overlay_payload_ = payload;
+  }
+  if (!force && !force_flag && !changed &&
+      (now - last_graphnav_overlay_pub_ms_.load()) < kPeriodicMs) {
+    return;
+  }
+  QueueStatusText(cfg_.graphnav_overlay_stream, payload);
+  last_graphnav_overlay_pub_ms_ = now;
 }
 
 void Adapter::MaybePublishGraphNavMap(long long now) {

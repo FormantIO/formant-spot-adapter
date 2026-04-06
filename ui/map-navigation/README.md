@@ -6,28 +6,41 @@ This directory contains a static single-page application intended to be hosted o
 
 - Uses Formant iframe auth context via `@formant/data-sdk`
 - Resolves the current device from Formant module context
-- Opens a Formant realtime connection and subscribes to the Spot GraphNav map image and companion metadata streams
-- Renders the live robot pose and optional waypoint overlays
-- Converts map clicks into seed-frame `(x, y, yaw)` targets
-- Sends `spot.graphnav.goto_pose` commands back through Formant
+- Opens a Formant realtime connection and subscribes to the Spot GraphNav map image, image metadata, overlay, and nav state streams
+- Renders the live robot pose, waypoint overlay, active target, and readiness state
+- Makes saved waypoint navigation the primary workflow, with arbitrary point navigation as an advanced mode
+- Sends `spot.waypoint.goto`, `spot.graphnav.goto_pose`, `spot.graphnav.cancel`, `spot.return_and_dock`, and `spot.undock` through Formant
 
-By default the module only depends on:
+By default the module depends on:
 
 - `spot.localization.graphnav.global.image`
 - `spot.localization.graphnav.global.image.meta`
+- `spot.graphnav.overlay`
 - `spot.nav.state`
+- `spot.connection_state`
+- `spot.docking_state`
+- `spot.motor_power_state`
+- `spot.behavior_state`
 
 Recommended module configuration:
 
 - `Global Map Image Stream`: `spot.localization.graphnav.global.image`
 - `Global Map Image Metadata Stream`: `spot.localization.graphnav.global.image.meta`
-- `GraphNav Metadata Stream`: leave blank unless you publish a small UI-safe overlay stream
+- `GraphNav Overlay Stream`: `spot.graphnav.overlay`
 - `Navigation State Stream`: `spot.nav.state`
+- `Connection State Stream`: `spot.connection_state`
+- `Docking State Stream`: `spot.docking_state`
+- `Motor Power State Stream`: `spot.motor_power_state`
+- `Behavior State Stream`: `spot.behavior_state`
+- `Waypoint Goto Command Name`: `spot.waypoint.goto`
 - `Goto Pose Command Name`: `spot.graphnav.goto_pose`
+- `Cancel Navigation Command Name`: `spot.graphnav.cancel`
+- `Return And Dock Command Name`: `spot.return_and_dock`
+- `Undock Command Name`: `spot.undock`
 
-`spot.graphnav.metadata` is optional and disabled by default because large text/json payloads can
-be truncated by downstream query paths. Only configure an overlay metadata stream if it is kept
-small enough for reliable iframe queries.
+`spot.graphnav.metadata` is intentionally not part of the default module contract. It can be too
+large for some downstream query paths. The adapter publishes `spot.graphnav.overlay` instead as a
+small UI-safe JSON stream for waypoint and edge rendering.
 
 ## Local development
 

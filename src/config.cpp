@@ -154,6 +154,9 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_graphnav_metadata_stream()) {
     c->graphnav_metadata_stream = j.graphnav_metadata_stream().value();
   }
+  if (j.has_graphnav_overlay_stream()) {
+    c->graphnav_overlay_stream = j.graphnav_overlay_stream().value();
+  }
   if (j.has_graphnav_nav_state_stream()) {
     c->graphnav_nav_state_stream = j.graphnav_nav_state_stream().value();
   }
@@ -263,6 +266,8 @@ Config load_config_from_env() {
   c.graphnav_map_stream = getenv_or("GRAPHNAV_MAP_STREAM", c.graphnav_map_stream);
   c.graphnav_metadata_stream =
       getenv_or("GRAPHNAV_METADATA_STREAM", c.graphnav_metadata_stream);
+  c.graphnav_overlay_stream =
+      getenv_or("GRAPHNAV_OVERLAY_STREAM", c.graphnav_overlay_stream);
   c.graphnav_nav_state_stream =
       getenv_or("GRAPHNAV_NAV_STATE_STREAM", c.graphnav_nav_state_stream);
   c.graphnav_map_image_stream_name =

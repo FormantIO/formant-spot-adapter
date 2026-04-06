@@ -52,6 +52,7 @@ class Adapter {
   bool ExecuteWaypointGotoCommand(const v1::model::CommandRequest& request);
   bool ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest& request);
   bool ExecuteGraphNavGotoPoseCommand(const v1::model::CommandRequest& request, bool straight);
+  bool ExecuteGraphNavCancelCommand();
   bool ExecuteDockSequence(bool return_and_dock);
   bool ExecuteUndockCommand();
   bool WaitForGraphNavCommandResult(uint32_t command_id, long long timeout_ms);
@@ -102,6 +103,7 @@ class Adapter {
   void PublishWaypointsText(bool force);
   void PublishMapsText(bool force);
   void PublishGraphNavMetadataText(bool force);
+  void PublishGraphNavOverlayText(bool force);
   void MaybePublishGraphNavMap(long long now_ms);
   void PublishCurrentMapText(bool force);
   void PublishDefaultMapText(bool force);
@@ -270,6 +272,7 @@ class Adapter {
   std::string last_waypoint_text_payload_;
   std::string last_maps_text_payload_;
   std::string last_graphnav_metadata_payload_;
+  std::string last_graphnav_overlay_payload_;
   std::string last_current_map_text_payload_;
   std::string last_default_map_text_payload_;
   std::string last_map_progress_signature_;
@@ -299,6 +302,7 @@ class Adapter {
   std::atomic<long long> last_waypoint_at_pub_ms_{0};
   std::atomic<long long> last_maps_pub_ms_{0};
   std::atomic<long long> last_graphnav_metadata_pub_ms_{0};
+  std::atomic<long long> last_graphnav_overlay_pub_ms_{0};
   std::atomic<long long> last_current_map_pub_ms_{0};
   std::atomic<long long> last_default_map_pub_ms_{0};
   std::atomic<long long> next_graphnav_map_post_ms_{0};
@@ -310,6 +314,7 @@ class Adapter {
   std::atomic<bool> force_waypoint_publish_{true};
   std::atomic<bool> force_maps_publish_{true};
   std::atomic<bool> force_graphnav_metadata_publish_{true};
+  std::atomic<bool> force_graphnav_overlay_publish_{true};
   std::string current_waypoint_at_text_;
   std::atomic<bool> map_recording_active_{false};
   std::atomic<bool> graphnav_navigation_active_{false};

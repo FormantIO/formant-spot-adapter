@@ -73,6 +73,7 @@ message AdapterConfig {
   google.protobuf.StringValue graphnav_map_stream = 62;
   google.protobuf.StringValue graphnav_metadata_stream = 63;
   google.protobuf.StringValue graphnav_nav_state_stream = 64;
+  google.protobuf.StringValue graphnav_overlay_stream = 77;
   google.protobuf.StringValue graphnav_map_image_stream_name = 65;
   google.protobuf.StringValue graphnav_map_image_metadata_stream_name = 75;
   google.protobuf.Int32Value graphnav_map_image_fps = 73;

@@ -50,6 +50,11 @@ declare module "@formant/data-sdk" {
       source: RealtimeStreamSource,
       callback: (data: unknown) => void
     ): () => void;
+    subscribeToText(
+      deviceId: string,
+      source: RealtimeStreamSource,
+      callback: (text: string | symbol) => void
+    ): () => void;
     subscribeToVideo(
       deviceId: string,
       source: RealtimeStreamSource,

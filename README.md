@@ -45,7 +45,7 @@ Additional control channels (not streams):
 - Teleop heartbeat from Formant agent controls session active/inactive behavior.
 - Command channel supports `spot.jetson.reboot`, `spot.robot.reboot`, `spot.camera.calibrate`,
   `spot.stand`, `spot.sit`, `spot.recover`, `spot.dock`, `spot.undock`, `spot.reset_arm`,
-  `spot.map.*`, and `spot.waypoint.*`.
+  `spot.graphnav.*`, `spot.map.*`, and `spot.waypoint.*`.
 
 ### Streams published by adapter (adapter -> Formant)
 
@@ -66,6 +66,7 @@ Additional control channels (not streams):
 | `spot.localization.graphnav.global.image.meta` | Text (JSON) | Companion metadata for the rendered global GraphNav image including draw rect, render scale, resolution, and `seed_tform_grid` for click-to-go UIs |
 | `spot.map.graphnav` | Localization payload carrying map-only data | Dedicated stitched GraphNav map payload for future top-level map transport |
 | `spot.graphnav.metadata` | Text (JSON) | Full waypoint/edge/object metadata for GraphNav maps. Useful for diagnostics, but may be too large for some iframe text-query paths; prefer a smaller UI-specific overlay stream if needed |
+| `spot.graphnav.overlay` | Text (JSON) | Small UI-safe waypoint/edge overlay stream for the active GraphNav map (`map_uuid`, `current_waypoint_id`, `dock_waypoint_id`, `waypoints`, `edges`) |
 | `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus latest command status and current seed-frame robot pose for external map UIs |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |
@@ -106,14 +107,16 @@ value in `streamControls`.
   stitched full-site map. See
   [`docs/formant-localization-map-analysis.md`](docs/formant-localization-map-analysis.md)
   for the implementation notes and next steps.
-- `spot.localization.graphnav.global.image`, `spot.localization.graphnav.global.image.meta`, and
-  `spot.nav.state` form the core backend contract for an external GraphNav map UI.
+- `spot.localization.graphnav.global.image`, `spot.localization.graphnav.global.image.meta`,
+  `spot.graphnav.overlay`, and `spot.nav.state` form the core backend contract for an external
+  GraphNav map UI.
 - `spot.graphnav.metadata` remains available as a richer diagnostic stream, but iframe-based UIs
   should treat it as optional unless they use a transport path that safely handles larger JSON
-  payloads.
+  payloads. Production map UIs should prefer `spot.graphnav.overlay`.
 - `ui/map-navigation` contains a GitHub Pages-hosted custom module that consumes that backend
-  contract from inside a Formant iframe, renders the global map image, and issues
-  `spot.graphnav.goto_pose` commands from click-selected targets.
+  contract from inside a Formant iframe, renders the global map image, prefers waypoint-first
+  navigation, and issues `spot.waypoint.goto` / `spot.graphnav.goto_pose` commands plus
+  `spot.graphnav.cancel`, `spot.undock`, and `spot.return_and_dock` actions.
 - `spot.localization.graphnav.image` is a rendered 16:9 visualization of the same local patch with a robot
   footprint, heading arrow, scale bar, and status HUD. The adapter renders only when the Spot data
   changes, then republishes the cached JPEG at a stable output FPS. For camera-like playback in
@@ -175,6 +178,10 @@ Additional non-GraphNav command-channel actions:
   `yaw_rad=<rad>` / `yaw_deg=<deg>` to navigate to a seed-frame target on the active map.
 - `spot.graphnav.goto_pose_straight`: same as `spot.graphnav.goto_pose`, with straight-line-biased travel params.
   - Parameter examples: `name=dock_entry`
+- `spot.graphnav.cancel`: override any active GraphNav route with a new goal at the robot's
+  current localized pose, effectively canceling in-flight navigation.
+  - No parameters.
+  - Requires a valid current localization and active lease.
 
 Note: `spot.waypoint.save`/`spot.waypoint.update` can be called while not actively mapping; the
 adapter runs a temporary start/create/stop recording sequence.
@@ -182,7 +189,8 @@ adapter runs a temporary start/create/stop recording sequence.
 Command responses:
 - Responses are terminal: success/failure is returned after the action reaches a terminal state.
 - Long-running commands (`spot.camera.calibrate`, `spot.waypoint.goto`, `spot.dock`,
-  `spot.undock`, `spot.return_and_dock`) keep the response pending until completion.
+  `spot.undock`, `spot.return_and_dock`, `spot.graphnav.cancel`) keep the response pending until
+  completion.
 
 ## Configuration Model
 

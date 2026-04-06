@@ -56,6 +56,7 @@ struct Config {
   int graphnav_global_localization_hz{2};
   std::string graphnav_map_stream{"spot.map.graphnav"};
   std::string graphnav_metadata_stream{"spot.graphnav.metadata"};
+  std::string graphnav_overlay_stream{"spot.graphnav.overlay"};
   std::string graphnav_nav_state_stream{"spot.nav.state"};
   std::string graphnav_map_image_stream_name{"spot.localization.graphnav.global.image"};
   std::string graphnav_map_image_metadata_stream_name{"spot.localization.graphnav.global.image.meta"};
