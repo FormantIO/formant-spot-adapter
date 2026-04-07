@@ -162,12 +162,12 @@ If you rename a stream from its default, use the renamed stream name in `streamC
   - `current_waypoint_id`
   - `dock_waypoint_id`
   - `waypoints: [{id, name, label, x, y, is_dock}]`
-  - `edges: [{from_waypoint_id, to_waypoint_id}]`
-- Intended as the primary waypoint/edge stream for iframe-based navigation UIs.
+- Intended as the primary waypoint stream for iframe-based navigation UIs.
 
 - `spot.nav.state` (type: text/json, 1 Hz + on change)
 - High-level GraphNav navigation state for external map UIs.
-- Includes `active`, `command_id`, `status`, `status_name`, `mode`, `map_id`, `map_uuid`,
+- Includes `active`, `command_id`, `status`, `status_name`, `phase`, `terminal_result`,
+  `terminal_reason`, `mode`, `map_id`, `map_uuid`,
   `target_waypoint_id`, `target_name`, target pose fields when available, plus current
   localization fields: `localized`, `current_waypoint_id`, `has_current_seed_pose`,
   `current_seed_x`, `current_seed_y`, `current_seed_z`, and `current_seed_yaw_rad`.
@@ -378,7 +378,7 @@ If you rename a stream from its default, use the renamed stream name in `streamC
 
 - `spot.graphnav.cancel` (command)
 - Overrides active GraphNav navigation with a new goal at the robot's current localized pose.
-- Intended as the operator-facing cancel primitive for map UIs.
+- Intended as the operator-facing hold-position override for map UIs.
 - No parameters.
 
 Command response behavior:

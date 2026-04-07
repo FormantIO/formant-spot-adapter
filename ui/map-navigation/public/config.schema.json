@@ -16,21 +16,21 @@
       "description": "JSON metadata companion for the rendered global map image.",
       "type": "string",
       "default": "spot.localization.graphnav.global.image.meta",
-      "$formant.streams.byType": "text"
+      "$formant.streams.byType": "json"
     },
     "overlayStreamName": {
       "title": "Waypoint Overlay Stream",
-      "description": "Small JSON overlay stream with waypoint and edge data for the current map.",
+      "description": "Small JSON overlay stream with waypoint data for the current map.",
       "type": "string",
       "default": "spot.graphnav.overlay",
-      "$formant.streams.byType": "text"
+      "$formant.streams.byType": "json"
     },
     "navStateStreamName": {
       "title": "Navigation State Stream",
       "description": "Current GraphNav status and live seed-frame pose.",
       "type": "string",
       "default": "spot.nav.state",
-      "$formant.streams.byType": "text"
+      "$formant.streams.byType": "json"
     },
     "connectionStateStreamName": {
       "title": "Connection State Stream",
@@ -60,6 +60,13 @@
       "default": "spot.behavior_state",
       "$formant.streams.byType": "text"
     },
+    "batteryStreamName": {
+      "title": "Battery Stream",
+      "description": "Numeric Spot battery percentage stream.",
+      "type": "string",
+      "default": "spot.robot_state.battery",
+      "$formant.streams.byType": "numeric"
+    },
     "waypointGotoCommandName": {
       "title": "Waypoint Goto Command Name",
       "description": "Command template used for waypoint-first navigation.",
@@ -73,7 +80,7 @@
       "default": "spot.graphnav.goto_pose"
     },
     "cancelNavCommandName": {
-      "title": "Cancel Navigation Command Name",
+      "title": "Hold Position Command Name",
       "description": "Command template used to override active navigation and hold the current localized pose.",
       "type": "string",
       "default": "spot.graphnav.cancel"

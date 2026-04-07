@@ -66,8 +66,8 @@ Additional control channels (not streams):
 | `spot.localization.graphnav.global.image.meta` | Text (JSON) | Companion metadata for the rendered global GraphNav image including draw rect, render scale, resolution, and `seed_tform_grid` for click-to-go UIs |
 | `spot.map.graphnav` | Localization payload carrying map-only data | Dedicated stitched GraphNav map payload for future top-level map transport |
 | `spot.graphnav.metadata` | Text (JSON) | Full waypoint/edge/object metadata for GraphNav maps. Useful for diagnostics, but may be too large for some iframe text-query paths; prefer a smaller UI-specific overlay stream if needed |
-| `spot.graphnav.overlay` | Text (JSON) | Small UI-safe waypoint/edge overlay stream for the active GraphNav map (`map_uuid`, `current_waypoint_id`, `dock_waypoint_id`, `waypoints`, `edges`) |
-| `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus latest command status and current seed-frame robot pose for external map UIs |
+| `spot.graphnav.overlay` | Text (JSON) | Small UI-safe waypoint overlay stream for the active GraphNav map (`map_uuid`, `current_waypoint_id`, `dock_waypoint_id`, `waypoints`) |
+| `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus lifecycle/terminal result and current seed-frame robot pose for external map UIs |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |
 | `spot.commanded_motion_mode` | Text | One-word commanded locomotion mode: `walk`, `stairs`, `crawl` |
@@ -116,7 +116,8 @@ value in `streamControls`.
 - `ui/map-navigation` contains a GitHub Pages-hosted custom module that consumes that backend
   contract from inside a Formant iframe, renders the global map image, prefers waypoint-first
   navigation, and issues `spot.waypoint.goto` / `spot.graphnav.goto_pose` commands plus
-  `spot.graphnav.cancel`, `spot.undock`, and `spot.return_and_dock` actions.
+  `spot.graphnav.cancel` (hold-position override), `spot.undock`, and
+  `spot.return_and_dock` actions.
 - `spot.localization.graphnav.image` is a rendered 16:9 visualization of the same local patch with a robot
   footprint, heading arrow, scale bar, and status HUD. The adapter renders only when the Spot data
   changes, then republishes the cached JPEG at a stable output FPS. For camera-like playback in
@@ -179,7 +180,7 @@ Additional non-GraphNav command-channel actions:
 - `spot.graphnav.goto_pose_straight`: same as `spot.graphnav.goto_pose`, with straight-line-biased travel params.
   - Parameter examples: `name=dock_entry`
 - `spot.graphnav.cancel`: override any active GraphNav route with a new goal at the robot's
-  current localized pose, effectively canceling in-flight navigation.
+  current localized pose, effectively acting as a hold-position override rather than a hard stop.
   - No parameters.
   - Requires a valid current localization and active lease.
 

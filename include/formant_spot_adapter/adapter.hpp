@@ -130,6 +130,13 @@ class Adapter {
   void CaptureDockWaypointCandidate();
   void CommitDockWaypointCandidateOnSuccess();
   void ClearDockWaypointCandidateLocked();
+  void ResetGraphNavNavStateLocked();
+  void MarkGraphNavNavigationTerminalLocked(uint32_t command_id,
+                                            int status,
+                                            double remaining_route_m,
+                                            const std::string& result,
+                                            const std::string& reason,
+                                            long long updated_ms);
   void ClearGraphNavNavTargetLocked();
   void SetGraphNavNavTarget(const std::string& mode,
                             const std::string& waypoint_id,
@@ -284,6 +291,11 @@ class Adapter {
   double last_nav_remaining_route_m_{0.0};
   long long last_nav_progress_change_ms_{0};
   std::string last_nav_state_payload_;
+  std::string nav_phase_{"idle"};
+  std::string nav_terminal_result_;
+  std::string nav_terminal_reason_;
+  uint32_t nav_last_completed_command_id_{0};
+  long long nav_last_updated_ms_{0};
   std::string nav_target_mode_;
   std::string nav_target_waypoint_id_;
   std::string nav_target_waypoint_name_;

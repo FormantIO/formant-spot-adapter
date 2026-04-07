@@ -7,6 +7,7 @@ export interface ModuleConfig {
   dockingStateStreamName: string;
   motorPowerStateStreamName: string;
   behaviorStateStreamName: string;
+  batteryStreamName: string;
   waypointGotoCommandName: string;
   gotoPoseCommandName: string;
   cancelNavCommandName: string;
@@ -76,18 +77,13 @@ export interface GraphNavOverlayWaypoint {
   is_dock: boolean;
 }
 
-export interface GraphNavOverlayEdge {
-  from_waypoint_id: string;
-  to_waypoint_id: string;
-}
-
 export interface GraphNavOverlay {
   map_id: string;
   map_uuid: string;
   current_waypoint_id: string;
   dock_waypoint_id: string;
   waypoints: GraphNavOverlayWaypoint[];
-  edges: GraphNavOverlayEdge[];
+  waypoint_count?: number;
 }
 
 export interface NavState {
@@ -98,6 +94,11 @@ export interface NavState {
   status_name: string;
   remaining_route_length_m: number;
   auto_recovered: boolean;
+  phase: string;
+  terminal_result: string;
+  terminal_reason: string;
+  last_completed_command_id: number;
+  updated_at_ms: number;
   mode: string;
   target_waypoint_id: string;
   target_name: string;
@@ -144,5 +145,7 @@ export interface StreamSnapshot {
   motorPowerStateTime?: number;
   behaviorState?: string;
   behaviorStateTime?: number;
+  batteryPct?: number;
+  batteryTime?: number;
   warnings?: string[];
 }

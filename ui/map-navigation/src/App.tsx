@@ -146,15 +146,50 @@ function statusTone(
   }
 }
 
+function navLifecycleTone(
+  result: string | undefined
+): "default" | "primary" | "secondary" | "warning" | "error" {
+  switch (result) {
+    case "reached":
+    case "held_position":
+      return "secondary";
+    case "interrupted":
+      return "warning";
+    case "failed":
+      return "error";
+    default:
+      return "default";
+  }
+}
+
+function isBehaviorNavigationReady(value: string | undefined): boolean {
+  return value === "standing" || value === "stepping" || value === "transition";
+}
+
 function buildMovementReadiness(snapshot: StreamSnapshot, mapUuid: string): string[] {
   const issues: string[] = [];
-  if (!isFresh(snapshot.navStateTime, 4000)) issues.push("Navigation state is stale.");
-  if (!isFresh(snapshot.mapImageMetadataTime, 8000)) issues.push("Map metadata is stale.");
-  if (!isFresh(snapshot.connectionStateTime, 8000)) issues.push("Connection state is stale.");
-  if (snapshot.connectionState !== "connected") issues.push("Robot is not connected.");
-  if (snapshot.motorPowerState !== "on") issues.push("Motor power is not on.");
-  if (snapshot.dockingState !== "undocked") issues.push("Robot must be undocked before moving.");
-  if (!snapshot.navState?.localized) issues.push("Robot is not localized.");
+  const navFresh = isFresh(snapshot.navStateTime, 4000);
+  const mapFresh = isFresh(snapshot.mapImageMetadataTime, 8000);
+  const connectionFresh = isFresh(snapshot.connectionStateTime, 8000);
+  const dockingFresh = isFresh(snapshot.dockingStateTime, 8000);
+  const motorFresh = isFresh(snapshot.motorPowerStateTime, 8000);
+  const behaviorFresh = isFresh(snapshot.behaviorStateTime, 8000);
+
+  if (!navFresh) issues.push("Navigation state is stale.");
+  if (!mapFresh) issues.push("Map metadata is stale.");
+  if (!connectionFresh) issues.push("Connection state is stale.");
+  if (!dockingFresh) issues.push("Docking state is stale.");
+  if (!motorFresh) issues.push("Motor power state is stale.");
+  if (!behaviorFresh) issues.push("Behavior state is stale.");
+  if (connectionFresh && snapshot.connectionState !== "connected") issues.push("Robot is not connected.");
+  if (motorFresh && snapshot.motorPowerState !== "on") issues.push("Motor power is not on.");
+  if (dockingFresh && snapshot.dockingState !== "undocked") {
+    issues.push("Robot must be undocked before moving.");
+  }
+  if (behaviorFresh && !isBehaviorNavigationReady(snapshot.behaviorState)) {
+    issues.push("Robot is not in a navigation-ready behavior state.");
+  }
+  if (navFresh && !snapshot.navState?.localized) issues.push("Robot is not localized.");
   if (!mapUuid) issues.push("No active map is available.");
   return issues;
 }
@@ -333,23 +368,6 @@ function MapView({
           />
         ) : null}
 
-        {snapshot.overlay?.edges.map((edge, index) => {
-          const from = waypointPixels.find((entry) => entry.waypoint.id === edge.from_waypoint_id);
-          const to = waypointPixels.find((entry) => entry.waypoint.id === edge.to_waypoint_id);
-          if (!from || !to) return null;
-          return (
-            <line
-              key={`${edge.from_waypoint_id}-${edge.to_waypoint_id}-${index}`}
-              x1={from.point.x}
-              y1={from.point.y}
-              x2={to.point.x}
-              y2={to.point.y}
-              stroke="rgba(43,182,255,0.36)"
-              strokeWidth="1.5"
-            />
-          );
-        })}
-
         {waypointPixels.map(({ waypoint, point }) => {
           const isCurrent = snapshot.overlay?.current_waypoint_id === waypoint.id;
           const isSelected = selection?.kind === "waypoint" && selection.waypoint.id === waypoint.id;
@@ -514,10 +532,7 @@ export default function App() {
       if (cancelled) return;
       setSnapshot((previous) => ({
         ...previous,
-        ...patch,
-        warnings: Array.from(
-          new Set([...(previous.warnings || []), ...((patch.warnings as string[] | undefined) || [])])
-        )
+        ...patch
       }));
     });
 
@@ -533,6 +548,12 @@ export default function App() {
       setSelectionMode("waypoints");
     }
   }, [snapshot.navState?.active, snapshot.navState?.command_id]);
+
+  useEffect(() => {
+    if (snapshot.navState?.phase === "active" || snapshot.navState?.phase === "terminal") {
+      setCommandNotice(undefined);
+    }
+  }, [snapshot.navState?.phase, snapshot.navState?.last_completed_command_id, snapshot.navState?.command_id]);
 
   const mapUuid = getMapUuid(snapshot);
   const movementReadinessIssues = useMemo(
@@ -586,6 +607,11 @@ export default function App() {
         )} m`
       : "No live pose";
 
+  const batteryLabel =
+    typeof snapshot.batteryPct === "number" ? `battery ${snapshot.batteryPct.toFixed(0)}%` : "battery";
+
+  const navTerminalVisible = snapshot.navState?.phase === "terminal" && Boolean(snapshot.navState?.terminal_result);
+
   const sendCommand = async (
     name: string,
     payload: string | undefined,
@@ -598,26 +624,14 @@ export default function App() {
 
     try {
       const currentDevice = await authenticateAndGetDevice();
-      void currentDevice
-        .sendCommand(name, payload)
-        .then(() => {
-          setCommandNotice(successNotice);
-        })
-        .catch((commandErrorValue) => {
-          setCommandError(
-            commandErrorValue instanceof Error
-              ? commandErrorValue.message
-              : `Command ${name} failed.`
-          );
-        })
-        .finally(() => {
-          setPendingCommand((current) => (current === name ? undefined : current));
-        });
+      await currentDevice.sendCommand(name, payload);
+      setCommandNotice(successNotice);
     } catch (deviceError) {
-      setPendingCommand(undefined);
       setCommandError(
         deviceError instanceof Error ? deviceError.message : `Command ${name} failed.`
       );
+    } finally {
+      setPendingCommand((current) => (current === name ? undefined : current));
     }
   };
 
@@ -675,8 +689,8 @@ export default function App() {
     void sendCommand(
       config.waypointGotoCommandName,
       payload,
-      `Sent ${selection.waypoint.name}. Waiting for navigation state...`,
-      `${selection.waypoint.name} navigation command accepted.`
+      `Sending ${selection.waypoint.name} to Formant...`,
+      `${selection.waypoint.name} command sent. Waiting for navigation state...`
     );
   };
 
@@ -691,8 +705,8 @@ export default function App() {
     void sendCommand(
       config.gotoPoseCommandName,
       payload,
-      "Submitted point target. Waiting for navigation state...",
-      "Point navigation command accepted."
+      "Sending point target to Formant...",
+      "Point target command sent. Waiting for navigation state..."
     );
   };
 
@@ -777,8 +791,23 @@ export default function App() {
                   color={statusTone(snapshot.behaviorState)}
                   variant="outlined"
                 />
+                <Chip
+                  label={batteryLabel}
+                  color={
+                    typeof snapshot.batteryPct === "number" && snapshot.batteryPct <= 20
+                      ? "warning"
+                      : "default"
+                  }
+                  variant={isFresh(snapshot.batteryTime, 15000) ? "outlined" : "filled"}
+                />
                 {snapshot.navState?.active && snapshot.navState.status_name ? (
                   <Chip label={snapshot.navState.status_name} color="warning" />
+                ) : null}
+                {navTerminalVisible ? (
+                  <Chip
+                    label={snapshot.navState?.terminal_result || "terminal"}
+                    color={navLifecycleTone(snapshot.navState?.terminal_result)}
+                  />
                 ) : null}
               </Stack>
             </Box>
@@ -856,12 +885,12 @@ export default function App() {
                     onClick={() =>
                       invokeAction(
                         config.cancelNavCommandName,
-                        "Sending navigation cancel command...",
-                        "Navigation cancel command accepted."
+                        "Sending hold-position override...",
+                        "Hold-position command sent. Waiting for navigation state..."
                       )
                     }
                   >
-                    Cancel Nav
+                    Hold Position
                   </Button>
                 </Stack>
 
@@ -896,6 +925,25 @@ export default function App() {
                       ) : null}
                     </Stack>
                   </Box>
+                ) : null}
+
+                {navTerminalVisible ? (
+                  <Alert severity={snapshot.navState?.terminal_result === "failed" ? "error" : "info"}>
+                    <Stack spacing={0.5}>
+                      <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+                        <Typography variant="subtitle2">Last Navigation</Typography>
+                        <Chip
+                          size="small"
+                          label={snapshot.navState?.terminal_result || "terminal"}
+                          color={navLifecycleTone(snapshot.navState?.terminal_result)}
+                        />
+                      </Stack>
+                      <Typography variant="body2">{activeNavLabel}</Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        {snapshot.navState?.terminal_reason || "Navigation reached a terminal state."}
+                      </Typography>
+                    </Stack>
+                  </Alert>
                 ) : null}
 
                 <Divider />

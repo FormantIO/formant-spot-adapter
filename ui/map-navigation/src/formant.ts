@@ -23,6 +23,7 @@ export const DEFAULT_MODULE_CONFIG: ModuleConfig = {
   dockingStateStreamName: "spot.docking_state",
   motorPowerStateStreamName: "spot.motor_power_state",
   behaviorStateStreamName: "spot.behavior_state",
+  batteryStreamName: "spot.robot_state.battery",
   waypointGotoCommandName: "spot.waypoint.goto",
   gotoPoseCommandName: "spot.graphnav.goto_pose",
   cancelNavCommandName: "spot.graphnav.cancel",
@@ -131,21 +132,14 @@ function parseGraphNavOverlayValue(value: unknown): GraphNavOverlay | undefined 
           is_dock: asBoolean(waypoint.is_dock)
         }))
     : [];
-  const edges = Array.isArray(value.edges)
-    ? value.edges
-        .filter(isRecord)
-        .map((edge) => ({
-          from_waypoint_id: asString(edge.from_waypoint_id),
-          to_waypoint_id: asString(edge.to_waypoint_id)
-        }))
-    : [];
   return {
     map_id: asString(value.map_id),
     map_uuid: asString(value.map_uuid),
     current_waypoint_id: asString(value.current_waypoint_id),
     dock_waypoint_id: asString(value.dock_waypoint_id),
-    waypoints,
-    edges
+    waypoint_count:
+      typeof value.waypoint_count === "number" ? value.waypoint_count : undefined,
+    waypoints
   };
 }
 
@@ -159,6 +153,11 @@ function parseNavStateValue(value: unknown): NavState {
       status_name: "",
       remaining_route_length_m: 0,
       auto_recovered: false,
+      phase: "idle",
+      terminal_result: "",
+      terminal_reason: "",
+      last_completed_command_id: 0,
+      updated_at_ms: 0,
       mode: "",
       target_waypoint_id: "",
       target_name: "",
@@ -179,6 +178,11 @@ function parseNavStateValue(value: unknown): NavState {
     status_name: asString(value.status_name),
     remaining_route_length_m: asNumber(value.remaining_route_length_m),
     auto_recovered: asBoolean(value.auto_recovered),
+    phase: asString(value.phase, "idle"),
+    terminal_result: asString(value.terminal_result),
+    terminal_reason: asString(value.terminal_reason),
+    last_completed_command_id: asNumber(value.last_completed_command_id),
+    updated_at_ms: asNumber(value.updated_at_ms),
     mode: asString(value.mode),
     target_waypoint_id: asString(value.target_waypoint_id),
     target_name: asString(value.target_name),
@@ -258,6 +262,10 @@ export function parseModuleConfig(raw: string | undefined): ModuleConfig {
         value.behaviorStateStreamName,
         DEFAULT_MODULE_CONFIG.behaviorStateStreamName
       ),
+      batteryStreamName: asConfiguredName(
+        value.batteryStreamName,
+        DEFAULT_MODULE_CONFIG.batteryStreamName
+      ),
       waypointGotoCommandName: asConfiguredName(
         value.waypointGotoCommandName,
         DEFAULT_MODULE_CONFIG.waypointGotoCommandName
@@ -330,20 +338,54 @@ function patchTextValue(
   });
 }
 
+function patchNumericValue(
+  key: keyof StreamSnapshot,
+  timeKey: keyof StreamSnapshot,
+  value: number | symbol,
+  onPatch: (patch: Partial<StreamSnapshot>) => void
+): void {
+  if (typeof value !== "number" || !Number.isFinite(value)) return;
+  onPatch({
+    [key]: value,
+    [timeKey]: Date.now()
+  });
+}
+
 export function subscribeRealtimeSnapshot(
   deviceId: string,
   config: ModuleConfig,
   onPatch: (patch: Partial<StreamSnapshot>) => void
 ): () => void {
   const live = new LiveUniverseData();
+  const liveWithNumeric = live as LiveUniverseData & {
+    subscribeToNumeric?: (
+      deviceId: string,
+      source: RealtimeStreamSource,
+      onValue: (value: number | symbol) => void
+    ) => () => void;
+  };
   const cleanups: Array<() => void> = [];
+  const warnings = new Map<string, string>();
+  const emitPatch = (patch: Partial<StreamSnapshot>) => {
+    onPatch({
+      ...patch,
+      warnings: Array.from(warnings.values())
+    });
+  };
+  const setWarning = (key: string, message?: string) => {
+    if (message) {
+      warnings.set(key, message);
+    } else {
+      warnings.delete(key);
+    }
+  };
 
   cleanups.push(
     live.subscribeToJson(
       deviceId,
       buildRealtimeSource(config.navStateStreamName, "json"),
       (value) => {
-        onPatch({
+        emitPatch({
           navState: parseNavStateValue(value),
           navStateTime: Date.now()
         });
@@ -358,12 +400,15 @@ export function subscribeRealtimeSnapshot(
       (value) => {
         const mapImageMetadata = parseGraphNavMapImageMetadataValue(value);
         if (!mapImageMetadata) {
-          onPatch({
-            warnings: [`Could not parse ${config.mapImageMetadataStreamName}`]
-          });
+          setWarning(
+            "mapImageMetadata",
+            `Could not parse ${config.mapImageMetadataStreamName}`
+          );
+          emitPatch({});
           return;
         }
-        onPatch({
+        setWarning("mapImageMetadata");
+        emitPatch({
           mapImageMetadata,
           mapImageMetadataTime: Date.now()
         });
@@ -378,12 +423,12 @@ export function subscribeRealtimeSnapshot(
       (value) => {
         const overlay = parseGraphNavOverlayValue(value);
         if (!overlay) {
-          onPatch({
-            warnings: [`Could not parse ${config.overlayStreamName}`]
-          });
+          setWarning("overlay", `Could not parse ${config.overlayStreamName}`);
+          emitPatch({});
           return;
         }
-        onPatch({
+        setWarning("overlay");
+        emitPatch({
           overlay,
           overlayTime: Date.now()
         });
@@ -396,7 +441,7 @@ export function subscribeRealtimeSnapshot(
       deviceId,
       buildRealtimeSource(config.mapImageStreamName, "video"),
       (canvas) => {
-        onPatch({
+        emitPatch({
           mapImageCanvas: canvas,
           mapImageFrameVersion: Date.now(),
           mapImageTime: Date.now()
@@ -409,7 +454,7 @@ export function subscribeRealtimeSnapshot(
     live.subscribeToText(
       deviceId,
       buildRealtimeSource(config.connectionStateStreamName, "text"),
-      (value) => patchTextValue("connectionState", "connectionStateTime", value, onPatch)
+      (value) => patchTextValue("connectionState", "connectionStateTime", value, emitPatch)
     )
   );
 
@@ -417,7 +462,7 @@ export function subscribeRealtimeSnapshot(
     live.subscribeToText(
       deviceId,
       buildRealtimeSource(config.dockingStateStreamName, "text"),
-      (value) => patchTextValue("dockingState", "dockingStateTime", value, onPatch)
+      (value) => patchTextValue("dockingState", "dockingStateTime", value, emitPatch)
     )
   );
 
@@ -425,7 +470,7 @@ export function subscribeRealtimeSnapshot(
     live.subscribeToText(
       deviceId,
       buildRealtimeSource(config.motorPowerStateStreamName, "text"),
-      (value) => patchTextValue("motorPowerState", "motorPowerStateTime", value, onPatch)
+      (value) => patchTextValue("motorPowerState", "motorPowerStateTime", value, emitPatch)
     )
   );
 
@@ -433,9 +478,26 @@ export function subscribeRealtimeSnapshot(
     live.subscribeToText(
       deviceId,
       buildRealtimeSource(config.behaviorStateStreamName, "text"),
-      (value) => patchTextValue("behaviorState", "behaviorStateTime", value, onPatch)
+      (value) => patchTextValue("behaviorState", "behaviorStateTime", value, emitPatch)
     )
   );
+
+  try {
+    if (typeof liveWithNumeric.subscribeToNumeric !== "function") {
+      throw new Error("numeric realtime subscriptions are unavailable");
+    }
+    cleanups.push(
+      liveWithNumeric.subscribeToNumeric(
+        deviceId,
+        buildRealtimeSource(config.batteryStreamName, "numeric"),
+        (value: number | symbol) =>
+          patchNumericValue("batteryPct", "batteryTime", value, emitPatch)
+      )
+    );
+  } catch {
+    setWarning("battery", `Could not subscribe to ${config.batteryStreamName}`);
+    emitPatch({});
+  }
 
   return () => {
     cleanups.forEach((cleanup) => {

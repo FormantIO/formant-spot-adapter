@@ -1465,6 +1465,7 @@ std::string build_graphnav_overlay_json(
           << "\",\"map_uuid\":\"" << json_escape(map_uuid)
           << "\",\"current_waypoint_id\":\"" << json_escape(current_waypoint_id)
           << "\",\"dock_waypoint_id\":\"" << json_escape(dock_waypoint_id)
+          << "\",\"waypoint_count\":" << graphnav_snapshot.waypoints.size()
           << "\",\"waypoints\":[";
   for (size_t i = 0; i < graphnav_snapshot.waypoints.size(); ++i) {
     const auto& waypoint = graphnav_snapshot.waypoints[i];
@@ -1482,13 +1483,6 @@ std::string build_graphnav_overlay_json(
             << ",\"y\":" << waypoint.seed_tform_waypoint.y
             << ",\"is_dock\":"
             << (waypoint.id == dock_waypoint_id ? "true" : "false") << "}";
-  }
-  overlay << "],\"edges\":[";
-  for (size_t i = 0; i < graphnav_snapshot.edges.size(); ++i) {
-    const auto& edge = graphnav_snapshot.edges[i];
-    if (i > 0) overlay << ",";
-    overlay << "{\"from_waypoint_id\":\"" << json_escape(edge.from_waypoint_id)
-            << "\",\"to_waypoint_id\":\"" << json_escape(edge.to_waypoint_id) << "\"}";
   }
   overlay << "]}";
   return overlay.str();
@@ -3568,11 +3562,13 @@ void Adapter::SetSpotDisconnected(const std::string& reason) {
   }
   {
     std::lock_guard<std::mutex> lk(nav_state_mu_);
-    ClearGraphNavNavTargetLocked();
-    last_nav_feedback_signature_.clear();
-    last_nav_status_ = 0;
-    last_nav_remaining_route_m_ = 0.0;
-    last_nav_progress_change_ms_ = 0;
+    if (last_graph_nav_command_id_.load() != 0 || graphnav_navigation_active_.load()) {
+      MarkGraphNavNavigationTerminalLocked(
+          last_graph_nav_command_id_.load(), last_nav_status_, last_nav_remaining_route_m_,
+          "interrupted", std::string("Spot connection lost: ") + reason, now_ms());
+    } else {
+      ResetGraphNavNavStateLocked();
+    }
   }
   ResetFaultEventsState();
   if (was_connected) {
@@ -3852,9 +3848,9 @@ void Adapter::PollGraphNavNavigation(long long now) {
   }
   const int status = fb.status;
 
-        if (IsStreamEnabled(kNavFeedbackStream)) {
-          QueueStatusText(kNavFeedbackStream, nav_feedback_to_json(command_id, fb));
-        }
+  if (IsStreamEnabled(kNavFeedbackStream)) {
+    QueueStatusText(kNavFeedbackStream, nav_feedback_to_json(command_id, fb));
+  }
 
   const std::string feedback_sig = nav_feedback_signature(fb);
   bool changed = false;
@@ -3879,6 +3875,11 @@ void Adapter::PollGraphNavNavigation(long long now) {
     bool should_log_pause = false;
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
+      nav_phase_ = "active";
+      nav_terminal_result_.clear();
+      nav_terminal_reason_.clear();
+      nav_last_completed_command_id_ = 0;
+      nav_last_updated_ms_ = now;
       if (last_nav_status_ != status) {
         last_nav_status_ = status;
         last_nav_progress_change_ms_ = now;
@@ -3915,25 +3916,24 @@ void Adapter::PollGraphNavNavigation(long long now) {
     return;
   }
 
-  const auto clear_nav_state = [this]() {
-    std::lock_guard<std::mutex> lk(nav_state_mu_);
-    last_nav_feedback_signature_.clear();
-    last_nav_progress_change_ms_ = 0;
-    last_nav_remaining_route_m_ = 0.0;
-  };
-
   graphnav_navigation_active_ = false;
   using Resp = ::bosdyn::api::graph_nav::NavigationFeedbackResponse;
   if (status == Resp::STATUS_REACHED_GOAL) {
-    EmitLog("[graphnav] navigation reached goal");
+    std::string mode;
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
-      last_nav_status_ = status;
-      last_nav_remaining_route_m_ = fb.remaining_route_length;
+      mode = nav_target_mode_;
+      MarkGraphNavNavigationTerminalLocked(
+          command_id, status, fb.remaining_route_length,
+          mode == "hold_position" ? "held_position" : "reached",
+          mode == "hold_position" ? "Robot is holding the current localized pose."
+                                  : "Reached goal.",
+          now);
     }
+    EmitLog(mode == "hold_position" ? "[graphnav] hold-position target reached"
+                                     : "[graphnav] navigation reached goal");
     last_graph_nav_command_id_ = 0;
     nav_auto_recovered_ = false;
-    clear_nav_state();
     return;
   }
 
@@ -3951,7 +3951,10 @@ void Adapter::PollGraphNavNavigation(long long now) {
       if (!spot_.RecoverSelfRight()) {
         EmitLog(std::string("[graphnav] auto-recover failed: ") + spot_.LastError());
         last_graph_nav_command_id_ = 0;
-        clear_nav_state();
+        std::lock_guard<std::mutex> lk(nav_state_mu_);
+        MarkGraphNavNavigationTerminalLocked(
+            command_id, status, fb.remaining_route_length, "failed",
+            "Navigation stopped because the robot became impaired and auto-recovery failed.", now);
         return;
       }
       (void)spot_.Stand();
@@ -3967,20 +3970,25 @@ void Adapter::PollGraphNavNavigation(long long now) {
       EmitLog(std::string("[graphnav] navigation retry after recover failed: ") + spot_.LastError());
     }
     last_graph_nav_command_id_ = 0;
-    clear_nav_state();
+    {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      MarkGraphNavNavigationTerminalLocked(
+          command_id, status, fb.remaining_route_length, "failed",
+          "Navigation stopped because the robot became impaired.", now);
+    }
     return;
   }
 
   {
     std::lock_guard<std::mutex> lk(nav_state_mu_);
-    last_nav_status_ = status;
-    last_nav_remaining_route_m_ = fb.remaining_route_length;
+    MarkGraphNavNavigationTerminalLocked(
+        command_id, status, fb.remaining_route_length, "failed",
+        std::string("Navigation ended with ") + nav_status_name(status) + ".", now);
   }
   EmitLog(std::string("[graphnav] navigation ended status=") + std::to_string(status) +
           " (" + nav_status_name(status) + ")");
   last_graph_nav_command_id_ = 0;
   nav_auto_recovered_ = false;
-  clear_nav_state();
 }
 
 void Adapter::QueueStatusText(const std::string& stream, const std::string& value) {
@@ -4287,22 +4295,61 @@ bool Adapter::WaitForGraphNavCommandResult(uint32_t command_id, long long timeou
   using Resp = ::bosdyn::api::graph_nav::NavigationFeedbackResponse;
   const long long deadline = now_ms() + timeout_ms;
   while (running_.load()) {
-    if (now_ms() > deadline) {
+    const long long now = now_ms();
+    if (now > deadline) {
       EmitLog("[command] graphnav command timeout");
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      MarkGraphNavNavigationTerminalLocked(
+          command_id, last_nav_status_, last_nav_remaining_route_m_, "failed",
+          "Navigation timed out before reaching a terminal state.", now);
       return false;
     }
     SpotClient::NavigationFeedbackSnapshot fb;
     if (!spot_.GetNavigationFeedbackSnapshot(command_id, &fb)) {
       EmitLog(std::string("[command] graphnav feedback failed: ") + spot_.LastError());
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      MarkGraphNavNavigationTerminalLocked(
+          command_id, last_nav_status_, last_nav_remaining_route_m_, "failed",
+          std::string("Navigation feedback failed: ") + spot_.LastError(), now);
       return false;
     }
     if (IsStreamEnabled(kNavFeedbackStream)) {
       QueueStatusText(kNavFeedbackStream, nav_feedback_to_json(command_id, fb));
     }
-    if (fb.status == Resp::STATUS_REACHED_GOAL) return true;
+    if (fb.status == Resp::STATUS_FOLLOWING_ROUTE) {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      nav_phase_ = "active";
+      nav_terminal_result_.clear();
+      nav_terminal_reason_.clear();
+      nav_last_completed_command_id_ = 0;
+      nav_last_updated_ms_ = now;
+      last_nav_status_ = fb.status;
+      last_nav_remaining_route_m_ = fb.remaining_route_length;
+      if (last_nav_progress_change_ms_ == 0) {
+        last_nav_progress_change_ms_ = now;
+      }
+    }
+    if (fb.status == Resp::STATUS_REACHED_GOAL) {
+      std::string mode;
+      {
+        std::lock_guard<std::mutex> lk(nav_state_mu_);
+        mode = nav_target_mode_;
+        MarkGraphNavNavigationTerminalLocked(
+            command_id, fb.status, fb.remaining_route_length,
+            mode == "hold_position" ? "held_position" : "reached",
+            mode == "hold_position" ? "Robot is holding the current localized pose."
+                                    : "Reached goal.",
+            now);
+      }
+      return true;
+    }
     if (fb.status != Resp::STATUS_FOLLOWING_ROUTE) {
       EmitLog("[command] graphnav ended status=" + std::to_string(fb.status) +
               " (" + nav_status_name(fb.status) + ")");
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      MarkGraphNavNavigationTerminalLocked(
+          command_id, fb.status, fb.remaining_route_length, "failed",
+          std::string("Navigation ended with ") + nav_status_name(fb.status) + ".", now);
       return false;
     }
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -4736,7 +4783,7 @@ bool Adapter::ExecuteGraphNavCancelCommand() {
   const double waypoint_goal_x = localization.waypoint_tform_body_x;
   const double waypoint_goal_y = localization.waypoint_tform_body_y;
 
-  EmitLog("[graphnav] spot.graphnav.cancel overriding active navigation to current pose at waypoint=" +
+  EmitLog("[graphnav] spot.graphnav.cancel holding position at current localized pose waypoint=" +
           waypoint_name);
 
   uint32_t command_id = 0;
@@ -4745,7 +4792,7 @@ bool Adapter::ExecuteGraphNavCancelCommand() {
     return false;
   }
 
-  SetGraphNavNavTarget("cancel", localization.waypoint_id, waypoint_name, map_id, map_uuid,
+  SetGraphNavNavTarget("hold_position", localization.waypoint_id, waypoint_name, map_id, map_uuid,
                        true, seed_x, seed_y, current_seed_yaw_rad, true, waypoint_goal_x,
                        waypoint_goal_y, waypoint_goal_yaw_rad);
   last_graph_nav_command_id_ = command_id;
@@ -4755,7 +4802,7 @@ bool Adapter::ExecuteGraphNavCancelCommand() {
       command_id, static_cast<long long>(std::max(15, cfg_.graphnav_command_timeout_sec)) * 1000LL);
   graphnav_navigation_active_ = false;
   last_graph_nav_command_id_ = 0;
-  if (ok) EmitLog("[graphnav] spot.graphnav.cancel success");
+  if (ok) EmitLog("[graphnav] spot.graphnav.cancel hold-position success");
   return ok;
 }
 
@@ -6293,6 +6340,14 @@ void Adapter::PublishGraphNavOverlayText(bool force) {
                                               artifacts->snapshot, aliases_by_waypoint,
                                               dock_waypoint_id, current_waypoint_id)
                 : "";
+  static constexpr size_t kGraphNavOverlayWarnBytes = 12000;
+  if (payload.size() > kGraphNavOverlayWarnBytes &&
+      (now - last_nav_diag_log_ms_.load()) >= 10000) {
+    last_nav_diag_log_ms_ = now;
+    EmitLog("[graphnav] overlay payload is large bytes=" + std::to_string(payload.size()) +
+            " waypoint_count=" +
+            std::to_string(artifacts ? artifacts->snapshot.waypoints.size() : 0));
+  }
   bool changed = false;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
@@ -6429,6 +6484,36 @@ bool Adapter::LookupWaypointSeedPoseLocked(const std::string& waypoint_id,
   return true;
 }
 
+void Adapter::ResetGraphNavNavStateLocked() {
+  ClearGraphNavNavTargetLocked();
+  last_nav_feedback_signature_.clear();
+  last_nav_status_ = 0;
+  last_nav_remaining_route_m_ = 0.0;
+  last_nav_progress_change_ms_ = 0;
+  nav_phase_ = "idle";
+  nav_terminal_result_.clear();
+  nav_terminal_reason_.clear();
+  nav_last_completed_command_id_ = 0;
+  nav_last_updated_ms_ = now_ms();
+}
+
+void Adapter::MarkGraphNavNavigationTerminalLocked(uint32_t command_id,
+                                                   int status,
+                                                   double remaining_route_m,
+                                                   const std::string& result,
+                                                   const std::string& reason,
+                                                   long long updated_ms) {
+  last_nav_feedback_signature_.clear();
+  last_nav_status_ = status;
+  last_nav_remaining_route_m_ = remaining_route_m;
+  last_nav_progress_change_ms_ = 0;
+  nav_phase_ = "terminal";
+  nav_terminal_result_ = result;
+  nav_terminal_reason_ = reason;
+  nav_last_completed_command_id_ = command_id;
+  nav_last_updated_ms_ = updated_ms;
+}
+
 void Adapter::ClearGraphNavNavTargetLocked() {
   nav_target_mode_.clear();
   nav_target_waypoint_id_.clear();
@@ -6476,6 +6561,11 @@ void Adapter::SetGraphNavNavTarget(const std::string& mode,
   last_nav_status_ = 0;
   last_nav_remaining_route_m_ = 0.0;
   last_nav_progress_change_ms_ = 0;
+  nav_phase_ = "active";
+  nav_terminal_result_.clear();
+  nav_terminal_reason_.clear();
+  nav_last_completed_command_id_ = 0;
+  nav_last_updated_ms_ = now_ms();
 }
 
 bool Adapter::ValidateGraphNavCommandMapUuid(const std::string& command_name,
@@ -6541,6 +6631,11 @@ std::string Adapter::BuildGraphNavNavStateJson(
   double waypoint_goal_x = 0.0;
   double waypoint_goal_y = 0.0;
   double waypoint_goal_yaw_rad = 0.0;
+  std::string phase;
+  std::string terminal_result;
+  std::string terminal_reason;
+  uint32_t last_completed_command_id = 0;
+  long long updated_ms = 0;
   int status = 0;
   double remaining_route_m = 0.0;
   const bool localized = localization && !localization->waypoint_id.empty();
@@ -6573,6 +6668,11 @@ std::string Adapter::BuildGraphNavNavStateJson(
     waypoint_goal_x = nav_target_waypoint_goal_x_;
     waypoint_goal_y = nav_target_waypoint_goal_y_;
     waypoint_goal_yaw_rad = nav_target_waypoint_goal_yaw_rad_;
+    phase = nav_phase_;
+    terminal_result = nav_terminal_result_;
+    terminal_reason = nav_terminal_reason_;
+    last_completed_command_id = nav_last_completed_command_id_;
+    updated_ms = nav_last_updated_ms_;
     status = last_nav_status_;
     remaining_route_m = last_nav_remaining_route_m_;
   }
@@ -6585,6 +6685,11 @@ std::string Adapter::BuildGraphNavNavStateJson(
       << ",\"status_name\":\"" << nav_status_name(status) << "\""
       << ",\"remaining_route_length_m\":" << remaining_route_m
       << ",\"auto_recovered\":" << (auto_recovered ? "true" : "false")
+      << ",\"phase\":\"" << json_escape(phase) << "\""
+      << ",\"terminal_result\":\"" << json_escape(terminal_result) << "\""
+      << ",\"terminal_reason\":\"" << json_escape(terminal_reason) << "\""
+      << ",\"last_completed_command_id\":" << last_completed_command_id
+      << ",\"updated_at_ms\":" << updated_ms
       << ",\"mode\":\"" << json_escape(mode) << "\""
       << ",\"target_waypoint_id\":\"" << json_escape(waypoint_id) << "\""
       << ",\"target_name\":\"" << json_escape(waypoint_name) << "\""
@@ -6688,11 +6793,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
     nav_auto_recovered_ = false;
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
-      ClearGraphNavNavTargetLocked();
-      last_nav_feedback_signature_.clear();
-      last_nav_status_ = 0;
-      last_nav_remaining_route_m_ = 0.0;
-      last_nav_progress_change_ms_ = 0;
+      ResetGraphNavNavStateLocked();
     }
 
     if (!SaveAdapterMapState()) {
@@ -6732,11 +6833,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
     nav_auto_recovered_ = false;
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
-      ClearGraphNavNavTargetLocked();
-      last_nav_feedback_signature_.clear();
-      last_nav_status_ = 0;
-      last_nav_remaining_route_m_ = 0.0;
-      last_nav_progress_change_ms_ = 0;
+      ResetGraphNavNavStateLocked();
     }
     if (!spot_.SetLocalizationFiducial()) {
       EmitLog(std::string("[graphnav] map.load localization warning: ") + spot_.LastError());
@@ -6806,11 +6903,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       nav_auto_recovered_ = false;
       {
         std::lock_guard<std::mutex> lk(nav_state_mu_);
-        ClearGraphNavNavTargetLocked();
-        last_nav_feedback_signature_.clear();
-        last_nav_status_ = 0;
-        last_nav_remaining_route_m_ = 0.0;
-        last_nav_progress_change_ms_ = 0;
+        ResetGraphNavNavStateLocked();
       }
     }
 
@@ -6832,7 +6925,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
     }
     if (clear_loaded_graph) {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
-      ClearGraphNavNavTargetLocked();
+      ResetGraphNavNavStateLocked();
     }
     if (!DeleteMapFromDisk(map_id)) {
       EmitLog(std::string("[graphnav] map.delete failed removing map files map_id=") + map_id);
