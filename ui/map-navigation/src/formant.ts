@@ -351,6 +351,22 @@ function patchNumericValue(
   });
 }
 
+function subscribeWithWarning(
+  cleanups: Array<() => void>,
+  warningKey: string,
+  warningMessage: string,
+  subscribe: () => () => void,
+  setWarning: (key: string, message?: string) => void,
+  emitPatch: (patch: Partial<StreamSnapshot>) => void
+): void {
+  try {
+    cleanups.push(subscribe());
+    setWarning(warningKey);
+  } catch {
+    setWarning(warningKey, warningMessage);
+    emitPatch({});
+  }
+}
 export function subscribeRealtimeSnapshot(
   deviceId: string,
   config: ModuleConfig,
@@ -380,121 +396,188 @@ export function subscribeRealtimeSnapshot(
     }
   };
 
-  cleanups.push(
-    live.subscribeToJson(
-      deviceId,
-      buildRealtimeSource(config.navStateStreamName, "json"),
-      (value) => {
-        emitPatch({
-          navState: parseNavStateValue(value),
-          navStateTime: Date.now()
-        });
-      }
-    )
-  );
-
-  cleanups.push(
-    live.subscribeToJson(
-      deviceId,
-      buildRealtimeSource(config.mapImageMetadataStreamName, "json"),
-      (value) => {
-        const mapImageMetadata = parseGraphNavMapImageMetadataValue(value);
-        if (!mapImageMetadata) {
-          setWarning(
-            "mapImageMetadata",
-            `Could not parse ${config.mapImageMetadataStreamName}`
-          );
-          emitPatch({});
-          return;
-        }
-        setWarning("mapImageMetadata");
-        emitPatch({
-          mapImageMetadata,
-          mapImageMetadataTime: Date.now()
-        });
-      }
-    )
-  );
-
-  cleanups.push(
-    live.subscribeToJson(
-      deviceId,
-      buildRealtimeSource(config.overlayStreamName, "json"),
-      (value) => {
-        const overlay = parseGraphNavOverlayValue(value);
-        if (!overlay) {
-          setWarning("overlay", `Could not parse ${config.overlayStreamName}`);
-          emitPatch({});
-          return;
-        }
-        setWarning("overlay");
-        emitPatch({
-          overlay,
-          overlayTime: Date.now()
-        });
-      }
-    )
-  );
-
-  cleanups.push(
-    live.subscribeToVideo(
-      deviceId,
-      buildRealtimeSource(config.mapImageStreamName, "video"),
-      (canvas) => {
-        emitPatch({
-          mapImageCanvas: canvas,
-          mapImageFrameVersion: Date.now(),
-          mapImageTime: Date.now()
-        });
-      }
-    )
-  );
-
-  cleanups.push(
-    live.subscribeToText(
-      deviceId,
-      buildRealtimeSource(config.connectionStateStreamName, "text"),
-      (value) => patchTextValue("connectionState", "connectionStateTime", value, emitPatch)
-    )
-  );
-
-  cleanups.push(
-    live.subscribeToText(
-      deviceId,
-      buildRealtimeSource(config.dockingStateStreamName, "text"),
-      (value) => patchTextValue("dockingState", "dockingStateTime", value, emitPatch)
-    )
-  );
-
-  cleanups.push(
-    live.subscribeToText(
-      deviceId,
-      buildRealtimeSource(config.motorPowerStateStreamName, "text"),
-      (value) => patchTextValue("motorPowerState", "motorPowerStateTime", value, emitPatch)
-    )
-  );
-
-  cleanups.push(
-    live.subscribeToText(
-      deviceId,
-      buildRealtimeSource(config.behaviorStateStreamName, "text"),
-      (value) => patchTextValue("behaviorState", "behaviorStateTime", value, emitPatch)
-    )
-  );
-
-  try {
-    if (typeof liveWithNumeric.subscribeToNumeric !== "function") {
-      throw new Error("numeric realtime subscriptions are unavailable");
-    }
-    cleanups.push(
-      liveWithNumeric.subscribeToNumeric(
+  subscribeWithWarning(
+    cleanups,
+    "navState",
+    `Could not subscribe to ${config.navStateStreamName}`,
+    () =>
+      live.subscribeToJson(
         deviceId,
-        buildRealtimeSource(config.batteryStreamName, "numeric"),
-        (value: number | symbol) =>
-          patchNumericValue("batteryPct", "batteryTime", value, emitPatch)
-      )
+        buildRealtimeSource(config.navStateStreamName, "json"),
+        (value) => {
+          setWarning("navState");
+          emitPatch({
+            navState: parseNavStateValue(value),
+            navStateTime: Date.now()
+          });
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  subscribeWithWarning(
+    cleanups,
+    "mapImageMetadata",
+    `Could not subscribe to ${config.mapImageMetadataStreamName}`,
+    () =>
+      live.subscribeToJson(
+        deviceId,
+        buildRealtimeSource(config.mapImageMetadataStreamName, "json"),
+        (value) => {
+          const mapImageMetadata = parseGraphNavMapImageMetadataValue(value);
+          if (!mapImageMetadata) {
+            setWarning(
+              "mapImageMetadata",
+              `Could not parse ${config.mapImageMetadataStreamName}`
+            );
+            emitPatch({});
+            return;
+          }
+          setWarning("mapImageMetadata");
+          emitPatch({
+            mapImageMetadata,
+            mapImageMetadataTime: Date.now()
+          });
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  subscribeWithWarning(
+    cleanups,
+    "overlay",
+    `Could not subscribe to ${config.overlayStreamName}`,
+    () =>
+      live.subscribeToJson(
+        deviceId,
+        buildRealtimeSource(config.overlayStreamName, "json"),
+        (value) => {
+          const overlay = parseGraphNavOverlayValue(value);
+          if (!overlay) {
+            setWarning("overlay", `Could not parse ${config.overlayStreamName}`);
+            emitPatch({});
+            return;
+          }
+          setWarning("overlay");
+          emitPatch({
+            overlay,
+            overlayTime: Date.now()
+          });
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  subscribeWithWarning(
+    cleanups,
+    "mapImage",
+    `Could not subscribe to ${config.mapImageStreamName}`,
+    () =>
+      live.subscribeToVideo(
+        deviceId,
+        buildRealtimeSource(config.mapImageStreamName, "video"),
+        (canvas) => {
+          setWarning("mapImage");
+          emitPatch({
+            mapImageCanvas: canvas,
+            mapImageFrameVersion: Date.now(),
+            mapImageTime: Date.now()
+          });
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  subscribeWithWarning(
+    cleanups,
+    "connectionState",
+    `Could not subscribe to ${config.connectionStateStreamName}`,
+    () =>
+      live.subscribeToText(
+        deviceId,
+        buildRealtimeSource(config.connectionStateStreamName, "text"),
+        (value) => {
+          setWarning("connectionState");
+          patchTextValue("connectionState", "connectionStateTime", value, emitPatch);
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  subscribeWithWarning(
+    cleanups,
+    "dockingState",
+    `Could not subscribe to ${config.dockingStateStreamName}`,
+    () =>
+      live.subscribeToText(
+        deviceId,
+        buildRealtimeSource(config.dockingStateStreamName, "text"),
+        (value) => {
+          setWarning("dockingState");
+          patchTextValue("dockingState", "dockingStateTime", value, emitPatch);
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  subscribeWithWarning(
+    cleanups,
+    "motorPowerState",
+    `Could not subscribe to ${config.motorPowerStateStreamName}`,
+    () =>
+      live.subscribeToText(
+        deviceId,
+        buildRealtimeSource(config.motorPowerStateStreamName, "text"),
+        (value) => {
+          setWarning("motorPowerState");
+          patchTextValue("motorPowerState", "motorPowerStateTime", value, emitPatch);
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  subscribeWithWarning(
+    cleanups,
+    "behaviorState",
+    `Could not subscribe to ${config.behaviorStateStreamName}`,
+    () =>
+      live.subscribeToText(
+        deviceId,
+        buildRealtimeSource(config.behaviorStateStreamName, "text"),
+        (value) => {
+          setWarning("behaviorState");
+          patchTextValue("behaviorState", "behaviorStateTime", value, emitPatch);
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  if (typeof liveWithNumeric.subscribeToNumeric === "function") {
+    subscribeWithWarning(
+      cleanups,
+      "battery",
+      `Could not subscribe to ${config.batteryStreamName}`,
+      () =>
+        liveWithNumeric.subscribeToNumeric!(
+          deviceId,
+          buildRealtimeSource(config.batteryStreamName, "numeric"),
+          (value: number | symbol) => {
+            setWarning("battery");
+            patchNumericValue("batteryPct", "batteryTime", value, emitPatch);
+          }
+        ),
+      setWarning,
+      emitPatch
     );
-  } catch {
+  } else {
     setWarning("battery", `Could not subscribe to ${config.batteryStreamName}`);
     emitPatch({});
   }

@@ -62,8 +62,8 @@ const theme = createTheme({
 type SelectionMode = "waypoints" | "point";
 type PointHeadingMode = "current" | "path" | "custom";
 type Selection =
-  | { kind: "waypoint"; waypoint: GraphNavOverlayWaypoint }
-  | { kind: "point"; target: TargetPose; headingMode: PointHeadingMode };
+  | { kind: "waypoint"; mapUuid: string; waypoint: GraphNavOverlayWaypoint }
+  | { kind: "point"; mapUuid: string; target: TargetPose; headingMode: PointHeadingMode };
 
 function isFresh(timestamp: number | undefined, maxAgeMs: number): boolean {
   return Boolean(timestamp && (Date.now() - timestamp) <= maxAgeMs);
@@ -72,15 +72,6 @@ function isFresh(timestamp: number | undefined, maxAgeMs: number): boolean {
 function formatPose(target?: TargetPose): string {
   if (!target) return "No target selected";
   return `x=${target.x.toFixed(2)} m, y=${target.y.toFixed(2)} m, yaw=${target.yawDeg.toFixed(1)} deg`;
-}
-
-function getMapUuid(snapshot: StreamSnapshot): string {
-  return (
-    snapshot.mapImageMetadata?.map_uuid ||
-    snapshot.navState?.map_uuid ||
-    snapshot.overlay?.map_uuid ||
-    ""
-  );
 }
 
 function getMapLabel(snapshot: StreamSnapshot): string {
@@ -136,11 +127,12 @@ function statusTone(
     case "stepping":
       return "warning";
     case "disconnected":
+    case "error":
+      return "error";
     case "docked":
     case "off":
-    case "error":
     case "not_ready":
-      return "error";
+      return "default";
     default:
       return "default";
   }
@@ -192,6 +184,25 @@ function buildMovementReadiness(snapshot: StreamSnapshot, mapUuid: string): stri
   if (navFresh && !snapshot.navState?.localized) issues.push("Robot is not localized.");
   if (!mapUuid) issues.push("No active map is available.");
   return issues;
+}
+
+function buildMapConsistencyIssues(snapshot: StreamSnapshot, displayedMapUuid: string): string[] {
+  const issues: string[] = [];
+  const overlayMapUuid = snapshot.overlay?.map_uuid || "";
+  const navMapUuid = snapshot.navState?.map_uuid || "";
+
+  if (displayedMapUuid && overlayMapUuid && overlayMapUuid !== displayedMapUuid) {
+    issues.push("Waypoint overlay does not match the displayed map.");
+  }
+  if (displayedMapUuid && navMapUuid && navMapUuid !== displayedMapUuid) {
+    issues.push("Navigation state does not match the displayed map.");
+  }
+
+  return issues;
+}
+
+function uniqueIssues(issues: string[]): string[] {
+  return Array.from(new Set(issues));
 }
 
 function clientToSvgPoint(
@@ -555,10 +566,17 @@ export default function App() {
     }
   }, [snapshot.navState?.phase, snapshot.navState?.last_completed_command_id, snapshot.navState?.command_id]);
 
-  const mapUuid = getMapUuid(snapshot);
+  const displayedMapUuid = snapshot.mapImageMetadata?.map_uuid || "";
   const movementReadinessIssues = useMemo(
-    () => buildMovementReadiness(snapshot, mapUuid),
-    [snapshot, mapUuid]
+    () =>
+      uniqueIssues([
+        ...buildMovementReadiness(snapshot, displayedMapUuid),
+        ...buildMapConsistencyIssues(snapshot, displayedMapUuid),
+        ...(snapshot.navState?.active
+          ? ["Active navigation must be held or completed before sending a new destination."]
+          : [])
+      ]),
+    [snapshot, displayedMapUuid]
   );
 
   const waypointCommandAvailable = availableCommands.includes(config.waypointGotoCommandName);
@@ -588,6 +606,49 @@ export default function App() {
       });
   }, [snapshot.overlay?.waypoints, snapshot.overlay?.current_waypoint_id, waypointSearch]);
 
+  const selectionReadinessIssues = useMemo(() => {
+    if (!selection) return [];
+
+    const issues = [...movementReadinessIssues];
+    if (selection.mapUuid && displayedMapUuid && selection.mapUuid !== displayedMapUuid) {
+      issues.push("The selected target no longer matches the displayed map.");
+    }
+
+    if (selection.kind === "waypoint") {
+      if (!waypointCommandAvailable) issues.push("Waypoint goto command is unavailable.");
+      if (!isFresh(snapshot.overlayTime, 15000)) issues.push("Waypoint overlay is stale.");
+      if (!snapshot.overlay) {
+        issues.push("Waypoint overlay is unavailable.");
+      } else if (!snapshot.overlay.waypoints.some((waypoint) => waypoint.id === selection.waypoint.id)) {
+        issues.push("Selected waypoint is no longer available.");
+      }
+    } else {
+      if (!gotoPoseCommandAvailable) issues.push("Point goto command is unavailable.");
+      if (!isFresh(snapshot.mapImageMetadataTime, 8000)) {
+        issues.push("Displayed map metadata is stale.");
+      }
+    }
+
+    return uniqueIssues(issues);
+  }, [
+    displayedMapUuid,
+    gotoPoseCommandAvailable,
+    movementReadinessIssues,
+    selection,
+    snapshot.mapImageMetadataTime,
+    snapshot.overlay,
+    snapshot.overlayTime,
+    waypointCommandAvailable
+  ]);
+
+  const connectionReady =
+    isFresh(snapshot.connectionStateTime, 8000) && snapshot.connectionState === "connected";
+  const dockingReady = isFresh(snapshot.dockingStateTime, 8000);
+  const navReady = isFresh(snapshot.navStateTime, 4000);
+  const motorReady =
+    isFresh(snapshot.motorPowerStateTime, 8000) && snapshot.motorPowerState === "on";
+  const localizedReady = navReady && Boolean(snapshot.navState?.localized);
+
   const activeNavLabel =
     snapshot.navState?.target_name ||
     (snapshot.navState?.target_waypoint_id
@@ -611,7 +672,21 @@ export default function App() {
     typeof snapshot.batteryPct === "number" ? `battery ${snapshot.batteryPct.toFixed(0)}%` : "battery";
 
   const navTerminalVisible = snapshot.navState?.phase === "terminal" && Boolean(snapshot.navState?.terminal_result);
-
+  useEffect(() => {
+    setSelection((current) => {
+      if (!current) return current;
+      if (current.mapUuid && displayedMapUuid && current.mapUuid !== displayedMapUuid) {
+        return undefined;
+      }
+      if (current.kind === "waypoint" && snapshot.overlay) {
+        const stillPresent = snapshot.overlay.waypoints.some(
+          (waypoint) => waypoint.id === current.waypoint.id
+        );
+        if (!stillPresent) return undefined;
+      }
+      return current;
+    });
+  }, [displayedMapUuid, snapshot.overlay]);
   const sendCommand = async (
     name: string,
     payload: string | undefined,
@@ -636,7 +711,11 @@ export default function App() {
   };
 
   const handleSelectWaypoint = (waypoint: GraphNavOverlayWaypoint) => {
-    setSelection({ kind: "waypoint", waypoint });
+    setSelection({
+      kind: "waypoint",
+      mapUuid: snapshot.overlay?.map_uuid || snapshot.mapImageMetadata?.map_uuid || "",
+      waypoint
+    });
     setSelectionMode("waypoints");
     setCommandError(undefined);
     setCommandNotice(undefined);
@@ -646,6 +725,7 @@ export default function App() {
     const nextTarget = { ...target, yawDeg: getCurrentYawDeg(config, snapshot.navState) };
     setSelection({
       kind: "point",
+      mapUuid: snapshot.mapImageMetadata?.map_uuid || "",
       target: nextTarget,
       headingMode: config.defaultYawMode === "fixed" ? "custom" : "current"
     });
@@ -663,6 +743,7 @@ export default function App() {
     }
     setSelection({
       kind: "point",
+      mapUuid: selection.mapUuid,
       headingMode,
       target: {
         ...selection.target,
@@ -684,8 +765,8 @@ export default function App() {
   };
 
   const confirmWaypointNavigation = () => {
-    if (selection?.kind !== "waypoint" || !mapUuid) return;
-    const payload = formatWaypointGotoPayload(mapUuid, selection.waypoint.id);
+    if (selection?.kind !== "waypoint" || !displayedMapUuid) return;
+    const payload = formatWaypointGotoPayload(displayedMapUuid, selection.waypoint.id);
     void sendCommand(
       config.waypointGotoCommandName,
       payload,
@@ -695,9 +776,9 @@ export default function App() {
   };
 
   const confirmPointNavigation = () => {
-    if (selection?.kind !== "point" || !mapUuid) return;
+    if (selection?.kind !== "point" || !displayedMapUuid) return;
     const payload = formatGotoPosePayload(
-      mapUuid,
+      displayedMapUuid,
       selection.target.x,
       selection.target.y,
       selection.target.yawDeg
@@ -714,12 +795,7 @@ export default function App() {
     void sendCommand(name, undefined, optimisticNotice, successNotice);
   };
 
-  const selectionReady =
-    selection?.kind === "waypoint"
-      ? movementReadinessIssues.length === 0 && waypointCommandAvailable
-      : selection?.kind === "point"
-        ? movementReadinessIssues.length === 0 && gotoPoseCommandAvailable
-        : false;
+  const selectionReady = Boolean(selection) && selectionReadinessIssues.length === 0;
 
   return (
     <ThemeProvider theme={theme}>
@@ -852,7 +928,13 @@ export default function App() {
                   <Button
                     variant="outlined"
                     size="small"
-                    disabled={!undockCommandAvailable || snapshot.dockingState !== "docked" || pendingCommand === config.undockCommandName}
+                    disabled={
+                      !undockCommandAvailable ||
+                      !connectionReady ||
+                      !dockingReady ||
+                      snapshot.dockingState !== "docked" ||
+                      pendingCommand === config.undockCommandName
+                    }
                     onClick={() =>
                       invokeAction(
                         config.undockCommandName,
@@ -866,7 +948,15 @@ export default function App() {
                   <Button
                     variant="outlined"
                     size="small"
-                    disabled={!returnAndDockCommandAvailable || pendingCommand === config.returnAndDockCommandName}
+                    disabled={
+                      !returnAndDockCommandAvailable ||
+                      !connectionReady ||
+                      !dockingReady ||
+                      !motorReady ||
+                      !localizedReady ||
+                      snapshot.dockingState !== "undocked" ||
+                      pendingCommand === config.returnAndDockCommandName
+                    }
                     onClick={() =>
                       invokeAction(
                         config.returnAndDockCommandName,
@@ -881,7 +971,12 @@ export default function App() {
                     variant="outlined"
                     size="small"
                     color="warning"
-                    disabled={!cancelCommandAvailable || !snapshot.navState?.active || pendingCommand === config.cancelNavCommandName}
+                    disabled={
+                      !cancelCommandAvailable ||
+                      !navReady ||
+                      !snapshot.navState?.active ||
+                      pendingCommand === config.cancelNavCommandName
+                    }
                     onClick={() =>
                       invokeAction(
                         config.cancelNavCommandName,
@@ -1011,10 +1106,21 @@ export default function App() {
                           {selection.waypoint.is_dock ? "Dock waypoint" : "Standard waypoint"}
                         </Typography>
                         <Typography variant="caption" color="text.secondary">
-                          {mapUuid
-                            ? formatWaypointGotoPayload(mapUuid, selection.waypoint.id)
+                          {displayedMapUuid
+                            ? formatWaypointGotoPayload(displayedMapUuid, selection.waypoint.id)
                             : "No command payload"}
                         </Typography>
+                        {selectionReadinessIssues.length ? (
+                          <Alert severity="warning">
+                            <Stack spacing={0.5}>
+                              {selectionReadinessIssues.map((issue) => (
+                                <Typography key={issue} variant="body2">
+                                  {issue}
+                                </Typography>
+                              ))}
+                            </Stack>
+                          </Alert>
+                        ) : null}
                         <Stack direction="row" spacing={1}>
                           <Button
                             variant="contained"
@@ -1057,15 +1163,26 @@ export default function App() {
                           />
                         ) : null}
                         <Typography variant="caption" color="text.secondary">
-                          {mapUuid
+                          {displayedMapUuid
                             ? formatGotoPosePayload(
-                                mapUuid,
+                                displayedMapUuid,
                                 selection.target.x,
                                 selection.target.y,
                                 selection.target.yawDeg
                               )
                             : "No command payload"}
                         </Typography>
+                        {selectionReadinessIssues.length ? (
+                          <Alert severity="warning">
+                            <Stack spacing={0.5}>
+                              {selectionReadinessIssues.map((issue) => (
+                                <Typography key={issue} variant="body2">
+                                  {issue}
+                                </Typography>
+                              ))}
+                            </Stack>
+                          </Alert>
+                        ) : null}
                         <Stack direction="row" spacing={1}>
                           <Button
                             variant="contained"
