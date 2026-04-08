@@ -139,12 +139,16 @@ export interface StreamSnapshot {
   mapImageCanvas?: HTMLCanvasElement;
   mapImageFrameVersion?: number;
   mapImageTime?: number;
+  mapImageRealtimeTime?: number;
   mapImageMetadata?: GraphNavMapImageMetadata;
   mapImageMetadataTime?: number;
+  mapImageMetadataRealtimeTime?: number;
   overlay?: GraphNavOverlay;
   overlayTime?: number;
+  overlayRealtimeTime?: number;
   navState?: NavState;
   navStateTime?: number;
+  navStateRealtimeTime?: number;
   maps?: string[];
   mapsTime?: number;
   currentMapId?: string;
@@ -153,6 +157,8 @@ export interface StreamSnapshot {
   defaultMapTime?: number;
   connectionState?: string;
   connectionStateTime?: number;
+  realtimeConnectionState?: string;
+  realtimeConnectionStateTime?: number;
   dockingState?: string;
   dockingStateTime?: number;
   motorPowerState?: string;

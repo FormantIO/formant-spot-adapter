@@ -69,18 +69,81 @@ type PointHeadingMode = "current" | "path" | "custom";
 type LocalizationStatus = "localized" | "not_localized" | "unknown";
 type MapSurfaceStatus = "live" | "catalog" | "unavailable";
 type SystemStatusSeverity = "success" | "info" | "warning";
+type ConnectionPhase = "connecting" | "ready" | "failed";
 type Selection =
   | { kind: "waypoint"; mapUuid: string; waypoint: GraphNavOverlayWaypoint }
   | { kind: "point"; mapUuid: string; target: TargetPose; headingMode: PointHeadingMode };
 
 const LIVE_MAP_VIEW_MAX_AGE_MS = 20000;
+const FORMANT_BACKEND_MAX_AGE_MS = TELEMETRY_POLL_INTERVAL_MS * 3;
+const REALTIME_CONNECTION_MAX_AGE_MS = 12000;
+const LIVE_SESSION_MAX_AGE_MS = 15000;
+const INITIAL_CONNECT_TIMEOUT_MS = 20000;
+const RECONNECT_TIMEOUT_MS = 15000;
+
+interface AsyncHealthState {
+  status: "idle" | "pending" | "ready" | "failed";
+  lastSuccessAt?: number;
+  error?: string;
+}
+
+interface ConnectionScreenState {
+  phase: ConnectionPhase;
+  title: string;
+  detail: string;
+}
+
+interface ConnectionHealth {
+  formantBackendHealthy: boolean;
+  realtimeConnectionFresh: boolean;
+  robotRealtimeHealthy: boolean;
+  liveSessionHealthy: boolean;
+  transportReady: boolean;
+}
 
 function getWaypointKey(waypoint: GraphNavOverlayWaypoint): string {
   return waypoint.id || waypoint.name;
 }
 
-function isFresh(timestamp: number | undefined, maxAgeMs: number): boolean {
-  return Boolean(timestamp && Date.now() - timestamp <= maxAgeMs);
+function isFresh(timestamp: number | undefined, maxAgeMs: number, now = Date.now()): boolean {
+  return Boolean(timestamp && now - timestamp <= maxAgeMs);
+}
+
+function deriveConnectionHealth(
+  now: number,
+  snapshot: StreamSnapshot,
+  bootstrapState: AsyncHealthState,
+  telemetryState: AsyncHealthState
+): ConnectionHealth {
+  const formantBackendHealthy =
+    bootstrapState.status === "ready" &&
+    Boolean(
+      telemetryState.lastSuccessAt &&
+        now - telemetryState.lastSuccessAt <= FORMANT_BACKEND_MAX_AGE_MS
+    );
+  const realtimeConnectionFresh = isFresh(
+    snapshot.realtimeConnectionStateTime,
+    REALTIME_CONNECTION_MAX_AGE_MS,
+    now
+  );
+  const robotRealtimeHealthy =
+    realtimeConnectionFresh && snapshot.realtimeConnectionState === "connected";
+  const liveSessionHealthy =
+    robotRealtimeHealthy &&
+    [
+      snapshot.navStateRealtimeTime,
+      snapshot.mapImageMetadataRealtimeTime,
+      snapshot.mapImageRealtimeTime,
+      snapshot.overlayRealtimeTime
+    ].some((timestamp) => isFresh(timestamp, LIVE_SESSION_MAX_AGE_MS, now));
+
+  return {
+    formantBackendHealthy,
+    realtimeConnectionFresh,
+    robotRealtimeHealthy,
+    liveSessionHealthy,
+    transportReady: formantBackendHealthy && liveSessionHealthy
+  };
 }
 
 function formatPose(target?: TargetPose): string {
@@ -177,6 +240,110 @@ function getMapSurfaceStatus(
   }
   if (catalogCurrentMapId) return "catalog";
   return "unavailable";
+}
+
+function buildConnectionScreenState(
+  now: number,
+  health: ConnectionHealth,
+  snapshot: StreamSnapshot,
+  bootstrapState: AsyncHealthState,
+  telemetryState: AsyncHealthState,
+  attemptStartedAt: number,
+  hasReachedReady: boolean
+): ConnectionScreenState {
+  const timeoutMs = hasReachedReady ? RECONNECT_TIMEOUT_MS : INITIAL_CONNECT_TIMEOUT_MS;
+  const timedOut = now - attemptStartedAt >= timeoutMs;
+
+  if (health.transportReady) {
+    return {
+      phase: "ready",
+      title: "Connected",
+      detail: "Formant and the live robot session are healthy."
+    };
+  }
+
+  if (bootstrapState.status === "failed") {
+    return {
+      phase: "failed",
+      title: "Could not connect to Formant",
+      detail:
+        bootstrapState.error ||
+        "Authentication or device bootstrap failed before the navigation session could start."
+    };
+  }
+
+  if (timedOut) {
+    if (!health.formantBackendHealthy) {
+      return {
+        phase: "failed",
+        title: "Formant connection failed",
+        detail:
+          telemetryState.error ||
+          "The module could not confirm a healthy connection to the Formant API backend."
+      };
+    }
+
+    if (!health.realtimeConnectionFresh) {
+      return {
+        phase: "failed",
+        title: "Live robot connection timed out",
+        detail:
+          "The realtime session never reported a current robot connection state."
+      };
+    }
+
+    if (snapshot.realtimeConnectionState !== "connected") {
+      return {
+        phase: "failed",
+        title: "Robot is not connected",
+        detail:
+          "Formant is reachable, but the live robot connection is not healthy yet."
+      };
+    }
+
+    return {
+      phase: "failed",
+      title: "Live navigation data is unavailable",
+      detail:
+        "The realtime session connected, but live map or navigation streams did not become healthy."
+    };
+  }
+
+  if (!health.formantBackendHealthy) {
+    return {
+      phase: "connecting",
+      title: "Connecting to Formant",
+      detail:
+        telemetryState.status === "pending"
+          ? "Checking the Formant API backend and loading the latest device state."
+          : "Waiting for a healthy Formant backend connection."
+      };
+  }
+
+  if (!health.realtimeConnectionFresh) {
+    return {
+      phase: "connecting",
+      title: "Connecting to live robot session",
+      detail:
+        "Waiting for the realtime robot connection state to become current."
+    };
+  }
+
+  if (snapshot.realtimeConnectionState !== "connected") {
+    return {
+      phase: "connecting",
+      title: "Waiting for robot connection",
+      detail:
+        "Formant is reachable, but the robot has not reported a healthy live connection yet."
+    };
+  }
+
+  return {
+    phase: "connecting",
+    title: "Starting live navigation session",
+    detail:
+      "The robot is connected. Waiting for live map and navigation data before showing the interface."
+  };
 }
 
 function buildSystemStatus(
@@ -673,10 +840,45 @@ const panelSurfaceSx = {
   boxShadow: "0 18px 54px rgba(0,0,0,0.26)"
 } as const;
 
+function ConnectionScreen({
+  state,
+  onRetry
+}: {
+  state: ConnectionScreenState;
+  onRetry: () => void;
+}) {
+  return (
+    <Stack
+      alignItems="center"
+      justifyContent="center"
+      spacing={2}
+      sx={{ width: "100%", height: "100%", px: 3, textAlign: "center" }}
+    >
+      {state.phase === "connecting" ? <CircularProgress size={28} color="primary" /> : null}
+      <Typography variant="h6">{state.title}</Typography>
+      <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 420 }}>
+        {state.detail}
+      </Typography>
+      {state.phase === "failed" ? (
+        <Button variant="contained" onClick={onRetry}>
+          Retry
+        </Button>
+      ) : null}
+    </Stack>
+  );
+}
+
 export default function App() {
+  const connectionReadyRef = useRef(false);
   const [device, setDevice] = useState<{ id: string; name: string }>();
   const [config, setConfig] = useState<ModuleConfig>(DEFAULT_MODULE_CONFIG);
   const [snapshot, setSnapshot] = useState<StreamSnapshot>({});
+  const [now, setNow] = useState(() => Date.now());
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
+  const [connectionAttemptStartedAt, setConnectionAttemptStartedAt] = useState(() => Date.now());
+  const [hasReachedReady, setHasReachedReady] = useState(false);
+  const [bootstrapState, setBootstrapState] = useState<AsyncHealthState>({ status: "idle" });
+  const [telemetryState, setTelemetryState] = useState<AsyncHealthState>({ status: "idle" });
   const [selectionMode, setSelectionMode] = useState<SelectionMode>("waypoints");
   const [selection, setSelection] = useState<Selection>();
   const [availableCommands, setAvailableCommands] = useState<string[]>([]);
@@ -685,17 +887,23 @@ export default function App() {
   const [saveWaypointExpanded, setSaveWaypointExpanded] = useState(false);
   const [mapSearch, setMapSearch] = useState("");
   const [mapsExpanded, setMapsExpanded] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [pendingCommand, setPendingCommand] = useState<string>();
-  const [error, setError] = useState<string>();
   const [commandError, setCommandError] = useState<string>();
   const [commandNotice, setCommandNotice] = useState<string>();
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     let configCleanup: (() => void) | undefined;
 
     const bootstrap = async () => {
+      setBootstrapState({ status: "pending" });
       try {
         const currentDevice = await authenticateAndGetDevice();
         const initialConfig = await getInitialModuleConfig();
@@ -707,13 +915,16 @@ export default function App() {
         configCleanup = FormantApp.addModuleConfigurationListener((event: { configuration: string }) => {
           setConfig(parseModuleConfig(event.configuration));
         });
+        setBootstrapState({ status: "ready", lastSuccessAt: Date.now() });
       } catch (bootstrapError) {
         if (cancelled) return;
-        setError(
-          bootstrapError instanceof Error ? bootstrapError.message : "Failed to initialize the module."
-        );
-      } finally {
-        if (!cancelled) setLoading(false);
+        setBootstrapState({
+          status: "failed",
+          error:
+            bootstrapError instanceof Error
+              ? bootstrapError.message
+              : "Failed to initialize the module."
+        });
       }
     };
 
@@ -723,13 +934,12 @@ export default function App() {
       cancelled = true;
       configCleanup?.();
     };
-  }, []);
+  }, [connectionAttempt]);
 
   useEffect(() => {
     if (!device) return undefined;
 
     let cancelled = false;
-    setError(undefined);
     const unsubscribe = subscribeRealtimeSnapshot(device.id, config, (patch) => {
       if (cancelled) return;
       setSnapshot((previous) => ({
@@ -742,12 +952,17 @@ export default function App() {
       cancelled = true;
       unsubscribe();
     };
-  }, [device, config]);
+  }, [device, config, connectionAttempt]);
 
   useEffect(() => {
     if (!device) return undefined;
 
     let cancelled = false;
+    setTelemetryState((previous) => ({
+      status: previous.lastSuccessAt ? previous.status : "pending",
+      lastSuccessAt: previous.lastSuccessAt,
+      error: undefined
+    }));
 
     const refreshTelemetry = async () => {
       try {
@@ -757,8 +972,21 @@ export default function App() {
           ...previous,
           ...patch
         }));
+        setTelemetryState({
+          status: "ready",
+          lastSuccessAt: Date.now()
+        });
       } catch (telemetryError) {
         console.warn("Failed to refresh telemetry snapshot.", telemetryError);
+        if (cancelled) return;
+        setTelemetryState((previous) => ({
+          status: previous.lastSuccessAt ? "ready" : "failed",
+          lastSuccessAt: previous.lastSuccessAt,
+          error:
+            telemetryError instanceof Error
+              ? telemetryError.message
+              : "Failed to refresh telemetry snapshot."
+        }));
       }
     };
 
@@ -771,7 +999,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(intervalId);
     };
-  }, [device, config]);
+  }, [device, config, connectionAttempt]);
 
   useEffect(() => {
     if (snapshot.navState?.active) {
@@ -800,11 +1028,46 @@ export default function App() {
     "";
   const currentMapId = catalogCurrentMapId || displayedMapId;
   const defaultMapId = snapshot.defaultMapId || "";
+  const connectionHealth = useMemo(
+    () => deriveConnectionHealth(now, snapshot, bootstrapState, telemetryState),
+    [now, snapshot, bootstrapState, telemetryState]
+  );
+
+  useEffect(() => {
+    if (connectionHealth.transportReady === connectionReadyRef.current) return;
+    connectionReadyRef.current = connectionHealth.transportReady;
+    setConnectionAttemptStartedAt(Date.now());
+    if (connectionHealth.transportReady) {
+      setHasReachedReady(true);
+    }
+  }, [connectionHealth.transportReady]);
+
   const localizationStatus = getLocalizationStatus(snapshot);
   const mapSurfaceStatus = getMapSurfaceStatus(snapshot, catalogCurrentMapId, displayedMapUuid);
   const systemStatus = useMemo(
     () => buildSystemStatus(snapshot, catalogCurrentMapId, displayedMapUuid),
     [snapshot, catalogCurrentMapId, displayedMapUuid]
+  );
+  const connectionScreenState = useMemo(
+    () =>
+      buildConnectionScreenState(
+        now,
+        connectionHealth,
+        snapshot,
+        bootstrapState,
+        telemetryState,
+        connectionAttemptStartedAt,
+        hasReachedReady
+      ),
+    [
+      now,
+      connectionHealth,
+      snapshot,
+      bootstrapState,
+      telemetryState,
+      connectionAttemptStartedAt,
+      hasReachedReady
+    ]
   );
 
   const mapLoadCommandAvailable = availableCommands.includes(config.mapLoadCommandName);
@@ -971,6 +1234,29 @@ export default function App() {
       return current;
     });
   }, [displayedMapUuid, snapshot.overlay]);
+
+  const handleRetryConnection = () => {
+    connectionReadyRef.current = false;
+    setDevice(undefined);
+    setConfig(DEFAULT_MODULE_CONFIG);
+    setSnapshot({});
+    setAvailableCommands([]);
+    setSelection(undefined);
+    setSelectionMode("waypoints");
+    setWaypointSearch("");
+    setSaveWaypointName("");
+    setSaveWaypointExpanded(false);
+    setMapSearch("");
+    setMapsExpanded(false);
+    setPendingCommand(undefined);
+    setCommandError(undefined);
+    setCommandNotice(undefined);
+    setBootstrapState({ status: "idle" });
+    setTelemetryState({ status: "idle" });
+    setHasReachedReady(false);
+    setConnectionAttemptStartedAt(Date.now());
+    setConnectionAttempt((current) => current + 1);
+  };
 
   const sendCommand = async (
     name: string,
@@ -1149,13 +1435,8 @@ export default function App() {
           color: "text.primary"
         }}
       >
-        {loading ? (
-          <Stack alignItems="center" justifyContent="center" spacing={2} sx={{ width: "100%", height: "100%" }}>
-            <CircularProgress size={28} color="primary" />
-            <Typography variant="body2" color="text.secondary">
-              Connecting
-            </Typography>
-          </Stack>
+        {connectionScreenState.phase !== "ready" ? (
+          <ConnectionScreen state={connectionScreenState} onRetry={handleRetryConnection} />
         ) : (
           <Box
             sx={{
@@ -1864,7 +2145,6 @@ export default function App() {
                   </Alert>
                 ) : null}
 
-                {error ? <Alert severity="error">{error}</Alert> : null}
                 {commandError ? <Alert severity="error">{commandError}</Alert> : null}
                 {commandNotice ? <Alert severity="info">{commandNotice}</Alert> : null}
 

@@ -781,10 +781,12 @@ export function subscribeRealtimeSnapshot(
         deviceId,
         buildRealtimeSource(config.navStateStreamName, "json"),
         (value) => {
+          const now = Date.now();
           setWarning("navState");
           emitPatch({
             navState: parseNavStateValue(value),
-            navStateTime: Date.now()
+            navStateTime: now,
+            navStateRealtimeTime: now
           });
         }
       ),
@@ -810,10 +812,12 @@ export function subscribeRealtimeSnapshot(
             emitPatch({});
             return;
           }
+          const now = Date.now();
           setWarning("mapImageMetadata");
           emitPatch({
             mapImageMetadata,
-            mapImageMetadataTime: Date.now()
+            mapImageMetadataTime: now,
+            mapImageMetadataRealtimeTime: now
           });
         }
       ),
@@ -836,10 +840,12 @@ export function subscribeRealtimeSnapshot(
             emitPatch({});
             return;
           }
+          const now = Date.now();
           setWarning("overlay");
           emitPatch({
             overlay,
-            overlayTime: Date.now()
+            overlayTime: now,
+            overlayRealtimeTime: now
           });
         }
       ),
@@ -856,11 +862,13 @@ export function subscribeRealtimeSnapshot(
         deviceId,
         buildRealtimeSource(config.mapImageStreamName, "video"),
         (canvas) => {
+          const now = Date.now();
           setWarning("mapImage");
           emitPatch({
             mapImageCanvas: canvas,
-            mapImageFrameVersion: Date.now(),
-            mapImageTime: Date.now()
+            mapImageFrameVersion: now,
+            mapImageTime: now,
+            mapImageRealtimeTime: now
           });
         }
       ),
@@ -929,7 +937,15 @@ export function subscribeRealtimeSnapshot(
         buildRealtimeSource(config.connectionStateStreamName, "text"),
         (value) => {
           setWarning("connectionState");
-          patchTextValue("connectionState", "connectionStateTime", value, emitPatch);
+          const normalized = normalizeOptionalText(value);
+          if (typeof normalized === "undefined") return;
+          const now = Date.now();
+          emitPatch({
+            connectionState: normalized,
+            connectionStateTime: now,
+            realtimeConnectionState: normalized,
+            realtimeConnectionStateTime: now
+          });
         }
       ),
     setWarning,
