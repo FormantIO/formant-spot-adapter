@@ -31,6 +31,7 @@ export const DEFAULT_MODULE_CONFIG: ModuleConfig = {
   mapLoadCommandName: "spot.map.load",
   mapSetDefaultCommandName: "spot.map.set_default",
   waypointSaveCommandName: "spot.waypoint.save",
+  waypointDeleteCommandName: "spot.waypoint.delete",
   waypointGotoCommandName: "spot.waypoint.goto",
   gotoPoseCommandName: "spot.graphnav.goto_pose",
   cancelNavCommandName: "spot.graphnav.cancel",
@@ -342,6 +343,10 @@ export function parseModuleConfig(raw: string | undefined): ModuleConfig {
       waypointSaveCommandName: asConfiguredName(
         value.waypointSaveCommandName,
         DEFAULT_MODULE_CONFIG.waypointSaveCommandName
+      ),
+      waypointDeleteCommandName: asConfiguredName(
+        value.waypointDeleteCommandName,
+        DEFAULT_MODULE_CONFIG.waypointDeleteCommandName
       ),
       waypointGotoCommandName: asConfiguredName(
         value.waypointGotoCommandName,
@@ -1182,6 +1187,10 @@ export function formatWaypointGotoByNamePayload(mapUuid: string, waypointName: s
 export function formatWaypointSavePayload(name: string): string | undefined {
   const trimmed = name.trim();
   return trimmed ? `name=${trimmed}` : undefined;
+}
+
+export function formatWaypointDeletePayload(name: string): string {
+  return `name=${name.trim()}`;
 }
 
 export function formatMapIdPayload(mapId: string): string {

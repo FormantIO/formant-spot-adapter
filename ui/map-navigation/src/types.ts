@@ -14,6 +14,7 @@ export interface ModuleConfig {
   mapLoadCommandName: string;
   mapSetDefaultCommandName: string;
   waypointSaveCommandName: string;
+  waypointDeleteCommandName: string;
   waypointGotoCommandName: string;
   gotoPoseCommandName: string;
   cancelNavCommandName: string;

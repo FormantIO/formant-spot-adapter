@@ -7,6 +7,11 @@ import {
   CircularProgress,
   Collapse,
   CssBaseline,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  IconButton,
   List,
   ListItemButton,
   ListItemText,
@@ -21,6 +26,7 @@ import {
   authenticateAndGetDevice,
   formatGotoPosePayload,
   formatMapIdPayload,
+  formatWaypointDeletePayload,
   formatWaypointGotoByNamePayload,
   formatWaypointSavePayload,
   getInitialModuleConfig,
@@ -83,6 +89,15 @@ type PointHeadingMode = "current" | "path" | "custom";
 type Selection =
   | { kind: "waypoint"; mapUuid: string; waypoint: GraphNavOverlayWaypoint }
   | { kind: "point"; mapUuid: string; target: TargetPose; headingMode: PointHeadingMode };
+type ModalState =
+  | { kind: "waypoint-goto"; waypoint: GraphNavOverlayWaypoint; mapUuid: string }
+  | { kind: "waypoint-delete"; waypoint: GraphNavOverlayWaypoint; mapUuid: string }
+  | {
+      kind: "point-goto";
+      target: TargetPose;
+      headingMode: PointHeadingMode;
+      mapUuid: string;
+    };
 
 const panelSurfaceSx = {
   backdropFilter: "blur(18px)",
@@ -97,6 +112,20 @@ const cardSx = {
   backgroundColor: "rgba(255,255,255,0.03)",
   border: "1px solid rgba(255,255,255,0.06)"
 } as const;
+
+function TrashIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M9 3.75h6m-9 3h12m-1.5 0-.6 10.2a1.5 1.5 0 0 1-1.5 1.41H9.6a1.5 1.5 0 0 1-1.5-1.41L7.5 6.75m3 3.75v5.25m3-5.25v5.25"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
 
 function roundCoord(value: number): number {
   return Math.round(value * 100);
@@ -908,6 +937,7 @@ export default function App() {
   const [telemetryState, setTelemetryState] = useState<AsyncHealthState>({ status: "idle" });
   const [selectionMode, setSelectionMode] = useState<SelectionMode>("waypoints");
   const [selection, setSelection] = useState<Selection>();
+  const [modalState, setModalState] = useState<ModalState>();
   const [availableCommands, setAvailableCommands] = useState<string[]>([]);
   const [waypointSearch, setWaypointSearch] = useState("");
   const [saveWaypointName, setSaveWaypointName] = useState("");
@@ -1029,6 +1059,7 @@ export default function App() {
   useEffect(() => {
     if (snapshot.navState?.active) {
       setSelection(undefined);
+      setModalState(undefined);
       setSelectionMode("waypoints");
       setSaveWaypointExpanded(false);
     }
@@ -1280,6 +1311,43 @@ export default function App() {
     () => buildWaypointSaveIssues(snapshot, currentMapId, now),
     [snapshot, currentMapId, now]
   );
+  const mapLoadCommandAvailable = availableCommands.includes(config.mapLoadCommandName);
+  const mapSetDefaultCommandAvailable = availableCommands.includes(config.mapSetDefaultCommandName);
+  const waypointSaveCommandAvailable = availableCommands.includes(config.waypointSaveCommandName);
+  const waypointDeleteCommandAvailable = availableCommands.includes(
+    config.waypointDeleteCommandName
+  );
+  const cancelCommandAvailable = availableCommands.includes(config.cancelNavCommandName);
+  const returnAndDockCommandAvailable = availableCommands.includes(config.returnAndDockCommandName);
+  const undockCommandAvailable = availableCommands.includes(config.undockCommandName);
+
+  const waypointDeleteIssues = useMemo(() => {
+    if (selection?.kind !== "waypoint") return [];
+    const issues: string[] = [];
+    if (!currentMapId) {
+      issues.push("No active map is loaded.");
+    }
+    if (!waypointDeleteCommandAvailable) {
+      issues.push("Waypoint delete command is unavailable.");
+    }
+    if (
+      isFresh(snapshot.overlayTime, ROBOT_STATE_MAX_AGE_MS, now) &&
+      !overlayWaypoints.some(
+        (waypoint) =>
+          getWaypointSignature(waypoint) === getWaypointSignature(selection.waypoint)
+      )
+    ) {
+      issues.push("Selected waypoint is no longer available.");
+    }
+    return uniqueIssues(issues);
+  }, [
+    currentMapId,
+    now,
+    overlayWaypoints,
+    selection,
+    snapshot.overlayTime,
+    waypointDeleteCommandAvailable
+  ]);
 
   const selectionReady = Boolean(selection) && selectionReadinessIssues.length === 0;
   const currentPoseLabel =
@@ -1298,13 +1366,6 @@ export default function App() {
           typeof snapshot.navState.target_seed_y === "number"
         ? `x=${snapshot.navState.target_seed_x.toFixed(1)} m, y=${snapshot.navState.target_seed_y.toFixed(1)} m`
         : "No active destination");
-
-  const mapLoadCommandAvailable = availableCommands.includes(config.mapLoadCommandName);
-  const mapSetDefaultCommandAvailable = availableCommands.includes(config.mapSetDefaultCommandName);
-  const waypointSaveCommandAvailable = availableCommands.includes(config.waypointSaveCommandName);
-  const cancelCommandAvailable = availableCommands.includes(config.cancelNavCommandName);
-  const returnAndDockCommandAvailable = availableCommands.includes(config.returnAndDockCommandName);
-  const undockCommandAvailable = availableCommands.includes(config.undockCommandName);
 
   const connectionReady =
     isFresh(snapshot.connectionStateTime, ROBOT_STATE_MAX_AGE_MS, now) &&
@@ -1347,6 +1408,11 @@ export default function App() {
     });
   }, [displayedMapUuid, overlayWaypoints]);
 
+  useEffect(() => {
+    if (selection) return;
+    setModalState(undefined);
+  }, [selection]);
+
   const handleRetryConnection = () => {
     connectionReadyRef.current = false;
     setDevice(undefined);
@@ -1354,6 +1420,7 @@ export default function App() {
     setSnapshot({});
     setAvailableCommands([]);
     setSelection(undefined);
+    setModalState(undefined);
     setSelectionMode("waypoints");
     setWaypointSearch("");
     setSaveWaypointName("");
@@ -1424,26 +1491,31 @@ export default function App() {
   };
 
   const handleSelectWaypoint = (waypoint: GraphNavOverlayWaypoint) => {
+    const mapUuid = snapshot.overlay?.map_uuid || snapshot.mapImageMetadata?.map_uuid || "";
     setSaveWaypointExpanded(false);
-    setSelection({
-      kind: "waypoint",
-      mapUuid: snapshot.overlay?.map_uuid || snapshot.mapImageMetadata?.map_uuid || "",
-      waypoint
-    });
+    setSelection({ kind: "waypoint", mapUuid, waypoint });
+    setModalState({ kind: "waypoint-goto", waypoint, mapUuid });
+    setSelectionMode("waypoints");
+    setCommandError(undefined);
+    setCommandNotice(undefined);
+  };
+
+  const handleRequestWaypointDelete = (waypoint: GraphNavOverlayWaypoint) => {
+    const mapUuid = snapshot.overlay?.map_uuid || snapshot.mapImageMetadata?.map_uuid || "";
+    setSelection({ kind: "waypoint", mapUuid, waypoint });
+    setModalState({ kind: "waypoint-delete", waypoint, mapUuid });
     setSelectionMode("waypoints");
     setCommandError(undefined);
     setCommandNotice(undefined);
   };
 
   const handleSelectPoint = (target: TargetPose) => {
+    const mapUuid = snapshot.mapImageMetadata?.map_uuid || "";
     const nextTarget = { ...target, yawDeg: getCurrentYawDeg(config, snapshot.navState) };
     setSaveWaypointExpanded(false);
-    setSelection({
-      kind: "point",
-      mapUuid: snapshot.mapImageMetadata?.map_uuid || "",
-      target: nextTarget,
-      headingMode: config.defaultYawMode === "fixed" ? "custom" : "current"
-    });
+    const headingMode = config.defaultYawMode === "fixed" ? "custom" : "current";
+    setSelection({ kind: "point", mapUuid, target: nextTarget, headingMode });
+    setModalState({ kind: "point-goto", mapUuid, target: nextTarget, headingMode });
     setCommandError(undefined);
     setCommandNotice(undefined);
   };
@@ -1456,7 +1528,7 @@ export default function App() {
     } else if (headingMode === "path") {
       nextYawDeg = computePathYawDeg(snapshot.navState, selection.target) ?? nextYawDeg;
     }
-    setSelection({
+    const nextSelection: Selection = {
       kind: "point",
       mapUuid: selection.mapUuid,
       headingMode,
@@ -1464,19 +1536,41 @@ export default function App() {
         ...selection.target,
         yawDeg: nextYawDeg
       }
-    });
+    };
+    setSelection(nextSelection);
+    setModalState((current) =>
+      current?.kind === "point-goto"
+        ? {
+            kind: "point-goto",
+            mapUuid: nextSelection.mapUuid,
+            headingMode,
+            target: nextSelection.target
+          }
+        : current
+    );
   };
 
   const updatePointYawDeg = (value: number) => {
     if (selection?.kind !== "point" || !Number.isFinite(value)) return;
-    setSelection({
+    const nextSelection: Selection = {
       ...selection,
       headingMode: "custom",
       target: {
         ...selection.target,
         yawDeg: value
       }
-    });
+    };
+    setSelection(nextSelection);
+    setModalState((current) =>
+      current?.kind === "point-goto"
+        ? {
+            kind: "point-goto",
+            mapUuid: nextSelection.mapUuid,
+            headingMode: "custom",
+            target: nextSelection.target
+          }
+        : current
+    );
   };
 
   const handleSaveWaypoint = () => {
@@ -1500,6 +1594,8 @@ export default function App() {
   const confirmWaypointNavigation = () => {
     if (selection?.kind !== "waypoint" || !displayedMapUuid) return;
     const payload = formatWaypointGotoByNamePayload(displayedMapUuid, selection.waypoint.name);
+    setModalState(undefined);
+    setSelection(undefined);
     void sendCommand(
       config.waypointGotoCommandName,
       payload,
@@ -1516,11 +1612,25 @@ export default function App() {
       selection.target.y,
       selection.target.yawDeg
     );
+    setModalState(undefined);
+    setSelection(undefined);
     void sendCommand(
       config.gotoPoseCommandName,
       payload,
       "Sending point target...",
       "Point target command sent. Waiting for navigation state..."
+    );
+  };
+
+  const confirmWaypointDelete = () => {
+    if (selection?.kind !== "waypoint") return;
+    setModalState(undefined);
+    setSelection(undefined);
+    void sendCommand(
+      config.waypointDeleteCommandName,
+      formatWaypointDeletePayload(selection.waypoint.name),
+      `Deleting ${selection.waypoint.name}...`,
+      `${selection.waypoint.name} delete command sent. Waiting for the waypoint list to update...`
     );
   };
 
@@ -1577,13 +1687,15 @@ export default function App() {
                 ...panelSurfaceSx
               }}
             >
-              <Stack spacing={2} sx={{ height: "100%", p: 2 }}>
+              <Stack spacing={1.5} sx={{ height: "100%", p: 1.5 }}>
                 <Stack spacing={0.5}>
-                  <Typography variant="h6">{device?.name || "Current device"}</Typography>
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="h6" noWrap>
+                    {device?.name || "Current device"}
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary" noWrap>
                     Current waypoint: {getCurrentWaypointLabel(snapshot)}
                   </Typography>
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="body2" color="text.secondary" noWrap>
                     Pose: {currentPoseLabel}
                   </Typography>
                 </Stack>
@@ -1604,8 +1716,8 @@ export default function App() {
                     ) : undefined
                   }
                 >
-                  <Stack spacing={0.8}>
-                    <Stack spacing={0.45}>
+                  <Stack spacing={0.7}>
+                    <Stack spacing={0.35}>
                       <Stack
                         direction="row"
                         spacing={0.75}
@@ -1631,7 +1743,7 @@ export default function App() {
                           <Chip size="small" label="Default" color="secondary" />
                         ) : null}
                       </Stack>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" color="text.secondary" noWrap>
                         {defaultMapId
                           ? defaultMapId === currentMapId
                             ? "Default map"
@@ -1642,25 +1754,11 @@ export default function App() {
                         {mapState.savedCount ? ` · ${mapState.savedCount} saved` : ""}
                         {mapState.headline ? ` · ${mapState.headline}` : ""}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary">
-                        {mapState.detail}
-                      </Typography>
-                    </Stack>
-
-                    <Stack direction="row" spacing={0.6} flexWrap="wrap" useFlexGap>
-                      {mapState.savedCount ? (
-                        <Chip
-                          size="small"
-                          label={`${mapState.savedCount} saved`}
-                          variant="outlined"
-                        />
+                      {!mapsExpanded ? (
+                        <Typography variant="caption" color="text.secondary" noWrap>
+                          {mapState.detail}
+                        </Typography>
                       ) : null}
-                      <Chip
-                        size="small"
-                        label={mapState.surfaceMode === "live" ? "Live" : mapState.headline}
-                        variant="outlined"
-                        color={mapState.surfaceMode === "live" ? "secondary" : "default"}
-                      />
                     </Stack>
 
                     <Collapse in={mapsPanelVisible} unmountOnExit>
@@ -1882,286 +1980,415 @@ export default function App() {
                   </Stack>
                 </SectionCard>
 
-                <SectionCard title="Navigate" subtitle={navigationSummary.title}>
-                  <Stack spacing={1.25}>
-                    <Typography variant="body2" color="text.secondary">
-                      {navigationSummary.detail}
-                    </Typography>
-
-                    <ModeSelector
-                      value={selectionMode}
-                      onChange={(value) => {
-                        setSelectionMode(value);
-                        setSelection(undefined);
-                        setSaveWaypointExpanded(false);
-                      }}
-                    />
-
-                    {selectionMode === "waypoints" ? (
-                      <Stack spacing={1.25}>
+                <Box sx={{ flex: 1, minHeight: 0, display: "flex" }}>
+                  <Box sx={{ ...cardSx, flex: 1, minHeight: 0, display: "flex" }}>
+                    <Stack spacing={1} sx={{ flex: 1, minHeight: 0 }}>
+                      <Stack spacing={0.45}>
                         <Stack
                           direction="row"
                           spacing={1}
                           justifyContent="space-between"
                           alignItems="center"
                         >
-                          <Typography variant="subtitle2">Saved Waypoints</Typography>
-                          <Button
-                            size="small"
-                            variant={saveWaypointExpanded ? "contained" : "outlined"}
-                            disabled={
-                              !waypointSaveCommandAvailable ||
-                              pendingCommand === config.waypointSaveCommandName
-                            }
-                            onClick={() => {
-                              setSaveWaypointExpanded((current) => !current);
-                              setSelection(undefined);
-                            }}
-                          >
-                            Save Current
-                          </Button>
+                          <Typography variant="subtitle2">Navigate</Typography>
+                          <Typography variant="caption" color="text.secondary" noWrap>
+                            {navigationSummary.title}
+                          </Typography>
                         </Stack>
+                        <Typography variant="caption" color="text.secondary" noWrap>
+                          {selectionMode === "waypoints"
+                            ? "Click a saved waypoint to send the robot."
+                            : "Click the map to place a point target."}
+                        </Typography>
+                      </Stack>
 
-                        <Collapse in={saveWaypointExpanded} unmountOnExit>
+                      <ModeSelector
+                        value={selectionMode}
+                        onChange={(value) => {
+                          setSelectionMode(value);
+                          setSelection(undefined);
+                          setSaveWaypointExpanded(false);
+                        }}
+                      />
+
+                      {selectionMode === "waypoints" ? (
+                        <>
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            justifyContent="space-between"
+                            alignItems="center"
+                          >
+                            <Typography variant="subtitle2">Saved Waypoints</Typography>
+                            <Button
+                              size="small"
+                              variant={saveWaypointExpanded ? "contained" : "outlined"}
+                              disabled={
+                                !waypointSaveCommandAvailable ||
+                                pendingCommand === config.waypointSaveCommandName
+                              }
+                              onClick={() => {
+                                setSaveWaypointExpanded((current) => !current);
+                                setSelection(undefined);
+                                setModalState(undefined);
+                              }}
+                            >
+                              Save Current
+                            </Button>
+                          </Stack>
+
+                          <Collapse in={saveWaypointExpanded} unmountOnExit>
+                            <Box
+                              sx={{
+                                p: 1.15,
+                                borderRadius: 1.8,
+                                border: "1px solid rgba(255,255,255,0.06)",
+                                backgroundColor: "rgba(255,255,255,0.02)"
+                              }}
+                            >
+                              <Stack spacing={0.85}>
+                                <Typography variant="caption" color="text.secondary">
+                                  Save the current pose on {currentMapId || "the active map"}.
+                                </Typography>
+                                <TextField
+                                  label="Waypoint name"
+                                  placeholder="Leave blank to auto-generate"
+                                  size="small"
+                                  value={saveWaypointName}
+                                  onChange={(event) => setSaveWaypointName(event.target.value)}
+                                />
+                                {waypointSaveIssues.length ? (
+                                  <Alert severity="warning">
+                                    <Stack spacing={0.5}>
+                                      {waypointSaveIssues.map((issue) => (
+                                        <Typography key={issue} variant="body2">
+                                          {issue}
+                                        </Typography>
+                                      ))}
+                                    </Stack>
+                                  </Alert>
+                                ) : null}
+                                <Stack direction="row" spacing={1}>
+                                  <Button
+                                    variant="contained"
+                                    onClick={handleSaveWaypoint}
+                                    disabled={!canSaveWaypoint}
+                                  >
+                                    Save
+                                  </Button>
+                                  <Button
+                                    variant="outlined"
+                                    onClick={() => {
+                                      setSaveWaypointExpanded(false);
+                                      setSaveWaypointName("");
+                                    }}
+                                  >
+                                    Cancel
+                                  </Button>
+                                </Stack>
+                              </Stack>
+                            </Box>
+                          </Collapse>
+
+                          <TextField
+                            value={waypointSearch}
+                            onChange={(event) => setWaypointSearch(event.target.value)}
+                            size="small"
+                            label="Search waypoints"
+                          />
+
                           <Box
                             sx={{
-                              p: 1.5,
+                              flex: 1,
+                              minHeight: 0,
+                              overflow: "auto",
                               borderRadius: 2,
                               border: "1px solid rgba(255,255,255,0.06)",
                               backgroundColor: "rgba(255,255,255,0.02)"
                             }}
                           >
-                            <Stack spacing={1}>
-                              <Typography variant="body2" color="text.secondary">
-                                Save the robot&apos;s current pose as a waypoint on{" "}
-                                {currentMapId || "the active map"}.
-                              </Typography>
-                              <TextField
-                                label="Waypoint name"
-                                placeholder="Leave blank to auto-generate"
-                                size="small"
-                                value={saveWaypointName}
-                                onChange={(event) => setSaveWaypointName(event.target.value)}
-                              />
-                              {waypointSaveIssues.length ? (
-                                <Alert severity="warning">
-                                  <Stack spacing={0.5}>
-                                    {waypointSaveIssues.map((issue) => (
-                                      <Typography key={issue} variant="body2">
-                                        {issue}
-                                      </Typography>
-                                    ))}
-                                  </Stack>
-                                </Alert>
+                            <List dense disablePadding sx={{ p: 0.65 }}>
+                              {sortedWaypoints.map((waypoint) => {
+                                const isSelected =
+                                  selection?.kind === "waypoint" &&
+                                  getWaypointSignature(selection.waypoint) ===
+                                    getWaypointSignature(waypoint);
+                                const duplicateNameCount =
+                                  duplicateWaypointNames.get(waypoint.name) || 0;
+                                const secondaryParts = [
+                                  waypoint.is_dock ? "Dock" : "",
+                                  snapshot.overlay?.current_waypoint_name === waypoint.name
+                                    ? "Current"
+                                    : "",
+                                  duplicateNameCount > 1
+                                    ? `${waypoint.x.toFixed(1)}, ${waypoint.y.toFixed(1)}`
+                                    : ""
+                                ].filter(Boolean);
+
+                                return (
+                                  <ListItemButton
+                                    key={getWaypointSignature(waypoint)}
+                                    selected={isSelected}
+                                    onClick={() => handleSelectWaypoint(waypoint)}
+                                    sx={{
+                                      borderRadius: 1.4,
+                                      mb: 0.4,
+                                      pr: 0.75,
+                                      alignItems: "stretch"
+                                    }}
+                                  >
+                                    <ListItemText
+                                      primary={waypoint.name}
+                                      secondary={secondaryParts.join(" · ") || undefined}
+                                      primaryTypographyProps={{ noWrap: true }}
+                                      secondaryTypographyProps={{ noWrap: true }}
+                                    />
+                                    <IconButton
+                                      size="small"
+                                      edge="end"
+                                      disabled={
+                                        !waypointDeleteCommandAvailable ||
+                                        pendingCommand === config.waypointDeleteCommandName
+                                      }
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        handleRequestWaypointDelete(waypoint);
+                                      }}
+                                      sx={{
+                                        ml: 0.25,
+                                        color: "text.secondary"
+                                      }}
+                                    >
+                                      <TrashIcon />
+                                    </IconButton>
+                                  </ListItemButton>
+                                );
+                              })}
+                              {!sortedWaypoints.length ? (
+                                <Typography variant="body2" color="text.secondary" sx={{ p: 1 }}>
+                                  {currentMapId
+                                    ? "No saved waypoints yet for this map."
+                                    : "Load a map to browse or save waypoints."}
+                                </Typography>
                               ) : null}
-                              <Stack direction="row" spacing={1}>
-                                <Button
-                                  variant="contained"
-                                  onClick={handleSaveWaypoint}
-                                  disabled={!canSaveWaypoint}
-                                >
-                                  Save
-                                </Button>
-                                <Button
-                                  variant="outlined"
-                                  onClick={() => {
-                                    setSaveWaypointExpanded(false);
-                                    setSaveWaypointName("");
-                                  }}
-                                >
-                                  Cancel
-                                </Button>
-                              </Stack>
-                            </Stack>
+                            </List>
                           </Box>
-                        </Collapse>
 
-                        <TextField
-                          value={waypointSearch}
-                          onChange={(event) => setWaypointSearch(event.target.value)}
-                          size="small"
-                          label="Search waypoints"
-                        />
-
+                          {!waypointSaveCommandAvailable ? (
+                            <Typography variant="caption" color="warning.main">
+                              Waypoint save command is unavailable.
+                            </Typography>
+                          ) : null}
+                          {!waypointDeleteCommandAvailable ? (
+                            <Typography variant="caption" color="warning.main">
+                              Waypoint delete command is unavailable.
+                            </Typography>
+                          ) : null}
+                        </>
+                      ) : (
                         <Box
                           sx={{
-                            maxHeight: 260,
-                            overflow: "auto",
-                            borderRadius: 2,
+                            p: 1.15,
+                            borderRadius: 1.8,
                             border: "1px solid rgba(255,255,255,0.06)",
                             backgroundColor: "rgba(255,255,255,0.02)"
                           }}
                         >
-                          <List dense disablePadding sx={{ p: 0.75 }}>
-                            {sortedWaypoints.map((waypoint) => {
-                              const isSelected =
-                                selection?.kind === "waypoint" &&
-                                getWaypointSignature(selection.waypoint) ===
-                                  getWaypointSignature(waypoint);
-                              const duplicateNameCount =
-                                duplicateWaypointNames.get(waypoint.name) || 0;
-                              const secondaryParts = [
-                                waypoint.is_dock ? "Dock" : "",
-                                snapshot.overlay?.current_waypoint_name === waypoint.name
-                                  ? "Current"
-                                  : "",
-                                duplicateNameCount > 1
-                                  ? `${waypoint.x.toFixed(1)}, ${waypoint.y.toFixed(1)}`
-                                  : ""
-                              ].filter(Boolean);
+                          <Typography variant="body2" color="text.secondary">
+                            Point mode is advanced. Click the map to review a target before sending it.
+                          </Typography>
+                        </Box>
+                      )}
+                    </Stack>
+                  </Box>
+                </Box>
 
+                <Dialog
+                  open={Boolean(modalState)}
+                  onClose={() => {
+                    setModalState(undefined);
+                    setSelection(undefined);
+                  }}
+                  fullWidth
+                  maxWidth="xs"
+                >
+                  {modalState?.kind === "waypoint-goto" && selection?.kind === "waypoint" ? (
+                    <>
+                      <DialogTitle>Send Robot To Waypoint</DialogTitle>
+                      <DialogContent>
+                        <Stack spacing={1.2} sx={{ pt: 0.5 }}>
+                          <Typography variant="body1" sx={{ fontWeight: 600 }}>
+                            {selection.waypoint.name}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            {selection.waypoint.is_dock ? "Dock waypoint" : "Saved waypoint"}
+                          </Typography>
+                          {selectionReadinessIssues.length ? (
+                            <Alert severity="warning">
+                              <Stack spacing={0.5}>
+                                {selectionReadinessIssues.map((issue) => (
+                                  <Typography key={issue} variant="body2">
+                                    {issue}
+                                  </Typography>
+                                ))}
+                              </Stack>
+                            </Alert>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">
+                              Send the robot to this saved waypoint?
+                            </Typography>
+                          )}
+                        </Stack>
+                      </DialogContent>
+                      <DialogActions sx={{ px: 3, pb: 2.25 }}>
+                        <Button
+                          variant="outlined"
+                          onClick={() => {
+                            setModalState(undefined);
+                            setSelection(undefined);
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          variant="contained"
+                          onClick={confirmWaypointNavigation}
+                          disabled={
+                            !selectionReady ||
+                            pendingCommand === config.waypointGotoCommandName
+                          }
+                        >
+                          Send
+                        </Button>
+                      </DialogActions>
+                    </>
+                  ) : null}
+
+                  {modalState?.kind === "waypoint-delete" && selection?.kind === "waypoint" ? (
+                    <>
+                      <DialogTitle>Delete Saved Waypoint</DialogTitle>
+                      <DialogContent>
+                        <Stack spacing={1.2} sx={{ pt: 0.5 }}>
+                          <Typography variant="body1" sx={{ fontWeight: 600 }}>
+                            {selection.waypoint.name}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            This removes the saved waypoint alias from the active map.
+                          </Typography>
+                          {waypointDeleteIssues.length ? (
+                            <Alert severity="warning">
+                              <Stack spacing={0.5}>
+                                {waypointDeleteIssues.map((issue) => (
+                                  <Typography key={issue} variant="body2">
+                                    {issue}
+                                  </Typography>
+                                ))}
+                              </Stack>
+                            </Alert>
+                          ) : null}
+                        </Stack>
+                      </DialogContent>
+                      <DialogActions sx={{ px: 3, pb: 2.25 }}>
+                        <Button
+                          variant="outlined"
+                          onClick={() => {
+                            setModalState(undefined);
+                            setSelection(undefined);
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          color="warning"
+                          variant="contained"
+                          onClick={confirmWaypointDelete}
+                          disabled={
+                            waypointDeleteIssues.length > 0 ||
+                            pendingCommand === config.waypointDeleteCommandName
+                          }
+                        >
+                          Delete
+                        </Button>
+                      </DialogActions>
+                    </>
+                  ) : null}
+
+                  {modalState?.kind === "point-goto" && selection?.kind === "point" ? (
+                    <>
+                      <DialogTitle>Send Robot To Point</DialogTitle>
+                      <DialogContent>
+                        <Stack spacing={1.2} sx={{ pt: 0.5 }}>
+                          <Typography variant="body2" color="text.secondary">
+                            {formatPose(selection.target)}
+                          </Typography>
+
+                          <Stack direction="row" spacing={0.75}>
+                            {([
+                              ["current", "Keep"],
+                              ["path", "Face"],
+                              ["custom", "Custom"]
+                            ] as const).map(([mode, label]) => {
+                              const selected = selection.headingMode === mode;
                               return (
-                                <ListItemButton
-                                  key={getWaypointSignature(waypoint)}
-                                  selected={isSelected}
-                                  onClick={() => handleSelectWaypoint(waypoint)}
-                                  sx={{ borderRadius: 1.5, mb: 0.5 }}
+                                <Button
+                                  key={mode}
+                                  fullWidth
+                                  variant={selected ? "contained" : "outlined"}
+                                  onClick={() => updatePointHeadingMode(mode)}
                                 >
-                                  <ListItemText
-                                    primary={waypoint.name}
-                                    secondary={secondaryParts.join(" · ") || undefined}
-                                  />
-                                </ListItemButton>
+                                  {label}
+                                </Button>
                               );
                             })}
-                            {!sortedWaypoints.length ? (
-                              <Typography variant="body2" color="text.secondary" sx={{ p: 1 }}>
-                                {currentMapId
-                                  ? "No saved waypoints yet for this map."
-                                  : "Load a map to browse or save waypoints."}
-                              </Typography>
-                            ) : null}
-                          </List>
-                        </Box>
+                          </Stack>
 
-                        {!waypointSaveCommandAvailable ? (
-                          <Typography variant="caption" color="warning.main">
-                            Waypoint save command is unavailable on this device.
-                          </Typography>
-                        ) : null}
-                      </Stack>
-                    ) : (
-                      <Box
-                        sx={{
-                          p: 1.5,
-                          borderRadius: 2,
-                          border: "1px solid rgba(255,255,255,0.06)",
-                          backgroundColor: "rgba(255,255,255,0.02)"
-                        }}
-                      >
-                        <Typography variant="body2" color="text.secondary">
-                          Click the map to place a precise target. Point navigation is an advanced
-                          tool; saved waypoints remain the safer default.
-                        </Typography>
-                      </Box>
-                    )}
-                  </Stack>
-                </SectionCard>
+                          {selection.headingMode === "custom" ? (
+                            <TextField
+                              label="Yaw (deg)"
+                              type="number"
+                              size="small"
+                              value={selection.target.yawDeg}
+                              onChange={(event) => updatePointYawDeg(Number(event.target.value))}
+                              inputProps={{ step: 1 }}
+                            />
+                          ) : null}
 
-                {selection ? (
-                  <Box sx={cardSx}>
-                    {selection.kind === "waypoint" ? (
-                      <Stack spacing={1}>
-                        <Typography variant="subtitle2">Confirm Waypoint</Typography>
-                        <Typography variant="body1" sx={{ fontWeight: 600 }}>
-                          {selection.waypoint.name}
-                        </Typography>
-                        <Typography variant="body2" color="text.secondary">
-                          {selection.waypoint.is_dock ? "Dock waypoint" : "Saved waypoint"}
-                        </Typography>
-                        {selectionReadinessIssues.length ? (
-                          <Alert severity="warning">
-                            <Stack spacing={0.5}>
-                              {selectionReadinessIssues.map((issue) => (
-                                <Typography key={issue} variant="body2">
-                                  {issue}
-                                </Typography>
-                              ))}
-                            </Stack>
-                          </Alert>
-                        ) : null}
-                        <Stack direction="row" spacing={1}>
-                          <Button
-                            variant="contained"
-                            onClick={confirmWaypointNavigation}
-                            disabled={
-                              !selectionReady ||
-                              pendingCommand === config.waypointGotoCommandName
-                            }
-                          >
-                            Confirm
-                          </Button>
-                          <Button variant="outlined" onClick={() => setSelection(undefined)}>
-                            Cancel
-                          </Button>
+                          {selectionReadinessIssues.length ? (
+                            <Alert severity="warning">
+                              <Stack spacing={0.5}>
+                                {selectionReadinessIssues.map((issue) => (
+                                  <Typography key={issue} variant="body2">
+                                    {issue}
+                                  </Typography>
+                                ))}
+                              </Stack>
+                            </Alert>
+                          ) : null}
                         </Stack>
-                      </Stack>
-                    ) : (
-                      <Stack spacing={1}>
-                        <Typography variant="subtitle2">Confirm Point Target</Typography>
-                        <Typography variant="body2" color="text.secondary">
-                          {formatPose(selection.target)}
-                        </Typography>
-
-                        <Stack direction="row" spacing={0.75}>
-                          {([
-                            ["current", "Keep Heading"],
-                            ["path", "Face Path"],
-                            ["custom", "Custom"]
-                          ] as const).map(([mode, label]) => {
-                            const selected = selection.headingMode === mode;
-                            return (
-                              <Button
-                                key={mode}
-                                fullWidth
-                                variant={selected ? "contained" : "outlined"}
-                                onClick={() => updatePointHeadingMode(mode)}
-                              >
-                                {label}
-                              </Button>
-                            );
-                          })}
-                        </Stack>
-
-                        {selection.headingMode === "custom" ? (
-                          <TextField
-                            label="Yaw (deg)"
-                            type="number"
-                            size="small"
-                            value={selection.target.yawDeg}
-                            onChange={(event) => updatePointYawDeg(Number(event.target.value))}
-                            inputProps={{ step: 1 }}
-                          />
-                        ) : null}
-
-                        {selectionReadinessIssues.length ? (
-                          <Alert severity="warning">
-                            <Stack spacing={0.5}>
-                              {selectionReadinessIssues.map((issue) => (
-                                <Typography key={issue} variant="body2">
-                                  {issue}
-                                </Typography>
-                              ))}
-                            </Stack>
-                          </Alert>
-                        ) : null}
-
-                        <Stack direction="row" spacing={1}>
-                          <Button
-                            variant="contained"
-                            onClick={confirmPointNavigation}
-                            disabled={!selectionReady || pendingCommand === config.gotoPoseCommandName}
-                          >
-                            Confirm
-                          </Button>
-                          <Button variant="outlined" onClick={() => setSelection(undefined)}>
-                            Cancel
-                          </Button>
-                        </Stack>
-                      </Stack>
-                    )}
-                  </Box>
-                ) : null}
+                      </DialogContent>
+                      <DialogActions sx={{ px: 3, pb: 2.25 }}>
+                        <Button
+                          variant="outlined"
+                          onClick={() => {
+                            setModalState(undefined);
+                            setSelection(undefined);
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          variant="contained"
+                          onClick={confirmPointNavigation}
+                          disabled={
+                            !selectionReady || pendingCommand === config.gotoPoseCommandName
+                          }
+                        >
+                          Send
+                        </Button>
+                      </DialogActions>
+                    </>
+                  ) : null}
+                </Dialog>
 
                 {snapshot.navState?.active ? (
                   <Alert severity="info">
