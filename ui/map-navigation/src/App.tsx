@@ -418,30 +418,35 @@ function StatusTile({
   return (
     <Box
       sx={{
-        px: 1,
-        py: 0.9,
-        minHeight: 58,
-        borderRadius: 1.75,
+        px: 0.85,
+        py: 0.7,
+        minHeight: 48,
+        borderRadius: 1.5,
         border: "1px solid rgba(255,255,255,0.06)",
         backgroundColor: "rgba(255,255,255,0.025)"
       }}
     >
-      <Stack spacing={0.45}>
-        <Stack direction="row" spacing={0.75} alignItems="center">
+      <Stack spacing={0.25}>
+        <Stack direction="row" spacing={0.6} alignItems="center">
           <Box
             sx={{
-              width: 8,
-              height: 8,
+              width: 6.5,
+              height: 6.5,
               borderRadius: "50%",
               flexShrink: 0,
               backgroundColor: lightColor,
-              boxShadow: `0 0 0 4px ${glowColor}`
+              boxShadow: `0 0 0 3px ${glowColor}`
             }}
           />
           <Typography
             variant="caption"
             color="text.secondary"
-            sx={{ lineHeight: 1.1, whiteSpace: "nowrap" }}
+            sx={{
+              lineHeight: 1,
+              whiteSpace: "nowrap",
+              letterSpacing: 0.2,
+              fontSize: "0.68rem"
+            }}
           >
             {label}
           </Typography>
@@ -451,8 +456,8 @@ function StatusTile({
           sx={{
             fontWeight: 600,
             lineHeight: 1.1,
-            fontSize: "0.83rem",
-            pl: 1.9,
+            fontSize: "0.77rem",
+            pl: 1.55,
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis"
@@ -1585,41 +1590,64 @@ export default function App() {
 
                 <SectionCard
                   title="Map"
-                  subtitle={mapState.headline}
+                  subtitle={undefined}
                   actions={
                     allMapIds.length > 1 ? (
                       <Button
                         size="small"
                         variant={mapsExpanded ? "contained" : "outlined"}
                         onClick={() => setMapsExpanded((current) => !current)}
+                        sx={{ minWidth: 0, px: 1.1 }}
                       >
-                        {mapsExpanded ? "Close" : "Catalog"}
+                        {mapsExpanded ? "Hide" : "Catalog"}
                       </Button>
                     ) : undefined
                   }
                 >
-                  <Stack spacing={1}>
-                    <Typography variant="body1" sx={{ fontWeight: 600 }}>
-                      {currentMapId || "No active map"}
-                    </Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      {defaultMapId
-                        ? defaultMapId === currentMapId
-                          ? "Current map is also the default."
-                          : `Default map: ${defaultMapId}`
-                        : allMapIds.length
-                          ? "No default map configured."
-                          : "No saved maps published yet."}
-                    </Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      {mapState.detail}
-                    </Typography>
+                  <Stack spacing={0.8}>
+                    <Stack spacing={0.45}>
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        alignItems="center"
+                        flexWrap="wrap"
+                        useFlexGap
+                      >
+                        <Typography
+                          variant="body1"
+                          sx={{
+                            fontWeight: 600,
+                            minWidth: 0,
+                            maxWidth: "100%",
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis"
+                          }}
+                        >
+                          {currentMapId || "No active map"}
+                        </Typography>
+                        {currentMapId ? <Chip size="small" label="Active" color="primary" /> : null}
+                        {defaultMapId === currentMapId && currentMapId ? (
+                          <Chip size="small" label="Default" color="secondary" />
+                        ) : null}
+                      </Stack>
+                      <Typography variant="caption" color="text.secondary">
+                        {defaultMapId
+                          ? defaultMapId === currentMapId
+                            ? "Default map"
+                            : `Default: ${defaultMapId}`
+                          : allMapIds.length
+                            ? "No default map"
+                            : "No saved maps"}
+                        {mapState.savedCount ? ` · ${mapState.savedCount} saved` : ""}
+                        {mapState.headline ? ` · ${mapState.headline}` : ""}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {mapState.detail}
+                      </Typography>
+                    </Stack>
 
-                    <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
-                      {currentMapId ? <Chip size="small" label="Active" color="primary" /> : null}
-                      {defaultMapId === currentMapId && currentMapId ? (
-                        <Chip size="small" label="Default" color="secondary" />
-                      ) : null}
+                    <Stack direction="row" spacing={0.6} flexWrap="wrap" useFlexGap>
                       {mapState.savedCount ? (
                         <Chip
                           size="small"
@@ -1627,10 +1655,16 @@ export default function App() {
                           variant="outlined"
                         />
                       ) : null}
+                      <Chip
+                        size="small"
+                        label={mapState.surfaceMode === "live" ? "Live" : mapState.headline}
+                        variant="outlined"
+                        color={mapState.surfaceMode === "live" ? "secondary" : "default"}
+                      />
                     </Stack>
 
                     <Collapse in={mapsPanelVisible} unmountOnExit>
-                      <Stack spacing={1}>
+                      <Stack spacing={0.85}>
                         {allMapIds.length > 6 ? (
                           <TextField
                             value={mapSearch}
@@ -1649,15 +1683,15 @@ export default function App() {
                                 <Box
                                   key={mapId}
                                   sx={{
-                                    p: 1.15,
-                                    borderRadius: 2,
+                                    p: 0.95,
+                                    borderRadius: 1.6,
                                     border: "1px solid rgba(255,255,255,0.06)",
                                     backgroundColor: isCurrent
                                       ? alpha("#2bb6ff", 0.1)
                                       : "rgba(255,255,255,0.02)"
                                   }}
                                 >
-                                  <Stack spacing={1}>
+                                  <Stack spacing={0.8}>
                                     <Stack
                                       direction="row"
                                       justifyContent="space-between"
@@ -1690,7 +1724,7 @@ export default function App() {
                                       </Stack>
                                     </Stack>
 
-                                    <Stack direction="row" spacing={1}>
+                                    <Stack direction="row" spacing={0.75}>
                                       <Button
                                         fullWidth
                                         size="small"
@@ -1701,6 +1735,7 @@ export default function App() {
                                           pendingCommand === config.mapLoadCommandName
                                         }
                                         onClick={() => handleLoadMap(mapId)}
+                                        sx={{ minWidth: 0 }}
                                       >
                                         {isCurrent ? "Loaded" : "Load"}
                                       </Button>
@@ -1714,8 +1749,9 @@ export default function App() {
                                           pendingCommand === config.mapSetDefaultCommandName
                                         }
                                         onClick={() => handleSetDefaultMap(mapId)}
+                                        sx={{ minWidth: 0 }}
                                       >
-                                        {isDefault ? "Default" : "Set Default"}
+                                        {isDefault ? "Default" : "Default"}
                                       </Button>
                                     </Stack>
                                   </Stack>
@@ -1758,7 +1794,7 @@ export default function App() {
                     sx={{
                       display: "grid",
                       gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-                      gap: 0.8
+                      gap: 0.6
                     }}
                   >
                     {robotMetrics.map((metric) => (
@@ -1773,9 +1809,10 @@ export default function App() {
                 </SectionCard>
 
                 <SectionCard title="Robot Actions">
-                  <Stack spacing={1}>
+                  <Stack direction="row" spacing={0.75}>
                     <Button
-                      fullWidth
+                      sx={{ flex: 1, minWidth: 0 }}
+                      size="small"
                       variant={snapshot.dockingState === "docked" ? "contained" : "outlined"}
                       disabled={
                         !undockCommandAvailable ||
@@ -1795,7 +1832,8 @@ export default function App() {
                       Undock
                     </Button>
                     <Button
-                      fullWidth
+                      sx={{ flex: 1, minWidth: 0 }}
+                      size="small"
                       variant={
                         snapshot.dockingState === "undocked" && localizedReady
                           ? "contained"
@@ -1818,10 +1856,11 @@ export default function App() {
                         )
                       }
                     >
-                      Return & Dock
+                      Return
                     </Button>
                     <Button
-                      fullWidth
+                      sx={{ flex: 1, minWidth: 0 }}
+                      size="small"
                       color="warning"
                       variant={snapshot.navState?.active ? "contained" : "outlined"}
                       disabled={
@@ -1838,7 +1877,7 @@ export default function App() {
                         )
                       }
                     >
-                      Hold Position
+                      Hold
                     </Button>
                   </Stack>
                 </SectionCard>

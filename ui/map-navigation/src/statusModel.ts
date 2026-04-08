@@ -83,6 +83,39 @@ function formatStateLabel(value: string | undefined): string {
     .join(" ");
 }
 
+function compactStateValue(value: string | undefined): string {
+  switch (value) {
+    case "connected":
+      return "Live";
+    case "connecting":
+      return "Wait";
+    case "disconnected":
+      return "Off";
+    case "undocked":
+      return "Free";
+    case "docked":
+      return "Docked";
+    case "docking":
+      return "Docking";
+    case "undocking":
+      return "Leaving";
+    case "on":
+      return "On";
+    case "off":
+      return "Off";
+    case "standing":
+      return "Standing";
+    case "stepping":
+      return "Stepping";
+    case "transition":
+      return "Transition";
+    case "not_ready":
+      return "Idle";
+    default:
+      return formatStateLabel(value);
+  }
+}
+
 export function isFresh(
   timestamp: number | undefined,
   maxAgeMs: number,
@@ -253,21 +286,21 @@ export function deriveRobotMetrics(
   const localization = getLocalizationStatus(snapshot, now);
   const localizationValue =
     localization === "localized"
-      ? "Localized"
+      ? "Locked"
       : localization === "not_localized"
-        ? "Not localized"
+        ? "No lock"
         : "Unknown";
 
   return [
     {
-      label: "Connection",
+      label: "Link",
       value: isFresh(snapshot.connectionStateTime, ROBOT_STATE_MAX_AGE_MS, now)
-        ? formatStateLabel(snapshot.connectionState)
+        ? compactStateValue(snapshot.connectionState)
         : "Unknown",
       tone: statusTone(snapshot.connectionState)
     },
     {
-      label: "Localization",
+      label: "Local",
       value: localizationValue,
       tone:
         localization === "localized"
@@ -277,28 +310,28 @@ export function deriveRobotMetrics(
             : "neutral"
     },
     {
-      label: "Docking",
+      label: "Dock",
       value: isFresh(snapshot.dockingStateTime, ROBOT_STATE_MAX_AGE_MS, now)
-        ? formatStateLabel(snapshot.dockingState)
+        ? compactStateValue(snapshot.dockingState)
         : "Unknown",
       tone: statusTone(snapshot.dockingState)
     },
     {
-      label: "Motors",
+      label: "Power",
       value: isFresh(snapshot.motorPowerStateTime, ROBOT_STATE_MAX_AGE_MS, now)
-        ? formatStateLabel(snapshot.motorPowerState)
+        ? compactStateValue(snapshot.motorPowerState)
         : "Unknown",
       tone: statusTone(snapshot.motorPowerState)
     },
     {
-      label: "Behavior",
+      label: "State",
       value: isFresh(snapshot.behaviorStateTime, ROBOT_STATE_MAX_AGE_MS, now)
-        ? formatStateLabel(snapshot.behaviorState)
+        ? compactStateValue(snapshot.behaviorState)
         : "Unknown",
       tone: statusTone(snapshot.behaviorState)
     },
     {
-      label: "Battery",
+      label: "Batt",
       value:
         typeof snapshot.batteryPct === "number"
           ? `${snapshot.batteryPct.toFixed(0)}%`
