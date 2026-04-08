@@ -32,6 +32,27 @@
       "default": "spot.nav.state",
       "$formant.streams.byType": "json"
     },
+    "mapsStreamName": {
+      "title": "Saved Maps Stream",
+      "description": "Realtime text stream with newline-separated saved map IDs.",
+      "type": "string",
+      "default": "spot.maps",
+      "$formant.streams.byType": "text"
+    },
+    "currentMapStreamName": {
+      "title": "Current Map Stream",
+      "description": "Realtime text stream with the active GraphNav map ID.",
+      "type": "string",
+      "default": "spot.map.current",
+      "$formant.streams.byType": "text"
+    },
+    "defaultMapStreamName": {
+      "title": "Default Map Stream",
+      "description": "Realtime text stream with the adapter default map ID.",
+      "type": "string",
+      "default": "spot.map.default",
+      "$formant.streams.byType": "text"
+    },
     "connectionStateStreamName": {
       "title": "Connection State Stream",
       "description": "One-word Spot connection state.",
@@ -66,6 +87,18 @@
       "type": "string",
       "default": "spot.robot_state.battery",
       "$formant.streams.byType": "numeric"
+    },
+    "mapLoadCommandName": {
+      "title": "Load Map Command Name",
+      "description": "Command template used to load a saved GraphNav map.",
+      "type": "string",
+      "default": "spot.map.load"
+    },
+    "mapSetDefaultCommandName": {
+      "title": "Set Default Map Command Name",
+      "description": "Command template used to set the adapter default map.",
+      "type": "string",
+      "default": "spot.map.set_default"
     },
     "waypointGotoCommandName": {
       "title": "Waypoint Goto Command Name",

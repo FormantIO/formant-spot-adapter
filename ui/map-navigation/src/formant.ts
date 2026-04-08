@@ -19,11 +19,16 @@ export const DEFAULT_MODULE_CONFIG: ModuleConfig = {
   mapImageMetadataStreamName: "spot.localization.graphnav.global.image.meta",
   overlayStreamName: "spot.graphnav.overlay",
   navStateStreamName: "spot.nav.state",
+  mapsStreamName: "spot.maps",
+  currentMapStreamName: "spot.map.current",
+  defaultMapStreamName: "spot.map.default",
   connectionStateStreamName: "spot.connection_state",
   dockingStateStreamName: "spot.docking_state",
   motorPowerStateStreamName: "spot.motor_power_state",
   behaviorStateStreamName: "spot.behavior_state",
   batteryStreamName: "spot.robot_state.battery",
+  mapLoadCommandName: "spot.map.load",
+  mapSetDefaultCommandName: "spot.map.set_default",
   waypointGotoCommandName: "spot.waypoint.goto",
   gotoPoseCommandName: "spot.graphnav.goto_pose",
   cancelNavCommandName: "spot.graphnav.cancel",
@@ -54,6 +59,22 @@ function asConfiguredName(value: unknown, fallback: string): string {
   if (typeof value !== "string") return fallback;
   const trimmed = value.trim();
   return trimmed.includes(".") ? trimmed : fallback;
+}
+
+function normalizeOptionalText(value: string | symbol): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.toLowerCase() === "none") return "";
+  return trimmed;
+}
+
+function parseMapListText(value: string | symbol): string[] | undefined {
+  if (typeof value !== "string") return undefined;
+  const entries = value
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry && entry.toLowerCase() !== "none");
+  return Array.from(new Set(entries));
 }
 
 function parseGraphNavMapImageMetadataValue(
@@ -246,6 +267,18 @@ export function parseModuleConfig(raw: string | undefined): ModuleConfig {
         value.navStateStreamName,
         DEFAULT_MODULE_CONFIG.navStateStreamName
       ),
+      mapsStreamName: asConfiguredName(
+        value.mapsStreamName,
+        DEFAULT_MODULE_CONFIG.mapsStreamName
+      ),
+      currentMapStreamName: asConfiguredName(
+        value.currentMapStreamName,
+        DEFAULT_MODULE_CONFIG.currentMapStreamName
+      ),
+      defaultMapStreamName: asConfiguredName(
+        value.defaultMapStreamName,
+        DEFAULT_MODULE_CONFIG.defaultMapStreamName
+      ),
       connectionStateStreamName: asConfiguredName(
         value.connectionStateStreamName,
         DEFAULT_MODULE_CONFIG.connectionStateStreamName
@@ -265,6 +298,14 @@ export function parseModuleConfig(raw: string | undefined): ModuleConfig {
       batteryStreamName: asConfiguredName(
         value.batteryStreamName,
         DEFAULT_MODULE_CONFIG.batteryStreamName
+      ),
+      mapLoadCommandName: asConfiguredName(
+        value.mapLoadCommandName,
+        DEFAULT_MODULE_CONFIG.mapLoadCommandName
+      ),
+      mapSetDefaultCommandName: asConfiguredName(
+        value.mapSetDefaultCommandName,
+        DEFAULT_MODULE_CONFIG.mapSetDefaultCommandName
       ),
       waypointGotoCommandName: asConfiguredName(
         value.waypointGotoCommandName,
@@ -331,9 +372,24 @@ function patchTextValue(
   value: string | symbol,
   onPatch: (patch: Partial<StreamSnapshot>) => void
 ): void {
-  if (typeof value !== "string") return;
+  const normalized = normalizeOptionalText(value);
+  if (typeof normalized === "undefined") return;
   onPatch({
-    [key]: value.trim(),
+    [key]: normalized,
+    [timeKey]: Date.now()
+  });
+}
+
+function patchMapListValue(
+  key: keyof StreamSnapshot,
+  timeKey: keyof StreamSnapshot,
+  value: string | symbol,
+  onPatch: (patch: Partial<StreamSnapshot>) => void
+): void {
+  const normalized = parseMapListText(value);
+  if (!normalized) return;
+  onPatch({
+    [key]: normalized,
     [timeKey]: Date.now()
   });
 }
@@ -367,6 +423,7 @@ function subscribeWithWarning(
     emitPatch({});
   }
 }
+
 export function subscribeRealtimeSnapshot(
   deviceId: string,
   config: ModuleConfig,
@@ -494,6 +551,57 @@ export function subscribeRealtimeSnapshot(
 
   subscribeWithWarning(
     cleanups,
+    "maps",
+    `Could not subscribe to ${config.mapsStreamName}`,
+    () =>
+      live.subscribeToText(
+        deviceId,
+        buildRealtimeSource(config.mapsStreamName, "text"),
+        (value) => {
+          setWarning("maps");
+          patchMapListValue("maps", "mapsTime", value, emitPatch);
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  subscribeWithWarning(
+    cleanups,
+    "currentMap",
+    `Could not subscribe to ${config.currentMapStreamName}`,
+    () =>
+      live.subscribeToText(
+        deviceId,
+        buildRealtimeSource(config.currentMapStreamName, "text"),
+        (value) => {
+          setWarning("currentMap");
+          patchTextValue("currentMapId", "currentMapTime", value, emitPatch);
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  subscribeWithWarning(
+    cleanups,
+    "defaultMap",
+    `Could not subscribe to ${config.defaultMapStreamName}`,
+    () =>
+      live.subscribeToText(
+        deviceId,
+        buildRealtimeSource(config.defaultMapStreamName, "text"),
+        (value) => {
+          setWarning("defaultMap");
+          patchTextValue("defaultMapId", "defaultMapTime", value, emitPatch);
+        }
+      ),
+    setWarning,
+    emitPatch
+  );
+
+  subscribeWithWarning(
+    cleanups,
     "connectionState",
     `Could not subscribe to ${config.connectionStateStreamName}`,
     () =>
@@ -604,4 +712,8 @@ export function formatGotoPosePayload(
 
 export function formatWaypointGotoPayload(mapUuid: string, waypointId: string): string {
   return `map_uuid=${mapUuid}, waypoint_id=${waypointId}`;
+}
+
+export function formatMapIdPayload(mapId: string): string {
+  return `map_id=${mapId}`;
 }

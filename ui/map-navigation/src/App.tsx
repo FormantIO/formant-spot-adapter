@@ -5,6 +5,7 @@ import {
   Button,
   Chip,
   CircularProgress,
+  Collapse,
   CssBaseline,
   Divider,
   List,
@@ -23,6 +24,7 @@ import {
   DEFAULT_MODULE_CONFIG,
   authenticateAndGetDevice,
   formatGotoPosePayload,
+  formatMapIdPayload,
   formatWaypointGotoPayload,
   getInitialModuleConfig,
   parseModuleConfig,
@@ -66,7 +68,7 @@ type Selection =
   | { kind: "point"; mapUuid: string; target: TargetPose; headingMode: PointHeadingMode };
 
 function isFresh(timestamp: number | undefined, maxAgeMs: number): boolean {
-  return Boolean(timestamp && (Date.now() - timestamp) <= maxAgeMs);
+  return Boolean(timestamp && Date.now() - timestamp <= maxAgeMs);
 }
 
 function formatPose(target?: TargetPose): string {
@@ -76,6 +78,7 @@ function formatPose(target?: TargetPose): string {
 
 function getMapLabel(snapshot: StreamSnapshot): string {
   return (
+    snapshot.currentMapId ||
     snapshot.mapImageMetadata?.map_id ||
     snapshot.navState?.map_id ||
     snapshot.overlay?.map_id ||
@@ -230,7 +233,7 @@ interface PoseMarkerProps {
 
 function PoseMarker({ x, y, yawRad, fill, outline, size = 14 }: PoseMarkerProps) {
   const half = size / 2;
-  const points = `${x},${y - size} ${x + half},${y + half} ${x},${y + (half / 2)} ${x - half},${y + half}`;
+  const points = `${x},${y - size} ${x + half},${y + half} ${x},${y + half / 2} ${x - half},${y + half}`;
   return (
     <g transform={`rotate(${(yawRad * 180) / Math.PI} ${x} ${y})`}>
       <polygon points={points} fill={fill} stroke={outline} strokeWidth="2" />
@@ -273,7 +276,10 @@ function MapView({
       const point = seedToPixel(snapshot.mapImageMetadata, waypoint.x, waypoint.y);
       return point ? { waypoint, point } : null;
     })
-    .filter((entry): entry is { waypoint: GraphNavOverlayWaypoint; point: { x: number; y: number } } => Boolean(entry));
+    .filter(
+      (entry): entry is { waypoint: GraphNavOverlayWaypoint; point: { x: number; y: number } } =>
+        Boolean(entry)
+    );
 
   const handleMapClick = (event: React.MouseEvent<SVGSVGElement>) => {
     if (selectionMode !== "point") return;
@@ -494,6 +500,8 @@ export default function App() {
   const [selection, setSelection] = useState<Selection>();
   const [availableCommands, setAvailableCommands] = useState<string[]>([]);
   const [waypointSearch, setWaypointSearch] = useState("");
+  const [mapSearch, setMapSearch] = useState("");
+  const [mapsExpanded, setMapsExpanded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [pendingCommand, setPendingCommand] = useState<string>();
   const [error, setError] = useState<string>();
@@ -567,6 +575,14 @@ export default function App() {
   }, [snapshot.navState?.phase, snapshot.navState?.last_completed_command_id, snapshot.navState?.command_id]);
 
   const displayedMapUuid = snapshot.mapImageMetadata?.map_uuid || "";
+  const currentMapId =
+    snapshot.currentMapId ||
+    snapshot.mapImageMetadata?.map_id ||
+    snapshot.navState?.map_id ||
+    snapshot.overlay?.map_id ||
+    "";
+  const defaultMapId = snapshot.defaultMapId || "";
+
   const movementReadinessIssues = useMemo(
     () =>
       uniqueIssues([
@@ -579,6 +595,8 @@ export default function App() {
     [snapshot, displayedMapUuid]
   );
 
+  const mapLoadCommandAvailable = availableCommands.includes(config.mapLoadCommandName);
+  const mapSetDefaultCommandAvailable = availableCommands.includes(config.mapSetDefaultCommandName);
   const waypointCommandAvailable = availableCommands.includes(config.waypointGotoCommandName);
   const gotoPoseCommandAvailable = availableCommands.includes(config.gotoPoseCommandName);
   const cancelCommandAvailable = availableCommands.includes(config.cancelNavCommandName);
@@ -605,6 +623,33 @@ export default function App() {
         return left.name.localeCompare(right.name);
       });
   }, [snapshot.overlay?.waypoints, snapshot.overlay?.current_waypoint_id, waypointSearch]);
+
+  const allMapIds = useMemo(() => {
+    const ids = new Set<string>();
+    (snapshot.maps || []).forEach((mapId) => {
+      if (mapId) ids.add(mapId);
+    });
+    if (currentMapId) ids.add(currentMapId);
+    if (defaultMapId) ids.add(defaultMapId);
+    return [...ids];
+  }, [snapshot.maps, currentMapId, defaultMapId]);
+
+  const sortedMaps = useMemo(() => {
+    const filter = mapSearch.trim().toLowerCase();
+    return [...allMapIds]
+      .filter((mapId) => {
+        if (!filter) return true;
+        return mapId.toLowerCase().includes(filter);
+      })
+      .sort((left, right) => {
+        const leftScore =
+          (left === currentMapId ? 0 : 10) + (left === defaultMapId ? 0 : 1);
+        const rightScore =
+          (right === currentMapId ? 0 : 10) + (right === defaultMapId ? 0 : 1);
+        if (leftScore !== rightScore) return leftScore - rightScore;
+        return left.localeCompare(right);
+      });
+  }, [allMapIds, currentMapId, defaultMapId, mapSearch]);
 
   const selectionReadinessIssues = useMemo(() => {
     if (!selection) return [];
@@ -648,6 +693,11 @@ export default function App() {
   const motorReady =
     isFresh(snapshot.motorPowerStateTime, 8000) && snapshot.motorPowerState === "on";
   const localizedReady = navReady && Boolean(snapshot.navState?.localized);
+  const mapsReady = isFresh(snapshot.mapsTime, 20000);
+  const currentMapReady =
+    Boolean(currentMapId) &&
+    (Boolean(snapshot.mapImageMetadata?.map_id) || isFresh(snapshot.currentMapTime, 30000));
+  const defaultMapReady = !defaultMapId || isFresh(snapshot.defaultMapTime, 30000);
 
   const activeNavLabel =
     snapshot.navState?.target_name ||
@@ -663,15 +713,16 @@ export default function App() {
     snapshot.navState?.has_current_seed_pose &&
     typeof snapshot.navState.current_seed_x === "number" &&
     typeof snapshot.navState.current_seed_y === "number"
-      ? `x=${snapshot.navState.current_seed_x.toFixed(2)} m, y=${snapshot.navState.current_seed_y.toFixed(
-          2
-        )} m`
+      ? `x=${snapshot.navState.current_seed_x.toFixed(2)} m, y=${snapshot.navState.current_seed_y.toFixed(2)} m`
       : "No live pose";
 
   const batteryLabel =
     typeof snapshot.batteryPct === "number" ? `battery ${snapshot.batteryPct.toFixed(0)}%` : "battery";
 
-  const navTerminalVisible = snapshot.navState?.phase === "terminal" && Boolean(snapshot.navState?.terminal_result);
+  const navTerminalVisible =
+    snapshot.navState?.phase === "terminal" && Boolean(snapshot.navState?.terminal_result);
+  const mapsPanelVisible = mapsExpanded || !currentMapId || sortedMaps.length === 0;
+
   useEffect(() => {
     setSelection((current) => {
       if (!current) return current;
@@ -687,6 +738,7 @@ export default function App() {
       return current;
     });
   }, [displayedMapUuid, snapshot.overlay]);
+
   const sendCommand = async (
     name: string,
     payload: string | undefined,
@@ -719,6 +771,34 @@ export default function App() {
     setSelectionMode("waypoints");
     setCommandError(undefined);
     setCommandNotice(undefined);
+  };
+
+  const handleLoadMap = (mapId: string) => {
+    if (!mapId) return;
+    setSelection(undefined);
+    setSelectionMode("waypoints");
+    setWaypointSearch("");
+    setMapsExpanded(false);
+    setCommandError(undefined);
+    setCommandNotice(undefined);
+    void sendCommand(
+      config.mapLoadCommandName,
+      formatMapIdPayload(mapId),
+      `Loading ${mapId}...`,
+      `Load command sent. Waiting for the active map to update...`
+    );
+  };
+
+  const handleSetDefaultMap = (mapId: string) => {
+    if (!mapId) return;
+    setCommandError(undefined);
+    setCommandNotice(undefined);
+    void sendCommand(
+      config.mapSetDefaultCommandName,
+      formatMapIdPayload(mapId),
+      `Setting ${mapId} as default...`,
+      `Default map command sent. Waiting for the adapter state to update...`
+    );
   };
 
   const handleSelectPoint = (target: TargetPose) => {
@@ -796,6 +876,8 @@ export default function App() {
   };
 
   const selectionReady = Boolean(selection) && selectionReadinessIssues.length === 0;
+  const canLoadMaps = mapLoadCommandAvailable && connectionReady && !snapshot.navState?.active;
+  const canSetDefaultMaps = mapSetDefaultCommandAvailable && connectionReady;
 
   return (
     <ThemeProvider theme={theme}>
@@ -890,7 +972,7 @@ export default function App() {
 
             <Box
               sx={{
-                width: { xs: "100%", md: 360 },
+                width: { xs: "100%", md: 368 },
                 borderLeft: { md: "1px solid rgba(255,255,255,0.06)" },
                 borderTop: { xs: "1px solid rgba(255,255,255,0.06)", md: "none" },
                 ...panelSurfaceSx
@@ -909,6 +991,204 @@ export default function App() {
                     Pose: {currentPoseLabel}
                   </Typography>
                 </Stack>
+
+                <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.03)" }}>
+                  <Stack spacing={1.25}>
+                    <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="flex-start">
+                      <Stack spacing={0.35} sx={{ minWidth: 0, flex: 1 }}>
+                        <Typography variant="subtitle2">Map</Typography>
+                        <Typography
+                          variant="body1"
+                          sx={{
+                            fontWeight: 600,
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis"
+                          }}
+                        >
+                          {currentMapId || "No active map"}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {defaultMapId
+                            ? defaultMapId === currentMapId
+                              ? "Current map is also the default."
+                              : `Default map: ${defaultMapId}`
+                            : allMapIds.length
+                              ? "No default map configured."
+                              : "No saved maps published yet."}
+                        </Typography>
+                      </Stack>
+                      <Stack direction="row" spacing={1}>
+                        {currentMapId && currentMapId !== defaultMapId ? (
+                          <Button
+                            size="small"
+                            variant="text"
+                            disabled={
+                              !canSetDefaultMaps ||
+                              pendingCommand === config.mapSetDefaultCommandName
+                            }
+                            onClick={() => handleSetDefaultMap(currentMapId)}
+                          >
+                            Set Default
+                          </Button>
+                        ) : null}
+                        {allMapIds.length > 1 ? (
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            onClick={() => setMapsExpanded((current) => !current)}
+                          >
+                            {mapsExpanded ? "Hide" : "Change"}
+                          </Button>
+                        ) : null}
+                      </Stack>
+                    </Stack>
+
+                    <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+                      {currentMapId ? <Chip size="small" label="Active" color="primary" /> : null}
+                      {defaultMapId === currentMapId && currentMapId ? (
+                        <Chip size="small" label="Default" color="secondary" />
+                      ) : null}
+                      {allMapIds.length ? (
+                        <Chip size="small" label={`${allMapIds.length} saved`} variant="outlined" />
+                      ) : null}
+                      {!mapsReady ? (
+                        <Chip size="small" label="Map list stale" color="warning" variant="outlined" />
+                      ) : null}
+                    </Stack>
+
+                    <Collapse in={mapsPanelVisible} unmountOnExit>
+                      <Stack spacing={1}>
+                        {allMapIds.length > 6 ? (
+                          <TextField
+                            value={mapSearch}
+                            onChange={(event) => setMapSearch(event.target.value)}
+                            size="small"
+                            label="Search maps"
+                          />
+                        ) : null}
+
+                        <Box sx={{ maxHeight: 216, overflow: "auto" }}>
+                          <Stack spacing={0.75}>
+                            {sortedMaps.map((mapId) => {
+                              const isCurrent = mapId === currentMapId;
+                              const isDefault = mapId === defaultMapId;
+                              return (
+                                <Box
+                                  key={mapId}
+                                  sx={{
+                                    p: 1.15,
+                                    borderRadius: 1.5,
+                                    bgcolor: isCurrent
+                                      ? "rgba(43,182,255,0.08)"
+                                      : "rgba(255,255,255,0.02)",
+                                    border: "1px solid rgba(255,255,255,0.06)"
+                                  }}
+                                >
+                                  <Stack
+                                    direction="row"
+                                    spacing={1}
+                                    justifyContent="space-between"
+                                    alignItems="center"
+                                  >
+                                    <Stack spacing={0.6} sx={{ minWidth: 0, flex: 1 }}>
+                                      <Typography
+                                        variant="body2"
+                                        sx={{
+                                          fontWeight: isCurrent ? 600 : 500,
+                                          whiteSpace: "nowrap",
+                                          overflow: "hidden",
+                                          textOverflow: "ellipsis"
+                                        }}
+                                      >
+                                        {mapId}
+                                      </Typography>
+                                      <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                                        {isCurrent ? (
+                                          <Chip size="small" label="Active" color="primary" />
+                                        ) : null}
+                                        {isDefault ? (
+                                          <Chip
+                                            size="small"
+                                            label="Default"
+                                            color={isCurrent ? "secondary" : "default"}
+                                            variant={isCurrent ? "filled" : "outlined"}
+                                          />
+                                        ) : null}
+                                      </Stack>
+                                    </Stack>
+                                    <Stack direction="row" spacing={0.75}>
+                                      {!isCurrent ? (
+                                        <Button
+                                          size="small"
+                                          variant="outlined"
+                                          disabled={
+                                            !canLoadMaps ||
+                                            pendingCommand === config.mapLoadCommandName
+                                          }
+                                          onClick={() => handleLoadMap(mapId)}
+                                        >
+                                          Load
+                                        </Button>
+                                      ) : null}
+                                      {!isDefault ? (
+                                        <Button
+                                          size="small"
+                                          variant="text"
+                                          disabled={
+                                            !canSetDefaultMaps ||
+                                            pendingCommand === config.mapSetDefaultCommandName
+                                          }
+                                          onClick={() => handleSetDefaultMap(mapId)}
+                                        >
+                                          Default
+                                        </Button>
+                                      ) : null}
+                                    </Stack>
+                                  </Stack>
+                                </Box>
+                              );
+                            })}
+
+                            {!sortedMaps.length ? (
+                              <Typography variant="body2" color="text.secondary" sx={{ py: 1 }}>
+                                {allMapIds.length
+                                  ? "No saved maps match the current search."
+                                  : "No saved maps have been published yet."}
+                              </Typography>
+                            ) : null}
+                          </Stack>
+                        </Box>
+
+                        {!mapLoadCommandAvailable ? (
+                          <Typography variant="caption" color="warning.main">
+                            Map load command is unavailable on this device.
+                          </Typography>
+                        ) : null}
+                        {!mapSetDefaultCommandAvailable ? (
+                          <Typography variant="caption" color="warning.main">
+                            Set-default command is unavailable on this device.
+                          </Typography>
+                        ) : null}
+                        {snapshot.navState?.active ? (
+                          <Typography variant="caption" color="text.secondary">
+                            Finish the current navigation before loading a different map.
+                          </Typography>
+                        ) : null}
+                        {!currentMapReady && currentMapId ? (
+                          <Typography variant="caption" color="warning.main">
+                            Active map state is stale. Wait for the map streams to settle before switching.
+                          </Typography>
+                        ) : null}
+                        {!defaultMapReady && defaultMapId ? (
+                          <Typography variant="caption" color="warning.main">
+                            Default map state is stale.
+                          </Typography>
+                        ) : null}
+                      </Stack>
+                    </Collapse>
+                  </Stack>
+                </Box>
 
                 <ToggleButtonGroup
                   exclusive
@@ -1069,10 +1349,7 @@ export default function App() {
                               onClick={() => handleSelectWaypoint(waypoint)}
                               sx={{ borderRadius: 1.5, mb: 0.5 }}
                             >
-                              <ListItemText
-                                primary={waypoint.name}
-                                secondary={secondary || waypoint.id}
-                              />
+                              <ListItemText primary={waypoint.name} secondary={secondary || waypoint.id} />
                             </ListItemButton>
                           );
                         })}
@@ -1218,9 +1495,7 @@ export default function App() {
 
                 <Box sx={{ mt: "auto" }}>
                   <Typography variant="caption" color="text.secondary">
-                    Map metadata: {isFresh(snapshot.mapImageMetadataTime, 8000) ? "live" : "stale"} ·
-                    Nav state: {isFresh(snapshot.navStateTime, 4000) ? "live" : "stale"} ·
-                    Overlay: {isFresh(snapshot.overlayTime, 15000) ? "live" : "stale"}
+                    Map view: {isFresh(snapshot.mapImageMetadataTime, 8000) ? "live" : "stale"} · Nav state: {isFresh(snapshot.navStateTime, 4000) ? "live" : "stale"} · Overlay: {isFresh(snapshot.overlayTime, 15000) ? "live" : "stale"} · Maps: {mapsReady ? "live" : "stale"}
                   </Typography>
                 </Box>
               </Stack>
