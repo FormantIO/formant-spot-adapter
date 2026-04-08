@@ -25,7 +25,7 @@ import {
   authenticateAndGetDevice,
   formatGotoPosePayload,
   formatMapIdPayload,
-  formatWaypointGotoPayload,
+  formatWaypointGotoByNamePayload,
   formatWaypointSavePayload,
   getInitialModuleConfig,
   loadTelemetrySnapshot,
@@ -73,6 +73,12 @@ type Selection =
   | { kind: "waypoint"; mapUuid: string; waypoint: GraphNavOverlayWaypoint }
   | { kind: "point"; mapUuid: string; target: TargetPose; headingMode: PointHeadingMode };
 
+const LIVE_MAP_VIEW_MAX_AGE_MS = 20000;
+
+function getWaypointKey(waypoint: GraphNavOverlayWaypoint): string {
+  return waypoint.id || waypoint.name;
+}
+
 function isFresh(timestamp: number | undefined, maxAgeMs: number): boolean {
   return Boolean(timestamp && Date.now() - timestamp <= maxAgeMs);
 }
@@ -83,8 +89,9 @@ function formatPose(target?: TargetPose): string {
 }
 
 function getCurrentWaypointLabel(snapshot: StreamSnapshot): string {
-  const currentWaypointId =
-    snapshot.overlay?.current_waypoint_id || snapshot.navState?.current_waypoint_id || "";
+  const currentWaypointName = snapshot.overlay?.current_waypoint_name || "";
+  if (currentWaypointName) return currentWaypointName;
+  const currentWaypointId = snapshot.navState?.current_waypoint_id || "";
   if (!currentWaypointId) return "Unknown waypoint";
   const waypoint = snapshot.overlay?.waypoints.find((entry) => entry.id === currentWaypointId);
   return waypoint?.name || waypoint?.label || currentWaypointId;
@@ -167,7 +174,7 @@ function getMapSurfaceStatus(
   catalogCurrentMapId: string,
   displayedMapUuid: string
 ): MapSurfaceStatus {
-  if (displayedMapUuid && isFresh(snapshot.mapImageMetadataTime, 8000)) {
+  if (displayedMapUuid && isFresh(snapshot.mapImageMetadataTime, LIVE_MAP_VIEW_MAX_AGE_MS)) {
     return "live";
   }
   if (catalogCurrentMapId) return "catalog";
@@ -269,7 +276,7 @@ function buildBaseNavigationIssues(
   const motorFresh = isFresh(snapshot.motorPowerStateTime, 45000);
   const behaviorFresh = isFresh(snapshot.behaviorStateTime, 45000);
   const navFresh = isFresh(snapshot.navStateTime, 4000);
-  const mapFresh = isFresh(snapshot.mapImageMetadataTime, 8000);
+  const mapFresh = isFresh(snapshot.mapImageMetadataTime, LIVE_MAP_VIEW_MAX_AGE_MS);
 
   if (!targetMapUuid) {
     issues.push("Selected map is unavailable.");
@@ -318,7 +325,7 @@ function buildWaypointNavigationIssues(
   }
   if (!snapshot.overlay) {
     issues.push("Waypoint list is unavailable.");
-  } else if (!snapshot.overlay.waypoints.some((waypoint) => waypoint.id === selection.waypoint.id)) {
+  } else if (!snapshot.overlay.waypoints.some((waypoint) => waypoint.name === selection.waypoint.name)) {
     issues.push("Selected waypoint is no longer available.");
   }
   const overlayMapUuid = snapshot.overlay?.map_uuid || "";
@@ -546,11 +553,14 @@ function MapView({
         ) : null}
 
         {waypointPixels.map(({ waypoint, point }) => {
-          const isCurrent = snapshot.overlay?.current_waypoint_id === waypoint.id;
-          const isSelected = selection?.kind === "waypoint" && selection.waypoint.id === waypoint.id;
+          const isCurrent =
+            snapshot.overlay?.current_waypoint_name === waypoint.name ||
+            (waypoint.id && snapshot.overlay?.current_waypoint_id === waypoint.id);
+          const isSelected =
+            selection?.kind === "waypoint" && selection.waypoint.name === waypoint.name;
           return (
             <g
-              key={waypoint.id}
+              key={getWaypointKey(waypoint)}
               onClick={(event) => {
                 event.stopPropagation();
                 onSelectWaypoint(waypoint);
@@ -796,25 +806,25 @@ export default function App() {
   const undockCommandAvailable = availableCommands.includes(config.undockCommandName);
 
   const sortedWaypoints = useMemo(() => {
-    const currentWaypointId = snapshot.overlay?.current_waypoint_id || "";
+    const currentWaypointName = snapshot.overlay?.current_waypoint_name || "";
     const filter = waypointSearch.trim().toLowerCase();
     return [...(snapshot.overlay?.waypoints || [])]
       .filter((waypoint) => {
         if (!filter) return true;
         return (
           waypoint.name.toLowerCase().includes(filter) ||
-          waypoint.label.toLowerCase().includes(filter) ||
-          waypoint.id.toLowerCase().includes(filter)
+          (waypoint.label || "").toLowerCase().includes(filter) ||
+          (waypoint.id || "").toLowerCase().includes(filter)
         );
       })
       .sort((left, right) => {
         if (left.is_dock !== right.is_dock) return left.is_dock ? -1 : 1;
-        if ((left.id === currentWaypointId) !== (right.id === currentWaypointId)) {
-          return left.id === currentWaypointId ? -1 : 1;
+        if ((left.name === currentWaypointName) !== (right.name === currentWaypointName)) {
+          return left.name === currentWaypointName ? -1 : 1;
         }
         return left.name.localeCompare(right.name);
       });
-  }, [snapshot.overlay?.waypoints, snapshot.overlay?.current_waypoint_id, waypointSearch]);
+  }, [snapshot.overlay?.waypoints, snapshot.overlay?.current_waypoint_name, waypointSearch]);
 
   const allMapIds = useMemo(() => {
     const ids = new Set<string>();
@@ -947,7 +957,7 @@ export default function App() {
       }
       if (current.kind === "waypoint" && snapshot.overlay) {
         const stillPresent = snapshot.overlay.waypoints.some(
-          (waypoint) => waypoint.id === current.waypoint.id
+          (waypoint) => waypoint.name === current.waypoint.name
         );
         if (!stillPresent) return undefined;
       }
@@ -1084,7 +1094,7 @@ export default function App() {
 
   const confirmWaypointNavigation = () => {
     if (selection?.kind !== "waypoint" || !displayedMapUuid) return;
-    const payload = formatWaypointGotoPayload(displayedMapUuid, selection.waypoint.id);
+    const payload = formatWaypointGotoByNamePayload(displayedMapUuid, selection.waypoint.name);
     void sendCommand(
       config.waypointGotoCommandName,
       payload,
@@ -1683,21 +1693,24 @@ export default function App() {
                       <List dense disablePadding>
                         {sortedWaypoints.map((waypoint) => {
                           const isSelected =
-                            selection?.kind === "waypoint" && selection.waypoint.id === waypoint.id;
+                            selection?.kind === "waypoint" && selection.waypoint.name === waypoint.name;
                           const secondary = [
                             waypoint.is_dock ? "Dock" : "",
-                            snapshot.overlay?.current_waypoint_id === waypoint.id ? "Current" : ""
+                            snapshot.overlay?.current_waypoint_name === waypoint.name ? "Current" : ""
                           ]
                             .filter(Boolean)
                             .join(" · ");
                           return (
                             <ListItemButton
-                              key={waypoint.id}
+                              key={getWaypointKey(waypoint)}
                               selected={isSelected}
                               onClick={() => handleSelectWaypoint(waypoint)}
                               sx={{ borderRadius: 1.5, mb: 0.5 }}
                             >
-                              <ListItemText primary={waypoint.name} secondary={secondary || waypoint.id} />
+                              <ListItemText
+                                primary={waypoint.name}
+                                secondary={secondary || waypoint.label || waypoint.id || waypoint.name}
+                              />
                             </ListItemButton>
                           );
                         })}
@@ -1739,7 +1752,7 @@ export default function App() {
                         </Typography>
                         <Typography variant="caption" color="text.secondary">
                           {displayedMapUuid
-                            ? formatWaypointGotoPayload(displayedMapUuid, selection.waypoint.id)
+                            ? formatWaypointGotoByNamePayload(displayedMapUuid, selection.waypoint.name)
                             : "No command payload"}
                         </Typography>
                         {selectionReadinessIssues.length ? (
@@ -1850,7 +1863,7 @@ export default function App() {
 
                 <Box sx={{ mt: "auto" }}>
                   <Typography variant="caption" color="text.secondary">
-                    Map view: {isFresh(snapshot.mapImageMetadataTime, 8000) ? "live" : "stale"} · Nav state: {isFresh(snapshot.navStateTime, 4000) ? "live" : "stale"} · Overlay: {isFresh(snapshot.overlayTime, 15000) ? "live" : "stale"} · Catalog: {mapsReady ? "ready" : "stale"}
+                    Map view: {isFresh(snapshot.mapImageMetadataTime, LIVE_MAP_VIEW_MAX_AGE_MS) ? "live" : "stale"} · Nav state: {isFresh(snapshot.navStateTime, 4000) ? "live" : "stale"} · Overlay: {isFresh(snapshot.overlayTime, 15000) ? "live" : "stale"} · Catalog: {mapsReady ? "ready" : "stale"}
                   </Typography>
                 </Box>
               </Stack>

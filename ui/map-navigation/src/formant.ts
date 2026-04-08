@@ -154,22 +154,40 @@ function parseGraphNavMapImageMetadataValue(
 function parseGraphNavOverlayValue(value: unknown): GraphNavOverlay | undefined {
   if (!isRecord(value)) return undefined;
   const waypoints = Array.isArray(value.waypoints)
-    ? value.waypoints
-        .filter(isRecord)
-        .map((waypoint) => ({
-          id: asString(waypoint.id),
+    ? value.waypoints.flatMap((waypoint) => {
+        if (Array.isArray(waypoint)) {
+          const name = typeof waypoint[0] === "string" ? waypoint[0] : "";
+          if (!name) return [];
+          return [{
+            name,
+            x: asNumber(waypoint[1]),
+            y: asNumber(waypoint[2]),
+            is_dock: Boolean(waypoint[3])
+          }];
+        }
+        if (!isRecord(waypoint)) return [];
+        return [{
+          id: asString(waypoint.id) || undefined,
           name: asString(waypoint.name),
-          label: asString(waypoint.label),
+          label: asString(waypoint.label) || undefined,
           x: asNumber(waypoint.x),
           y: asNumber(waypoint.y),
-          is_dock: asBoolean(waypoint.is_dock)
-        }))
+          is_dock: asBoolean(
+            typeof waypoint.is_dock === "boolean" ? waypoint.is_dock : waypoint.d,
+            false
+          )
+        }];
+      })
     : [];
   return {
     map_id: asString(value.map_id),
     map_uuid: asString(value.map_uuid),
-    current_waypoint_id: asString(value.current_waypoint_id),
-    dock_waypoint_id: asString(value.dock_waypoint_id),
+    current_waypoint_id: asString(value.current_waypoint_id) || undefined,
+    current_waypoint_name:
+      asString(value.current_waypoint_name) || asString(value.current_waypoint_id),
+    dock_waypoint_id: asString(value.dock_waypoint_id) || undefined,
+    dock_waypoint_name:
+      asString(value.dock_waypoint_name) || asString(value.dock_waypoint_id),
     waypoint_count:
       typeof value.waypoint_count === "number" ? value.waypoint_count : undefined,
     waypoints
@@ -989,6 +1007,10 @@ export function formatGotoPosePayload(
 
 export function formatWaypointGotoPayload(mapUuid: string, waypointId: string): string {
   return `map_uuid=${mapUuid}, waypoint_id=${waypointId}`;
+}
+
+export function formatWaypointGotoByNamePayload(mapUuid: string, waypointName: string): string {
+  return `map_uuid=${mapUuid}, name=${waypointName}`;
 }
 
 export function formatWaypointSavePayload(name: string): string | undefined {

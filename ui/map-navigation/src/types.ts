@@ -75,9 +75,9 @@ export interface GraphNavMapImageMetadata {
 }
 
 export interface GraphNavOverlayWaypoint {
-  id: string;
+  id?: string;
   name: string;
-  label: string;
+  label?: string;
   x: number;
   y: number;
   is_dock: boolean;
@@ -86,8 +86,10 @@ export interface GraphNavOverlayWaypoint {
 export interface GraphNavOverlay {
   map_id: string;
   map_uuid: string;
-  current_waypoint_id: string;
-  dock_waypoint_id: string;
+  current_waypoint_id?: string;
+  current_waypoint_name: string;
+  dock_waypoint_id?: string;
+  dock_waypoint_name: string;
   waypoints: GraphNavOverlayWaypoint[];
   waypoint_count?: number;
 }

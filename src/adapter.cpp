@@ -1460,29 +1460,37 @@ std::string build_graphnav_overlay_json(
     const std::unordered_map<std::string, std::vector<std::string>>& aliases_by_waypoint,
     const std::string& dock_waypoint_id,
     const std::string& current_waypoint_id) {
-  std::ostringstream overlay;
-  overlay << "{\"map_id\":\"" << json_escape(map_id)
-          << "\",\"map_uuid\":\"" << json_escape(map_uuid)
-          << "\",\"current_waypoint_id\":\"" << json_escape(current_waypoint_id)
-          << "\",\"dock_waypoint_id\":\"" << json_escape(dock_waypoint_id)
-          << "\",\"waypoint_count\":" << graphnav_snapshot.waypoints.size()
-          << "\",\"waypoints\":[";
-  for (size_t i = 0; i < graphnav_snapshot.waypoints.size(); ++i) {
-    const auto& waypoint = graphnav_snapshot.waypoints[i];
+  const auto display_name_for_waypoint = [&](const SpotClient::WaypointInfo& waypoint) {
     const auto alias_it = aliases_by_waypoint.find(waypoint.id);
     const std::vector<std::string>* aliases =
         (alias_it == aliases_by_waypoint.end()) ? nullptr : &alias_it->second;
-    const std::string display_name =
-        (aliases && !aliases->empty()) ? aliases->front()
-                                       : (waypoint.label.empty() ? waypoint.id : waypoint.label);
+    return (aliases && !aliases->empty()) ? aliases->front()
+                                          : (waypoint.label.empty() ? waypoint.id : waypoint.label);
+  };
+  const auto display_name_for_id = [&](const std::string& waypoint_id) {
+    if (waypoint_id.empty()) return std::string();
+    for (const auto& waypoint : graphnav_snapshot.waypoints) {
+      if (waypoint.id == waypoint_id) {
+        return display_name_for_waypoint(waypoint);
+      }
+    }
+    return waypoint_id;
+  };
+  std::ostringstream overlay;
+  overlay << "{\"map_id\":\"" << json_escape(map_id)
+          << "\",\"map_uuid\":\"" << json_escape(map_uuid)
+          << "\",\"current_waypoint_name\":\"" << json_escape(display_name_for_id(current_waypoint_id))
+          << "\",\"dock_waypoint_name\":\"" << json_escape(display_name_for_id(dock_waypoint_id))
+          << "\",\"waypoints\":[";
+  for (size_t i = 0; i < graphnav_snapshot.waypoints.size(); ++i) {
+    const auto& waypoint = graphnav_snapshot.waypoints[i];
+    const std::string display_name = display_name_for_waypoint(waypoint);
     if (i > 0) overlay << ",";
-    overlay << "{\"id\":\"" << json_escape(waypoint.id)
-            << "\",\"name\":\"" << json_escape(display_name)
-            << "\",\"label\":\"" << json_escape(waypoint.label)
+    overlay << "{\"name\":\"" << json_escape(display_name)
             << "\",\"x\":" << waypoint.seed_tform_waypoint.x
             << ",\"y\":" << waypoint.seed_tform_waypoint.y
-            << ",\"is_dock\":"
-            << (waypoint.id == dock_waypoint_id ? "true" : "false") << "}";
+            << ",\"d\":"
+            << (waypoint.id == dock_waypoint_id ? "1" : "0") << "}";
   }
   overlay << "]}";
   return overlay.str();
@@ -7088,22 +7096,34 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
     }
 
     if (started_temp_recording) {
-      if (!spot_.StopGraphRecording()) {
+      bool stopped_temp_recording = false;
+      std::string stop_error;
+      const long long stop_deadline_ms = now_ms() + 5000;
+      while (now_ms() <= stop_deadline_ms) {
+        if (spot_.StopGraphRecording()) {
+          map_recording_active_ = false;
+          stopped_temp_recording = true;
+          break;
+        }
+        stop_error = spot_.LastError();
         SpotClient::MappingStatus post_stop_status;
         if (spot_.GetMappingStatus(&post_stop_status)) {
           map_recording_active_ = post_stop_status.is_recording;
           if (!post_stop_status.is_recording) {
             EmitLog("[graphnav] waypoint save: stop recording returned error but recording is now false");
-          } else {
-            EmitLog(std::string("[graphnav] waypoint create failed: temp stop recording failed: ") +
-                    spot_.LastError());
-            return false;
+            stopped_temp_recording = true;
+            break;
           }
-        } else {
-          EmitLog(std::string("[graphnav] waypoint create failed: temp stop recording failed: ") +
-                  spot_.LastError());
-          return false;
         }
+        if (stop_error.find("STATUS_NOT_READY_YET") == std::string::npos) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
+      if (!stopped_temp_recording) {
+        EmitLog(std::string("[graphnav] waypoint create failed: temp stop recording failed: ") +
+                stop_error);
+        return false;
       }
     }
     if (waypoint_id.empty()) {
