@@ -156,12 +156,13 @@ If you rename a stream from its default, use the renamed stream name in `streamC
 
 - `spot.graphnav.overlay` (type: text/json, every 5s + on change)
 - UI-safe GraphNav overlay stream for operator map modules.
+- Includes only saved/operator-facing waypoint names, not every raw GraphNav node label.
 - Includes:
   - `map_id`
   - `map_uuid`
   - `current_waypoint_id`
   - `dock_waypoint_id`
-  - `waypoints: [{id, name, label, x, y, is_dock}]`
+  - `waypoints: [{name, x, y, is_dock}]`
 - Intended as the primary waypoint stream for iframe-based navigation UIs.
 
 - `spot.nav.state` (type: text/json, 1 Hz + on change)

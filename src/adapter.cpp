@@ -1464,8 +1464,9 @@ std::string build_graphnav_overlay_json(
     const auto alias_it = aliases_by_waypoint.find(waypoint.id);
     const std::vector<std::string>* aliases =
         (alias_it == aliases_by_waypoint.end()) ? nullptr : &alias_it->second;
-    return (aliases && !aliases->empty()) ? aliases->front()
-                                          : (waypoint.label.empty() ? waypoint.id : waypoint.label);
+    if (aliases && !aliases->empty()) return aliases->front();
+    if (!dock_waypoint_id.empty() && waypoint.id == dock_waypoint_id) return std::string("dock");
+    return std::string();
   };
   const auto display_name_for_id = [&](const std::string& waypoint_id) {
     if (waypoint_id.empty()) return std::string();
@@ -1479,20 +1480,25 @@ std::string build_graphnav_overlay_json(
   std::ostringstream overlay;
   overlay << "{\"map_id\":\"" << json_escape(map_id)
           << "\",\"map_uuid\":\"" << json_escape(map_uuid)
+          << "\",\"current_waypoint_id\":\"" << json_escape(current_waypoint_id)
+          << "\",\"dock_waypoint_id\":\"" << json_escape(dock_waypoint_id)
           << "\",\"current_waypoint_name\":\"" << json_escape(display_name_for_id(current_waypoint_id))
           << "\",\"dock_waypoint_name\":\"" << json_escape(display_name_for_id(dock_waypoint_id))
           << "\",\"waypoints\":[";
+  size_t emitted_waypoint_count = 0;
   for (size_t i = 0; i < graphnav_snapshot.waypoints.size(); ++i) {
     const auto& waypoint = graphnav_snapshot.waypoints[i];
     const std::string display_name = display_name_for_waypoint(waypoint);
-    if (i > 0) overlay << ",";
+    if (display_name.empty()) continue;
+    if (emitted_waypoint_count > 0) overlay << ",";
     overlay << "{\"name\":\"" << json_escape(display_name)
             << "\",\"x\":" << waypoint.seed_tform_waypoint.x
             << ",\"y\":" << waypoint.seed_tform_waypoint.y
             << ",\"d\":"
             << (waypoint.id == dock_waypoint_id ? "1" : "0") << "}";
+    ++emitted_waypoint_count;
   }
-  overlay << "]}";
+  overlay << "],\"waypoint_count\":" << emitted_waypoint_count << "}";
   return overlay.str();
 }
 

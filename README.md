@@ -66,7 +66,7 @@ Additional control channels (not streams):
 | `spot.localization.graphnav.global.image.meta` | Text (JSON) | Companion metadata for the rendered global GraphNav image including draw rect, render scale, resolution, and `seed_tform_grid` for click-to-go UIs |
 | `spot.map.graphnav` | Localization payload carrying map-only data | Dedicated stitched GraphNav map payload for future top-level map transport |
 | `spot.graphnav.metadata` | Text (JSON) | Full waypoint/edge/object metadata for GraphNav maps. Useful for diagnostics, but may be too large for some iframe text-query paths; prefer a smaller UI-specific overlay stream if needed |
-| `spot.graphnav.overlay` | Text (JSON) | Small UI-safe waypoint overlay stream for the active GraphNav map (`map_uuid`, `current_waypoint_id`, `dock_waypoint_id`, `waypoints`) |
+| `spot.graphnav.overlay` | Text (JSON) | Small UI-safe waypoint overlay stream for the active GraphNav map. Publishes saved/operator waypoint names only (`map_uuid`, `current_waypoint_id`, `dock_waypoint_id`, `waypoints`). |
 | `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus lifecycle/terminal result and current seed-frame robot pose for external map UIs |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |

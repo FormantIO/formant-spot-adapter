@@ -91,10 +91,8 @@ function formatPose(target?: TargetPose): string {
 function getCurrentWaypointLabel(snapshot: StreamSnapshot): string {
   const currentWaypointName = snapshot.overlay?.current_waypoint_name || "";
   if (currentWaypointName) return currentWaypointName;
-  const currentWaypointId = snapshot.navState?.current_waypoint_id || "";
-  if (!currentWaypointId) return "Unknown waypoint";
-  const waypoint = snapshot.overlay?.waypoints.find((entry) => entry.id === currentWaypointId);
-  return waypoint?.name || waypoint?.label || currentWaypointId;
+  if (!snapshot.navState?.localized) return "Not localized";
+  return "No saved waypoint nearby";
 }
 
 function getCurrentYawDeg(config: ModuleConfig, navState?: NavState): number {
@@ -596,7 +594,7 @@ function MapView({
                 stroke={isSelected ? "#ffffff" : "rgba(255,255,255,0.82)"}
                 strokeWidth={isSelected ? 2.2 : 1.4}
               />
-              {showWaypointLabels ? (
+              {showWaypointLabels && waypoint.name.trim() ? (
                 <text
                   x={point.x + 10}
                   y={point.y - 8}
@@ -824,11 +822,7 @@ export default function App() {
     return [...(snapshot.overlay?.waypoints || [])]
       .filter((waypoint) => {
         if (!filter) return true;
-        return (
-          waypoint.name.toLowerCase().includes(filter) ||
-          (waypoint.label || "").toLowerCase().includes(filter) ||
-          (waypoint.id || "").toLowerCase().includes(filter)
-        );
+        return waypoint.name.toLowerCase().includes(filter);
       })
       .sort((left, right) => {
         if (left.is_dock !== right.is_dock) return left.is_dock ? -1 : 1;
@@ -1722,7 +1716,7 @@ export default function App() {
                             >
                               <ListItemText
                                 primary={waypoint.name}
-                                secondary={secondary || waypoint.label || waypoint.id || waypoint.name}
+                                secondary={secondary || undefined}
                               />
                             </ListItemButton>
                           );
