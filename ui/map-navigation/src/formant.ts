@@ -45,6 +45,7 @@ const MAP_CATALOG_LOOKBACK_MS = 30 * 24 * 60 * 60 * 1000;
 const STATE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
 const DYNAMIC_LOOKBACK_MS = 20 * 60 * 1000;
 export const TELEMETRY_POLL_INTERVAL_MS = 15000;
+const CURRENT_DEVICE_RETRY_MS = 250;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -377,14 +378,33 @@ export function parseModuleConfig(raw: string | undefined): ModuleConfig {
   }
 }
 
-export async function authenticateAndGetDevice(): Promise<Device> {
+export async function authenticateAndGetDevice(timeoutMs = 0): Promise<Device> {
   const authenticated = await Authentication.waitTilAuthenticated();
   if (!authenticated) {
     throw new Error(
       "Authentication failed. Open this module from Formant or include auth context in the URL."
     );
   }
-  return Fleet.getCurrentDevice();
+
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  let lastError: unknown;
+
+  while (true) {
+    try {
+      return Fleet.getCurrentDevice();
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => window.setTimeout(resolve, CURRENT_DEVICE_RETRY_MS));
+  }
+
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+
+  throw new Error("No known default device.");
 }
 
 export async function getInitialModuleConfig(): Promise<ModuleConfig> {

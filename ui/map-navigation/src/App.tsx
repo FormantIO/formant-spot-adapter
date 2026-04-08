@@ -102,9 +102,9 @@ interface ConnectionScreenState {
 interface ConnectionHealth {
   formantBackendHealthy: boolean;
   realtimeTransportHealthy: boolean;
-  robotRealtimeHealthy: boolean;
-  liveRobotStateHealthy: boolean;
+  realtimeConnectionFresh: boolean;
   liveMapHealthy: boolean;
+  liveNavigationDataHealthy: boolean;
   transportReady: boolean;
 }
 
@@ -138,32 +138,26 @@ function deriveConnectionHealth(
     REALTIME_CONNECTION_MAX_AGE_MS,
     now
   );
-  const robotRealtimeHealthy =
-    realtimeConnectionFresh
-      ? snapshot.realtimeConnectionState === "connected"
-      : realtimeTransportHealthy;
-  const liveRobotStateHealthy = isFresh(
-    snapshot.navStateRealtimeTime,
-    LIVE_SESSION_MAX_AGE_MS,
-    now
-  );
   const liveMapHealthy = isFresh(
     snapshot.mapImageRealtimeTime,
     LIVE_SESSION_MAX_AGE_MS,
     now
   );
+  const liveNavigationDataHealthy = [
+    snapshot.navStateRealtimeTime,
+    snapshot.mapImageMetadataRealtimeTime,
+    snapshot.overlayRealtimeTime
+  ].some((timestamp) => isFresh(timestamp, LIVE_SESSION_MAX_AGE_MS, now));
 
   return {
     formantBackendHealthy,
     realtimeTransportHealthy,
-    robotRealtimeHealthy,
-    liveRobotStateHealthy,
+    realtimeConnectionFresh,
     liveMapHealthy,
+    liveNavigationDataHealthy,
     transportReady:
       formantBackendHealthy &&
       realtimeTransportHealthy &&
-      robotRealtimeHealthy &&
-      liveRobotStateHealthy &&
       liveMapHealthy
   };
 }
@@ -293,18 +287,18 @@ function buildConnectionScreenState(
       status: health.realtimeTransportHealthy ? "complete" : "pending"
     },
     {
-      label: "Robot state",
-      detail: health.liveRobotStateHealthy
-        ? "Receiving live robot navigation state."
-        : "Waiting for live robot state.",
-      status: health.liveRobotStateHealthy ? "complete" : "pending"
-    },
-    {
       label: "Map video",
       detail: health.liveMapHealthy
         ? "Receiving live map video."
         : "Waiting for the first live map frame.",
       status: health.liveMapHealthy ? "complete" : "pending"
+    },
+    {
+      label: "Navigation data",
+      detail: health.liveNavigationDataHealthy
+        ? "Navigation metadata is available."
+        : "Waiting for live navigation metadata.",
+      status: health.liveNavigationDataHealthy ? "complete" : "pending"
     }
   ];
 
@@ -359,7 +353,7 @@ function buildConnectionScreenState(
       };
     }
 
-    if (isFresh(snapshot.realtimeConnectionStateTime, REALTIME_CONNECTION_MAX_AGE_MS, now) &&
+    if (health.realtimeConnectionFresh &&
         snapshot.realtimeConnectionState !== "connected") {
       return {
         phase: "failed",
@@ -367,20 +361,7 @@ function buildConnectionScreenState(
         detail:
           "Formant is reachable, but the robot reported a disconnected live state.",
         steps: steps.map((step, index) =>
-          index === 2 && step.status !== "complete"
-            ? { ...step, status: "failed" }
-            : step
-        )
-      };
-    }
-
-    if (!health.liveRobotStateHealthy) {
-      return {
-        phase: "failed",
-        title: "Live robot state is unavailable",
-        detail: "The realtime session started, but robot navigation state did not arrive in time.",
-        steps: steps.map((step, index) =>
-          index === 2 && step.status !== "complete"
+          index === 1 && step.status !== "complete"
             ? { ...step, status: "failed" }
             : step
         )
@@ -392,7 +373,7 @@ function buildConnectionScreenState(
       title: "Live map video is unavailable",
       detail: "The realtime session connected, but the live map video did not arrive in time.",
       steps: steps.map((step, index) =>
-        index === 3 && step.status !== "complete"
+        index === 2 && step.status !== "complete"
           ? { ...step, status: "failed" }
           : step
       )
@@ -421,7 +402,7 @@ function buildConnectionScreenState(
   }
 
   if (
-    isFresh(snapshot.realtimeConnectionStateTime, REALTIME_CONNECTION_MAX_AGE_MS, now) &&
+    health.realtimeConnectionFresh &&
     snapshot.realtimeConnectionState !== "connected"
   ) {
     return {
@@ -433,20 +414,15 @@ function buildConnectionScreenState(
     };
   }
 
-  if (!health.liveRobotStateHealthy) {
-    return {
-      phase: "connecting",
-      title: "Receiving live robot state",
-      detail: "The realtime session is active. Waiting for live robot state to arrive.",
-      steps
-    };
-  }
-
   return {
     phase: "connecting",
-    title: "Starting live navigation session",
+    title: health.liveNavigationDataHealthy
+      ? "Starting live navigation session"
+      : "Receiving navigation data",
     detail:
-      "Live robot state is ready. Waiting for the first live map frame before showing the interface.",
+      health.liveNavigationDataHealthy
+        ? "The live map is ready. Finalizing the navigation session."
+        : "The live map is ready. Waiting for navigation metadata before enabling the full interface.",
     steps
   };
 }
@@ -1095,7 +1071,7 @@ export default function App() {
     const bootstrap = async () => {
       setBootstrapState({ status: "pending" });
       try {
-        const currentDevice = await authenticateAndGetDevice();
+        const currentDevice = await authenticateAndGetDevice(INITIAL_CONNECT_TIMEOUT_MS);
         const initialConfig = await getInitialModuleConfig();
         const commands = await currentDevice.getAvailableCommands().catch(() => []);
         if (cancelled) return;
