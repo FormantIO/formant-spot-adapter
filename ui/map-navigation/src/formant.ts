@@ -46,6 +46,7 @@ const STATE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
 const DYNAMIC_LOOKBACK_MS = 20 * 60 * 1000;
 export const TELEMETRY_POLL_INTERVAL_MS = 15000;
 const CURRENT_DEVICE_RETRY_MS = 250;
+const LOG_PREFIX = "[spot-nav]";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -379,6 +380,7 @@ export function parseModuleConfig(raw: string | undefined): ModuleConfig {
 }
 
 export async function authenticateAndGetDevice(timeoutMs = 0): Promise<Device> {
+  console.info(`${LOG_PREFIX} bootstrap wait for auth`, { timeoutMs });
   const authenticated = await Authentication.waitTilAuthenticated();
   if (!authenticated) {
     throw new Error(
@@ -391,7 +393,12 @@ export async function authenticateAndGetDevice(timeoutMs = 0): Promise<Device> {
 
   while (true) {
     try {
-      return Fleet.getCurrentDevice();
+      const device = await Fleet.getCurrentDevice();
+      console.info(`${LOG_PREFIX} bootstrap device ready`, {
+        deviceId: device.id,
+        deviceName: device.name
+      });
+      return device;
     } catch (error) {
       lastError = error;
     }
@@ -411,7 +418,7 @@ export async function getInitialModuleConfig(): Promise<ModuleConfig> {
   try {
     return parseModuleConfig(await App.getCurrentModuleConfiguration());
   } catch (error) {
-    console.warn("Falling back to default module configuration.", error);
+    console.warn(`${LOG_PREFIX} module config fallback`, error);
     return DEFAULT_MODULE_CONFIG;
   }
 }
@@ -585,6 +592,7 @@ export async function loadTelemetrySnapshot(
   deviceId: string,
   config: ModuleConfig
 ): Promise<Partial<StreamSnapshot>> {
+  console.info(`${LOG_PREFIX} telemetry refresh start`, { deviceId });
   const [catalogStreams, stateStreams, dynamicStreams] = await Promise.all([
     queryTelemetryWindow(
       deviceId,
@@ -755,6 +763,16 @@ export async function loadTelemetrySnapshot(
     patch.navStateTime = navStatePoint.time;
   }
 
+  console.info(`${LOG_PREFIX} telemetry refresh success`, {
+    deviceId,
+    hasMaps: Boolean(patch.maps?.length),
+    hasCurrentMap: Boolean(patch.currentMapId),
+    hasDefaultMap: Boolean(patch.defaultMapId),
+    hasMapMetadata: Boolean(patch.mapImageMetadata),
+    hasOverlay: Boolean(patch.overlay),
+    hasNavState: Boolean(patch.navState)
+  });
+
   return patch;
 }
 
@@ -780,6 +798,17 @@ export function subscribeRealtimeSnapshot(
   config: ModuleConfig,
   onPatch: (patch: Partial<StreamSnapshot>) => void
 ): () => void {
+  console.info(`${LOG_PREFIX} realtime subscribe start`, {
+    deviceId,
+    streams: {
+      navState: config.navStateStreamName,
+      mapImage: config.mapImageStreamName,
+      mapImageMetadata: config.mapImageMetadataStreamName,
+      overlay: config.overlayStreamName,
+      connectionState: config.connectionStateStreamName,
+      battery: config.batteryStreamName
+    }
+  });
   const live = new LiveUniverseData();
   const liveWithNumeric = live as LiveUniverseData & {
     subscribeToNumeric?: (
@@ -790,6 +819,7 @@ export function subscribeRealtimeSnapshot(
   };
   const cleanups: Array<() => void> = [];
   const warnings = new Map<string, string>();
+  const seenStreams = new Set<string>();
   const emitPatch = (patch: Partial<StreamSnapshot>) => {
     onPatch({
       ...patch,
@@ -809,6 +839,11 @@ export function subscribeRealtimeSnapshot(
       ...patch
     });
   };
+  const noteRealtimeStream = (key: string, extra?: Record<string, unknown>) => {
+    if (seenStreams.has(key)) return;
+    seenStreams.add(key);
+    console.info(`${LOG_PREFIX} realtime stream ready`, { stream: key, ...extra });
+  };
 
   subscribeWithWarning(
     cleanups,
@@ -822,11 +857,15 @@ export function subscribeRealtimeSnapshot(
           const now = Date.now();
           const navState = parseRealtimeJsonText(value, parseNavStateValue);
           if (!navState) {
+            console.warn(`${LOG_PREFIX} realtime parse failed`, {
+              stream: config.navStateStreamName
+            });
             setWarning("navState", `Could not parse ${config.navStateStreamName}`);
             emitPatch({});
             return;
           }
           setWarning("navState");
+          noteRealtimeStream("navState");
           emitRealtimePatch(now, {
             navState,
             navStateTime: now,
@@ -852,6 +891,9 @@ export function subscribeRealtimeSnapshot(
             parseGraphNavMapImageMetadataValue
           );
           if (!mapImageMetadata) {
+            console.warn(`${LOG_PREFIX} realtime parse failed`, {
+              stream: config.mapImageMetadataStreamName
+            });
             setWarning(
               "mapImageMetadata",
               `Could not parse ${config.mapImageMetadataStreamName}`
@@ -861,6 +903,10 @@ export function subscribeRealtimeSnapshot(
           }
           const now = Date.now();
           setWarning("mapImageMetadata");
+          noteRealtimeStream("mapImageMetadata", {
+            mapId: mapImageMetadata.map_id,
+            mapUuid: mapImageMetadata.map_uuid
+          });
           emitRealtimePatch(now, {
             mapImageMetadata,
             mapImageMetadataTime: now,
@@ -883,12 +929,19 @@ export function subscribeRealtimeSnapshot(
         (value) => {
           const overlay = parseRealtimeJsonText(value, parseGraphNavOverlayValue);
           if (!overlay) {
+            console.warn(`${LOG_PREFIX} realtime parse failed`, {
+              stream: config.overlayStreamName
+            });
             setWarning("overlay", `Could not parse ${config.overlayStreamName}`);
             emitPatch({});
             return;
           }
           const now = Date.now();
           setWarning("overlay");
+          noteRealtimeStream("overlay", {
+            mapId: overlay.map_id,
+            waypointCount: overlay.waypoint_count ?? overlay.waypoints.length
+          });
           emitRealtimePatch(now, {
             overlay,
             overlayTime: now,
@@ -911,6 +964,10 @@ export function subscribeRealtimeSnapshot(
         (canvas) => {
           const now = Date.now();
           setWarning("mapImage");
+          noteRealtimeStream("mapImage", {
+            width: canvas.width,
+            height: canvas.height
+          });
           emitRealtimePatch(now, {
             mapImageCanvas: canvas,
             mapImageFrameVersion: now,
@@ -935,6 +992,7 @@ export function subscribeRealtimeSnapshot(
           setWarning("maps");
           const now = Date.now();
           emitRealtimePatch(now, {});
+          noteRealtimeStream("maps");
           patchMapListValue("maps", "mapsTime", value, emitPatch);
         }
       ),
@@ -954,6 +1012,7 @@ export function subscribeRealtimeSnapshot(
           setWarning("currentMap");
           const now = Date.now();
           emitRealtimePatch(now, {});
+          noteRealtimeStream("currentMap");
           patchTextValue("currentMapId", "currentMapTime", value, emitPatch);
         }
       ),
@@ -973,6 +1032,7 @@ export function subscribeRealtimeSnapshot(
           setWarning("defaultMap");
           const now = Date.now();
           emitRealtimePatch(now, {});
+          noteRealtimeStream("defaultMap");
           patchTextValue("defaultMapId", "defaultMapTime", value, emitPatch);
         }
       ),
@@ -993,6 +1053,7 @@ export function subscribeRealtimeSnapshot(
           const normalized = normalizeOptionalText(value);
           if (typeof normalized === "undefined") return;
           const now = Date.now();
+          noteRealtimeStream("connectionState", { state: normalized });
           emitRealtimePatch(now, {
             connectionState: normalized,
             connectionStateTime: now,
@@ -1017,6 +1078,7 @@ export function subscribeRealtimeSnapshot(
           setWarning("dockingState");
           const now = Date.now();
           emitRealtimePatch(now, {});
+          noteRealtimeStream("dockingState");
           patchTextValue("dockingState", "dockingStateTime", value, emitPatch);
         }
       ),
@@ -1036,6 +1098,7 @@ export function subscribeRealtimeSnapshot(
           setWarning("motorPowerState");
           const now = Date.now();
           emitRealtimePatch(now, {});
+          noteRealtimeStream("motorPowerState");
           patchTextValue("motorPowerState", "motorPowerStateTime", value, emitPatch);
         }
       ),
@@ -1055,6 +1118,7 @@ export function subscribeRealtimeSnapshot(
           setWarning("behaviorState");
           const now = Date.now();
           emitRealtimePatch(now, {});
+          noteRealtimeStream("behaviorState");
           patchTextValue("behaviorState", "behaviorStateTime", value, emitPatch);
         }
       ),
@@ -1075,6 +1139,7 @@ export function subscribeRealtimeSnapshot(
             setWarning("battery");
             const now = Date.now();
             emitRealtimePatch(now, {});
+            noteRealtimeStream("battery");
             patchNumericValue("batteryPct", "batteryTime", value, emitPatch);
           }
         ),

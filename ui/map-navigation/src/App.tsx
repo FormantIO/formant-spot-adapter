@@ -81,6 +81,7 @@ const REALTIME_CONNECTION_MAX_AGE_MS = 12000;
 const LIVE_SESSION_MAX_AGE_MS = 15000;
 const INITIAL_CONNECT_TIMEOUT_MS = 10000;
 const RECONNECT_TIMEOUT_MS = 10000;
+const LOG_PREFIX = "[spot-nav]";
 
 interface AsyncHealthState {
   status: "idle" | "pending" | "ready" | "failed";
@@ -105,6 +106,7 @@ interface ConnectionHealth {
   realtimeConnectionFresh: boolean;
   liveMapHealthy: boolean;
   liveNavigationDataHealthy: boolean;
+  catalogHealthy: boolean;
   transportReady: boolean;
 }
 
@@ -148,6 +150,10 @@ function deriveConnectionHealth(
     snapshot.mapImageMetadataRealtimeTime,
     snapshot.overlayRealtimeTime
   ].some((timestamp) => isFresh(timestamp, LIVE_SESSION_MAX_AGE_MS, now));
+  const catalogHealthy = Boolean(
+    telemetryState.lastSuccessAt &&
+      now - telemetryState.lastSuccessAt <= FORMANT_BACKEND_MAX_AGE_MS
+  );
 
   return {
     formantBackendHealthy,
@@ -155,8 +161,9 @@ function deriveConnectionHealth(
     realtimeConnectionFresh,
     liveMapHealthy,
     liveNavigationDataHealthy,
+    catalogHealthy,
     transportReady:
-      formantBackendHealthy &&
+      bootstrapState.status === "ready" &&
       realtimeTransportHealthy &&
       liveMapHealthy
   };
@@ -299,6 +306,13 @@ function buildConnectionScreenState(
         ? "Navigation metadata is available."
         : "Waiting for live navigation metadata.",
       status: health.liveNavigationDataHealthy ? "complete" : "pending"
+    },
+    {
+      label: "Catalog state",
+      detail: health.catalogHealthy
+        ? "Saved maps and sidebar state are available."
+        : "Waiting for telemetry-backed catalog data.",
+      status: health.catalogHealthy ? "complete" : "pending"
     }
   ];
 
@@ -325,7 +339,7 @@ function buildConnectionScreenState(
   }
 
   if (timedOut) {
-    if (!health.formantBackendHealthy) {
+    if (bootstrapState.status !== "ready") {
       return {
         phase: "failed",
         title: "Formant connection failed",
@@ -380,7 +394,7 @@ function buildConnectionScreenState(
     };
   }
 
-  if (!health.formantBackendHealthy) {
+  if (bootstrapState.status !== "ready") {
     return {
       phase: "connecting",
       title: "Connecting to Formant",
@@ -1036,6 +1050,7 @@ function ConnectionScreen({
 
 export default function App() {
   const connectionReadyRef = useRef(false);
+  const phaseLogRef = useRef("");
   const [device, setDevice] = useState<{ id: string; name: string }>();
   const [config, setConfig] = useState<ModuleConfig>(DEFAULT_MODULE_CONFIG);
   const [snapshot, setSnapshot] = useState<StreamSnapshot>({});
@@ -1143,7 +1158,7 @@ export default function App() {
           lastSuccessAt: Date.now()
         });
       } catch (telemetryError) {
-        console.warn("Failed to refresh telemetry snapshot.", telemetryError);
+        console.warn(`${LOG_PREFIX} telemetry refresh failed`, telemetryError);
         if (cancelled) return;
         setTelemetryState((previous) => ({
           status: previous.lastSuccessAt ? "ready" : "failed",
@@ -1235,6 +1250,57 @@ export default function App() {
       hasReachedReady
     ]
   );
+
+  useEffect(() => {
+    const signature = JSON.stringify({
+      phase: connectionScreenState.phase,
+      title: connectionScreenState.title,
+      bootstrapStatus: bootstrapState.status,
+      telemetryStatus: telemetryState.status,
+      transportReady: connectionHealth.transportReady,
+      realtimeTransportHealthy: connectionHealth.realtimeTransportHealthy,
+      liveMapHealthy: connectionHealth.liveMapHealthy,
+      liveNavigationDataHealthy: connectionHealth.liveNavigationDataHealthy,
+      catalogHealthy: connectionHealth.catalogHealthy
+    });
+    if (phaseLogRef.current === signature) return;
+    phaseLogRef.current = signature;
+    console.info(`${LOG_PREFIX} connection state`, {
+      phase: connectionScreenState.phase,
+      title: connectionScreenState.title,
+      detail: connectionScreenState.detail,
+      bootstrap: bootstrapState,
+      telemetry: telemetryState,
+      health: connectionHealth,
+      snapshotTimes: {
+        realtimeActivityTime: snapshot.realtimeActivityTime,
+        realtimeConnectionStateTime: snapshot.realtimeConnectionStateTime,
+        navStateRealtimeTime: snapshot.navStateRealtimeTime,
+        mapImageRealtimeTime: snapshot.mapImageRealtimeTime,
+        mapImageMetadataRealtimeTime: snapshot.mapImageMetadataRealtimeTime,
+        overlayRealtimeTime: snapshot.overlayRealtimeTime,
+        mapsTime: snapshot.mapsTime,
+        currentMapTime: snapshot.currentMapTime,
+        defaultMapTime: snapshot.defaultMapTime
+      }
+    });
+  }, [
+    bootstrapState,
+    connectionHealth,
+    connectionScreenState.detail,
+    connectionScreenState.phase,
+    connectionScreenState.title,
+    snapshot.currentMapTime,
+    snapshot.defaultMapTime,
+    snapshot.mapImageMetadataRealtimeTime,
+    snapshot.mapImageRealtimeTime,
+    snapshot.mapsTime,
+    snapshot.navStateRealtimeTime,
+    snapshot.overlayRealtimeTime,
+    snapshot.realtimeActivityTime,
+    snapshot.realtimeConnectionStateTime,
+    telemetryState
+  ]);
 
   const mapLoadCommandAvailable = availableCommands.includes(config.mapLoadCommandName);
   const mapSetDefaultCommandAvailable = availableCommands.includes(config.mapSetDefaultCommandName);
