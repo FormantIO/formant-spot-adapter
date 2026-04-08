@@ -1460,7 +1460,7 @@ std::string build_graphnav_overlay_json(
     const std::unordered_map<std::string, std::vector<std::string>>& aliases_by_waypoint,
     const std::string& dock_waypoint_id,
     const std::string& current_waypoint_id) {
-  const auto display_name_for_waypoint = [&](const SpotClient::WaypointInfo& waypoint) {
+  const auto display_name_for_waypoint = [&](const SpotClient::GraphNavWaypoint& waypoint) {
     const auto alias_it = aliases_by_waypoint.find(waypoint.id);
     const std::vector<std::string>* aliases =
         (alias_it == aliases_by_waypoint.end()) ? nullptr : &alias_it->second;
