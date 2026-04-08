@@ -75,12 +75,37 @@ const theme = createTheme({
     }
   },
   shape: {
-    borderRadius: 16
+    borderRadius: 6
   },
   typography: {
     fontFamily: `"IBM Plex Sans", "Inter", sans-serif`,
     h6: { fontWeight: 600 },
     subtitle2: { fontWeight: 600 }
+  },
+  components: {
+    MuiButton: {
+      styleOverrides: {
+        root: {
+          borderRadius: 8,
+          textTransform: "none",
+          boxShadow: "none"
+        }
+      }
+    },
+    MuiChip: {
+      styleOverrides: {
+        root: {
+          borderRadius: 8
+        }
+      }
+    },
+    MuiPaper: {
+      styleOverrides: {
+        rounded: {
+          borderRadius: 10
+        }
+      }
+    }
   }
 });
 
@@ -108,7 +133,7 @@ const panelSurfaceSx = {
 
 const cardSx = {
   p: 1.5,
-  borderRadius: 3,
+  borderRadius: "10px",
   backgroundColor: "rgba(255,255,255,0.03)",
   border: "1px solid rgba(255,255,255,0.06)"
 } as const;
@@ -450,7 +475,7 @@ function StatusTile({
         px: 0.85,
         py: 0.7,
         minHeight: 48,
-        borderRadius: 1.5,
+        borderRadius: "6px",
         border: "1px solid rgba(255,255,255,0.06)",
         backgroundColor: "rgba(255,255,255,0.025)"
       }}
@@ -512,7 +537,7 @@ function ModeSelector({
       spacing={0.75}
       sx={{
         p: 0.5,
-        borderRadius: 2,
+        borderRadius: "8px",
         bgcolor: "rgba(255,255,255,0.03)",
         border: "1px solid rgba(255,255,255,0.06)"
       }}
@@ -598,7 +623,7 @@ function ConnectionScreen({
               key={step.label}
               sx={{
                 p: 1.15,
-                borderRadius: 2,
+                borderRadius: "8px",
                 textAlign: "left",
                 border: "1px solid rgba(255,255,255,0.06)",
                 backgroundColor: "rgba(255,255,255,0.03)"
@@ -775,7 +800,7 @@ function MapStage({
           height: `${stageSize.height}px`,
           maxWidth: "100%",
           maxHeight: "100%",
-          borderRadius: 3,
+          borderRadius: "10px",
           overflow: "hidden",
           backgroundColor: MAP_SURFACE_BACKGROUND,
           boxShadow: "0 28px 72px rgba(0,0,0,0.28)"
@@ -1229,38 +1254,14 @@ export default function App() {
 
   const labeledWaypointKeys = useMemo(() => {
     const keys = new Set<string>();
-    const searchActive = waypointSearch.trim().length > 0;
-    const addIfPresent = (waypoint: GraphNavOverlayWaypoint | undefined) => {
-      if (waypoint) keys.add(getWaypointSignature(waypoint));
-    };
-
-    if (selection?.kind === "waypoint") {
-      addIfPresent(selection.waypoint);
-    }
-
-    const currentWaypoint = overlayWaypoints.find(
-      (waypoint) =>
-        (waypoint.id && waypoint.id === snapshot.overlay?.current_waypoint_id) ||
-        waypoint.name === snapshot.overlay?.current_waypoint_name
-    );
-    addIfPresent(currentWaypoint);
-
-    const dockWaypoint = overlayWaypoints.find((waypoint) => waypoint.is_dock);
-    addIfPresent(dockWaypoint);
-
-    if (searchActive) {
-      sortedWaypoints.slice(0, 8).forEach((waypoint) => keys.add(getWaypointSignature(waypoint)));
-    }
+    overlayWaypoints.forEach((waypoint) => {
+      if (waypoint.name.trim()) {
+        keys.add(getWaypointSignature(waypoint));
+      }
+    });
 
     return keys;
-  }, [
-    overlayWaypoints,
-    selection,
-    snapshot.overlay?.current_waypoint_id,
-    snapshot.overlay?.current_waypoint_name,
-    sortedWaypoints,
-    waypointSearch
-  ]);
+  }, [overlayWaypoints]);
 
   const selectionReadinessIssues = useMemo(() => {
     if (!selection) return [];
