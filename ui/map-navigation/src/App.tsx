@@ -27,8 +27,10 @@ import {
   formatMapIdPayload,
   formatWaypointGotoPayload,
   getInitialModuleConfig,
+  loadTelemetrySnapshot,
   parseModuleConfig,
-  subscribeRealtimeSnapshot
+  subscribeRealtimeSnapshot,
+  TELEMETRY_POLL_INTERVAL_MS
 } from "./formant";
 import { getCanvasSize, pixelToSeed, seedToPixel } from "./mapMath";
 import {
@@ -165,10 +167,10 @@ function buildMovementReadiness(snapshot: StreamSnapshot, mapUuid: string): stri
   const issues: string[] = [];
   const navFresh = isFresh(snapshot.navStateTime, 4000);
   const mapFresh = isFresh(snapshot.mapImageMetadataTime, 8000);
-  const connectionFresh = isFresh(snapshot.connectionStateTime, 8000);
-  const dockingFresh = isFresh(snapshot.dockingStateTime, 8000);
-  const motorFresh = isFresh(snapshot.motorPowerStateTime, 8000);
-  const behaviorFresh = isFresh(snapshot.behaviorStateTime, 8000);
+  const connectionFresh = isFresh(snapshot.connectionStateTime, 45000);
+  const dockingFresh = isFresh(snapshot.dockingStateTime, 45000);
+  const motorFresh = isFresh(snapshot.motorPowerStateTime, 45000);
+  const behaviorFresh = isFresh(snapshot.behaviorStateTime, 45000);
 
   if (!navFresh) issues.push("Navigation state is stale.");
   if (!mapFresh) issues.push("Map metadata is stale.");
@@ -562,6 +564,35 @@ export default function App() {
   }, [device, config]);
 
   useEffect(() => {
+    if (!device) return undefined;
+
+    let cancelled = false;
+
+    const refreshTelemetry = async () => {
+      try {
+        const patch = await loadTelemetrySnapshot(device.id, config);
+        if (cancelled) return;
+        setSnapshot((previous) => ({
+          ...previous,
+          ...patch
+        }));
+      } catch (telemetryError) {
+        console.warn("Failed to refresh telemetry snapshot.", telemetryError);
+      }
+    };
+
+    void refreshTelemetry();
+    const intervalId = window.setInterval(() => {
+      void refreshTelemetry();
+    }, TELEMETRY_POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [device, config]);
+
+  useEffect(() => {
     if (snapshot.navState?.active) {
       setSelection(undefined);
       setSelectionMode("waypoints");
@@ -687,17 +718,17 @@ export default function App() {
   ]);
 
   const connectionReady =
-    isFresh(snapshot.connectionStateTime, 8000) && snapshot.connectionState === "connected";
-  const dockingReady = isFresh(snapshot.dockingStateTime, 8000);
+    isFresh(snapshot.connectionStateTime, 45000) && snapshot.connectionState === "connected";
+  const dockingReady = isFresh(snapshot.dockingStateTime, 45000);
   const navReady = isFresh(snapshot.navStateTime, 4000);
   const motorReady =
-    isFresh(snapshot.motorPowerStateTime, 8000) && snapshot.motorPowerState === "on";
+    isFresh(snapshot.motorPowerStateTime, 45000) && snapshot.motorPowerState === "on";
   const localizedReady = navReady && Boolean(snapshot.navState?.localized);
-  const mapsReady = isFresh(snapshot.mapsTime, 20000);
+  const mapsReady = isFresh(snapshot.mapsTime, 60000);
   const currentMapReady =
     Boolean(currentMapId) &&
-    (Boolean(snapshot.mapImageMetadata?.map_id) || isFresh(snapshot.currentMapTime, 30000));
-  const defaultMapReady = !defaultMapId || isFresh(snapshot.defaultMapTime, 30000);
+    (Boolean(snapshot.mapImageMetadata?.map_id) || isFresh(snapshot.currentMapTime, 60000));
+  const defaultMapReady = !defaultMapId || isFresh(snapshot.defaultMapTime, 60000);
 
   const activeNavLabel =
     snapshot.navState?.target_name ||
@@ -1495,7 +1526,7 @@ export default function App() {
 
                 <Box sx={{ mt: "auto" }}>
                   <Typography variant="caption" color="text.secondary">
-                    Map view: {isFresh(snapshot.mapImageMetadataTime, 8000) ? "live" : "stale"} · Nav state: {isFresh(snapshot.navStateTime, 4000) ? "live" : "stale"} · Overlay: {isFresh(snapshot.overlayTime, 15000) ? "live" : "stale"} · Maps: {mapsReady ? "live" : "stale"}
+                    Map view: {isFresh(snapshot.mapImageMetadataTime, 8000) ? "live" : "stale"} · Nav state: {isFresh(snapshot.navStateTime, 4000) ? "live" : "stale"} · Overlay: {isFresh(snapshot.overlayTime, 15000) ? "live" : "stale"} · Catalog: {mapsReady ? "ready" : "stale"}
                   </Typography>
                 </Box>
               </Stack>

@@ -3,6 +3,7 @@ import {
   Authentication,
   Device,
   Fleet,
+  IStreamData,
   LiveUniverseData,
   RealtimeStreamSource
 } from "@formant/data-sdk";
@@ -38,6 +39,11 @@ export const DEFAULT_MODULE_CONFIG: ModuleConfig = {
   defaultYawMode: "current",
   defaultYawDeg: 0
 };
+
+const MAP_CATALOG_LOOKBACK_MS = 30 * 24 * 60 * 60 * 1000;
+const STATE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
+const DYNAMIC_LOOKBACK_MS = 20 * 60 * 1000;
+export const TELEMETRY_POLL_INTERVAL_MS = 15000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -75,6 +81,11 @@ function parseMapListText(value: string | symbol): string[] | undefined {
     .map((entry) => entry.trim())
     .filter((entry) => entry && entry.toLowerCase() !== "none");
   return Array.from(new Set(entries));
+}
+
+interface TelemetryPoint {
+  time: number;
+  value: unknown;
 }
 
 function parseGraphNavMapImageMetadataValue(
@@ -405,11 +416,267 @@ function patchNumericValue(
   value: number | symbol,
   onPatch: (patch: Partial<StreamSnapshot>) => void
 ): void {
-  if (typeof value !== "number" || !Number.isFinite(value)) return;
+  const normalized =
+    typeof value === "number"
+      ? value
+      : Array.isArray(value) &&
+          value.length > 0 &&
+          typeof value[value.length - 1] === "number"
+        ? (value[value.length - 1] as number)
+        : undefined;
+  if (typeof normalized !== "number" || !Number.isFinite(normalized)) return;
   onPatch({
-    [key]: value,
+    [key]: normalized,
     [timeKey]: Date.now()
   });
+}
+
+function getLatestTelemetryPoint(
+  streams: IStreamData[],
+  name: string,
+  type: string
+): TelemetryPoint | undefined {
+  let latest: TelemetryPoint | undefined;
+
+  for (const stream of streams) {
+    if (stream.name !== name || stream.type !== type) continue;
+    for (const point of stream.points || []) {
+      const [time, value] = point;
+      if (typeof time !== "number") continue;
+      if (!latest || time >= latest.time) {
+        latest = { time, value };
+      }
+    }
+  }
+
+  return latest;
+}
+
+async function resolveTelemetryText(value: unknown): Promise<string | undefined> {
+  if (typeof value !== "string") return undefined;
+  if (/^https?:\/\//.test(value)) {
+    const response = await fetch(value);
+    if (!response.ok) return undefined;
+    return response.text();
+  }
+  return value;
+}
+
+async function resolveTelemetryJson(value: unknown): Promise<unknown> {
+  if (typeof value === "string") {
+    if (/^https?:\/\//.test(value)) {
+      const response = await fetch(value);
+      if (!response.ok) return undefined;
+      return response.json();
+    }
+    try {
+      return JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+
+  return value;
+}
+
+function resolveTelemetryNumeric(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (Array.isArray(value) && value.length > 0) {
+    const candidate = value[value.length - 1];
+    if (typeof candidate === "number" && Number.isFinite(candidate)) return candidate;
+  }
+  if (isRecord(value) && typeof value.value === "number" && Number.isFinite(value.value)) {
+    return value.value;
+  }
+  return undefined;
+}
+
+async function queryTelemetryWindow(
+  deviceId: string,
+  names: string[],
+  types: string[],
+  lookbackMs: number
+): Promise<IStreamData[]> {
+  if (!names.length || !types.length) return [];
+  const end = new Date();
+  const start = new Date(end.getTime() - lookbackMs);
+  return Fleet.queryTelemetry({
+    deviceIds: [deviceId],
+    names,
+    types,
+    start: start.toISOString(),
+    end: end.toISOString()
+  });
+}
+
+export async function loadTelemetrySnapshot(
+  deviceId: string,
+  config: ModuleConfig
+): Promise<Partial<StreamSnapshot>> {
+  const [catalogStreams, stateStreams, dynamicStreams] = await Promise.all([
+    queryTelemetryWindow(
+      deviceId,
+      [config.mapsStreamName, config.currentMapStreamName, config.defaultMapStreamName],
+      ["text"],
+      MAP_CATALOG_LOOKBACK_MS
+    ),
+    queryTelemetryWindow(
+      deviceId,
+      [
+        config.connectionStateStreamName,
+        config.dockingStateStreamName,
+        config.motorPowerStateStreamName,
+        config.behaviorStateStreamName,
+        config.batteryStreamName
+      ],
+      ["text", "numeric"],
+      STATE_LOOKBACK_MS
+    ),
+    queryTelemetryWindow(
+      deviceId,
+      [
+        config.mapImageMetadataStreamName,
+        config.overlayStreamName,
+        config.navStateStreamName
+      ],
+      ["json"],
+      DYNAMIC_LOOKBACK_MS
+    )
+  ]);
+
+  const patch: Partial<StreamSnapshot> = {};
+  const now = Date.now();
+
+  const mapsPoint = getLatestTelemetryPoint(catalogStreams, config.mapsStreamName, "text");
+  if (mapsPoint) {
+    const mapsText = await resolveTelemetryText(mapsPoint.value);
+    const maps = parseMapListText(mapsText ?? "");
+    if (maps) {
+      patch.maps = maps;
+      patch.mapsTime = now;
+    }
+  }
+
+  const currentMapPoint = getLatestTelemetryPoint(
+    catalogStreams,
+    config.currentMapStreamName,
+    "text"
+  );
+  if (currentMapPoint) {
+    const currentMapText = await resolveTelemetryText(currentMapPoint.value);
+    const currentMapId = normalizeOptionalText(currentMapText ?? "");
+    if (typeof currentMapId !== "undefined") {
+      patch.currentMapId = currentMapId;
+      patch.currentMapTime = now;
+    }
+  }
+
+  const defaultMapPoint = getLatestTelemetryPoint(
+    catalogStreams,
+    config.defaultMapStreamName,
+    "text"
+  );
+  if (defaultMapPoint) {
+    const defaultMapText = await resolveTelemetryText(defaultMapPoint.value);
+    const defaultMapId = normalizeOptionalText(defaultMapText ?? "");
+    if (typeof defaultMapId !== "undefined") {
+      patch.defaultMapId = defaultMapId;
+      patch.defaultMapTime = now;
+    }
+  }
+
+  const connectionPoint = getLatestTelemetryPoint(
+    stateStreams,
+    config.connectionStateStreamName,
+    "text"
+  );
+  if (connectionPoint) {
+    const value = await resolveTelemetryText(connectionPoint.value);
+    const normalized = normalizeOptionalText(value ?? "");
+    if (typeof normalized !== "undefined") {
+      patch.connectionState = normalized;
+      patch.connectionStateTime = connectionPoint.time;
+    }
+  }
+
+  const dockingPoint = getLatestTelemetryPoint(stateStreams, config.dockingStateStreamName, "text");
+  if (dockingPoint) {
+    const value = await resolveTelemetryText(dockingPoint.value);
+    const normalized = normalizeOptionalText(value ?? "");
+    if (typeof normalized !== "undefined") {
+      patch.dockingState = normalized;
+      patch.dockingStateTime = dockingPoint.time;
+    }
+  }
+
+  const motorPoint = getLatestTelemetryPoint(
+    stateStreams,
+    config.motorPowerStateStreamName,
+    "text"
+  );
+  if (motorPoint) {
+    const value = await resolveTelemetryText(motorPoint.value);
+    const normalized = normalizeOptionalText(value ?? "");
+    if (typeof normalized !== "undefined") {
+      patch.motorPowerState = normalized;
+      patch.motorPowerStateTime = motorPoint.time;
+    }
+  }
+
+  const behaviorPoint = getLatestTelemetryPoint(
+    stateStreams,
+    config.behaviorStateStreamName,
+    "text"
+  );
+  if (behaviorPoint) {
+    const value = await resolveTelemetryText(behaviorPoint.value);
+    const normalized = normalizeOptionalText(value ?? "");
+    if (typeof normalized !== "undefined") {
+      patch.behaviorState = normalized;
+      patch.behaviorStateTime = behaviorPoint.time;
+    }
+  }
+
+  const batteryPoint = getLatestTelemetryPoint(stateStreams, config.batteryStreamName, "numeric");
+  if (batteryPoint) {
+    const batteryPct = resolveTelemetryNumeric(batteryPoint.value);
+    if (typeof batteryPct === "number") {
+      patch.batteryPct = batteryPct;
+      patch.batteryTime = batteryPoint.time;
+    }
+  }
+
+  const metadataPoint = getLatestTelemetryPoint(
+    dynamicStreams,
+    config.mapImageMetadataStreamName,
+    "json"
+  );
+  if (metadataPoint) {
+    const metadata = parseGraphNavMapImageMetadataValue(
+      await resolveTelemetryJson(metadataPoint.value)
+    );
+    if (metadata) {
+      patch.mapImageMetadata = metadata;
+      patch.mapImageMetadataTime = metadataPoint.time;
+    }
+  }
+
+  const overlayPoint = getLatestTelemetryPoint(dynamicStreams, config.overlayStreamName, "json");
+  if (overlayPoint) {
+    const overlay = parseGraphNavOverlayValue(await resolveTelemetryJson(overlayPoint.value));
+    if (overlay) {
+      patch.overlay = overlay;
+      patch.overlayTime = overlayPoint.time;
+    }
+  }
+
+  const navStatePoint = getLatestTelemetryPoint(dynamicStreams, config.navStateStreamName, "json");
+  if (navStatePoint) {
+    patch.navState = parseNavStateValue(await resolveTelemetryJson(navStatePoint.value));
+    patch.navStateTime = navStatePoint.time;
+  }
+
+  return patch;
 }
 
 function subscribeWithWarning(
