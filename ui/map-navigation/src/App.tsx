@@ -70,6 +70,7 @@ type LocalizationStatus = "localized" | "not_localized" | "unknown";
 type MapSurfaceStatus = "live" | "catalog" | "unavailable";
 type SystemStatusSeverity = "success" | "info" | "warning";
 type ConnectionPhase = "connecting" | "ready" | "failed";
+type ConnectionStepStatus = "pending" | "complete" | "failed";
 type Selection =
   | { kind: "waypoint"; mapUuid: string; waypoint: GraphNavOverlayWaypoint }
   | { kind: "point"; mapUuid: string; target: TargetPose; headingMode: PointHeadingMode };
@@ -78,8 +79,8 @@ const LIVE_MAP_VIEW_MAX_AGE_MS = 20000;
 const FORMANT_BACKEND_MAX_AGE_MS = TELEMETRY_POLL_INTERVAL_MS * 3;
 const REALTIME_CONNECTION_MAX_AGE_MS = 12000;
 const LIVE_SESSION_MAX_AGE_MS = 15000;
-const INITIAL_CONNECT_TIMEOUT_MS = 20000;
-const RECONNECT_TIMEOUT_MS = 15000;
+const INITIAL_CONNECT_TIMEOUT_MS = 10000;
+const RECONNECT_TIMEOUT_MS = 10000;
 
 interface AsyncHealthState {
   status: "idle" | "pending" | "ready" | "failed";
@@ -91,13 +92,19 @@ interface ConnectionScreenState {
   phase: ConnectionPhase;
   title: string;
   detail: string;
+  steps: Array<{
+    label: string;
+    detail: string;
+    status: ConnectionStepStatus;
+  }>;
 }
 
 interface ConnectionHealth {
   formantBackendHealthy: boolean;
-  realtimeConnectionFresh: boolean;
+  realtimeTransportHealthy: boolean;
   robotRealtimeHealthy: boolean;
-  liveSessionHealthy: boolean;
+  liveRobotStateHealthy: boolean;
+  liveMapHealthy: boolean;
   transportReady: boolean;
 }
 
@@ -121,28 +128,43 @@ function deriveConnectionHealth(
       telemetryState.lastSuccessAt &&
         now - telemetryState.lastSuccessAt <= FORMANT_BACKEND_MAX_AGE_MS
     );
+  const realtimeTransportHealthy = isFresh(
+    snapshot.realtimeActivityTime,
+    REALTIME_CONNECTION_MAX_AGE_MS,
+    now
+  );
   const realtimeConnectionFresh = isFresh(
     snapshot.realtimeConnectionStateTime,
     REALTIME_CONNECTION_MAX_AGE_MS,
     now
   );
   const robotRealtimeHealthy =
-    realtimeConnectionFresh && snapshot.realtimeConnectionState === "connected";
-  const liveSessionHealthy =
-    robotRealtimeHealthy &&
-    [
-      snapshot.navStateRealtimeTime,
-      snapshot.mapImageMetadataRealtimeTime,
-      snapshot.mapImageRealtimeTime,
-      snapshot.overlayRealtimeTime
-    ].some((timestamp) => isFresh(timestamp, LIVE_SESSION_MAX_AGE_MS, now));
+    realtimeConnectionFresh
+      ? snapshot.realtimeConnectionState === "connected"
+      : realtimeTransportHealthy;
+  const liveRobotStateHealthy = isFresh(
+    snapshot.navStateRealtimeTime,
+    LIVE_SESSION_MAX_AGE_MS,
+    now
+  );
+  const liveMapHealthy = isFresh(
+    snapshot.mapImageRealtimeTime,
+    LIVE_SESSION_MAX_AGE_MS,
+    now
+  );
 
   return {
     formantBackendHealthy,
-    realtimeConnectionFresh,
+    realtimeTransportHealthy,
     robotRealtimeHealthy,
-    liveSessionHealthy,
-    transportReady: formantBackendHealthy && liveSessionHealthy
+    liveRobotStateHealthy,
+    liveMapHealthy,
+    transportReady:
+      formantBackendHealthy &&
+      realtimeTransportHealthy &&
+      robotRealtimeHealthy &&
+      liveRobotStateHealthy &&
+      liveMapHealthy
   };
 }
 
@@ -253,12 +275,45 @@ function buildConnectionScreenState(
 ): ConnectionScreenState {
   const timeoutMs = hasReachedReady ? RECONNECT_TIMEOUT_MS : INITIAL_CONNECT_TIMEOUT_MS;
   const timedOut = now - attemptStartedAt >= timeoutMs;
+  const steps: ConnectionScreenState["steps"] = [
+    {
+      label: "Formant backend",
+      detail: health.formantBackendHealthy
+        ? "Authenticated and device state loaded."
+        : bootstrapState.status === "pending"
+          ? "Authenticating and loading device context."
+          : "Waiting for a healthy backend session.",
+      status: health.formantBackendHealthy ? "complete" : "pending"
+    },
+    {
+      label: "Live session",
+      detail: health.realtimeTransportHealthy
+        ? "Realtime transport is active."
+        : "Starting the realtime connection.",
+      status: health.realtimeTransportHealthy ? "complete" : "pending"
+    },
+    {
+      label: "Robot state",
+      detail: health.liveRobotStateHealthy
+        ? "Receiving live robot navigation state."
+        : "Waiting for live robot state.",
+      status: health.liveRobotStateHealthy ? "complete" : "pending"
+    },
+    {
+      label: "Map video",
+      detail: health.liveMapHealthy
+        ? "Receiving live map video."
+        : "Waiting for the first live map frame.",
+      status: health.liveMapHealthy ? "complete" : "pending"
+    }
+  ];
 
   if (health.transportReady) {
     return {
       phase: "ready",
       title: "Connected",
-      detail: "Formant and the live robot session are healthy."
+      detail: "Formant and the live robot session are healthy.",
+      steps
     };
   }
 
@@ -268,7 +323,10 @@ function buildConnectionScreenState(
       title: "Could not connect to Formant",
       detail:
         bootstrapState.error ||
-        "Authentication or device bootstrap failed before the navigation session could start."
+        "Authentication or device bootstrap failed before the navigation session could start.",
+      steps: steps.map((step, index) =>
+        index === 0 ? { ...step, status: "failed" } : step
+      )
     };
   }
 
@@ -279,33 +337,65 @@ function buildConnectionScreenState(
         title: "Formant connection failed",
         detail:
           telemetryState.error ||
-          "The module could not confirm a healthy connection to the Formant API backend."
+          "The module could not confirm a healthy connection to the Formant API backend.",
+        steps: steps.map((step, index) =>
+          index === 0 && step.status !== "complete"
+            ? { ...step, status: "failed" }
+            : step
+        )
       };
     }
 
-    if (!health.realtimeConnectionFresh) {
+    if (!health.realtimeTransportHealthy) {
       return {
         phase: "failed",
         title: "Live robot connection timed out",
-        detail:
-          "The realtime session never reported a current robot connection state."
+        detail: "The realtime transport never became active.",
+        steps: steps.map((step, index) =>
+          index === 1 && step.status !== "complete"
+            ? { ...step, status: "failed" }
+            : step
+        )
       };
     }
 
-    if (snapshot.realtimeConnectionState !== "connected") {
+    if (isFresh(snapshot.realtimeConnectionStateTime, REALTIME_CONNECTION_MAX_AGE_MS, now) &&
+        snapshot.realtimeConnectionState !== "connected") {
       return {
         phase: "failed",
         title: "Robot is not connected",
         detail:
-          "Formant is reachable, but the live robot connection is not healthy yet."
+          "Formant is reachable, but the robot reported a disconnected live state.",
+        steps: steps.map((step, index) =>
+          index === 2 && step.status !== "complete"
+            ? { ...step, status: "failed" }
+            : step
+        )
+      };
+    }
+
+    if (!health.liveRobotStateHealthy) {
+      return {
+        phase: "failed",
+        title: "Live robot state is unavailable",
+        detail: "The realtime session started, but robot navigation state did not arrive in time.",
+        steps: steps.map((step, index) =>
+          index === 2 && step.status !== "complete"
+            ? { ...step, status: "failed" }
+            : step
+        )
       };
     }
 
     return {
       phase: "failed",
-      title: "Live navigation data is unavailable",
-      detail:
-        "The realtime session connected, but live map or navigation streams did not become healthy."
+      title: "Live map video is unavailable",
+      detail: "The realtime session connected, but the live map video did not arrive in time.",
+      steps: steps.map((step, index) =>
+        index === 3 && step.status !== "complete"
+          ? { ...step, status: "failed" }
+          : step
+      )
     };
   }
 
@@ -316,25 +406,39 @@ function buildConnectionScreenState(
       detail:
         telemetryState.status === "pending"
           ? "Checking the Formant API backend and loading the latest device state."
-          : "Waiting for a healthy Formant backend connection."
+          : "Waiting for a healthy Formant backend connection.",
+      steps
       };
   }
 
-  if (!health.realtimeConnectionFresh) {
+  if (!health.realtimeTransportHealthy) {
     return {
       phase: "connecting",
       title: "Connecting to live robot session",
-      detail:
-        "Waiting for the realtime robot connection state to become current."
+      detail: "Waiting for the realtime session to become active.",
+      steps
     };
   }
 
-  if (snapshot.realtimeConnectionState !== "connected") {
+  if (
+    isFresh(snapshot.realtimeConnectionStateTime, REALTIME_CONNECTION_MAX_AGE_MS, now) &&
+    snapshot.realtimeConnectionState !== "connected"
+  ) {
     return {
       phase: "connecting",
       title: "Waiting for robot connection",
       detail:
-        "Formant is reachable, but the robot has not reported a healthy live connection yet."
+        "Formant is reachable, but the robot has not reported a healthy live connection yet.",
+      steps
+    };
+  }
+
+  if (!health.liveRobotStateHealthy) {
+    return {
+      phase: "connecting",
+      title: "Receiving live robot state",
+      detail: "The realtime session is active. Waiting for live robot state to arrive.",
+      steps
     };
   }
 
@@ -342,7 +446,8 @@ function buildConnectionScreenState(
     phase: "connecting",
     title: "Starting live navigation session",
     detail:
-      "The robot is connected. Waiting for live map and navigation data before showing the interface."
+      "Live robot state is ready. Waiting for the first live map frame before showing the interface.",
+    steps
   };
 }
 
@@ -848,23 +953,108 @@ function ConnectionScreen({
   onRetry: () => void;
 }) {
   return (
-    <Stack
-      alignItems="center"
-      justifyContent="center"
-      spacing={2}
-      sx={{ width: "100%", height: "100%", px: 3, textAlign: "center" }}
-    >
-      {state.phase === "connecting" ? <CircularProgress size={28} color="primary" /> : null}
-      <Typography variant="h6">{state.title}</Typography>
-      <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 420 }}>
-        {state.detail}
-      </Typography>
-      {state.phase === "failed" ? (
-        <Button variant="contained" onClick={onRetry}>
-          Retry
-        </Button>
-      ) : null}
-    </Stack>
+    <Box sx={{ position: "relative", width: "100%", height: "100%", px: 3 }}>
+      <Box
+        sx={{
+          position: "absolute",
+          top: "50%",
+          left: "50%",
+          transform: "translate(-50%, -50%)",
+          width: 52,
+          height: 52,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center"
+        }}
+      >
+        {state.phase === "connecting" ? (
+          <CircularProgress size={32} color="primary" />
+        ) : (
+          <Box
+            sx={{
+              width: 34,
+              height: 34,
+              borderRadius: "50%",
+              border: "2px solid rgba(255,255,255,0.24)",
+              color: "warning.main",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontWeight: 700,
+              fontSize: 20
+            }}
+          >
+            !
+          </Box>
+        )}
+      </Box>
+
+      <Stack
+        spacing={1.5}
+        sx={{
+          position: "absolute",
+          top: "calc(50% + 56px)",
+          left: "50%",
+          transform: "translateX(-50%)",
+          width: "min(420px, calc(100% - 32px))",
+          textAlign: "center"
+        }}
+      >
+        <Typography variant="h6">{state.title}</Typography>
+        <Typography
+          variant="body2"
+          color="text.secondary"
+          sx={{ minHeight: 40, maxWidth: 420, mx: "auto" }}
+        >
+          {state.detail}
+        </Typography>
+
+        <Stack spacing={1} sx={{ textAlign: "left" }}>
+          {state.steps.map((step) => (
+            <Box
+              key={step.label}
+              sx={{
+                p: 1.15,
+                borderRadius: 1.5,
+                bgcolor: "rgba(255,255,255,0.03)",
+                border: "1px solid rgba(255,255,255,0.06)"
+              }}
+            >
+              <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+                <Typography variant="subtitle2">{step.label}</Typography>
+                <Chip
+                  size="small"
+                  label={
+                    step.status === "complete"
+                      ? "Ready"
+                      : step.status === "failed"
+                        ? "Failed"
+                        : "Waiting"
+                  }
+                  color={
+                    step.status === "complete"
+                      ? "secondary"
+                      : step.status === "failed"
+                        ? "warning"
+                        : "default"
+                  }
+                  variant={step.status === "complete" ? "filled" : "outlined"}
+                />
+              </Stack>
+              <Typography variant="caption" color="text.secondary">
+                {step.detail}
+              </Typography>
+            </Box>
+          ))}
+        </Stack>
+
+        {state.phase === "failed" ? (
+          <Button variant="contained" onClick={onRetry} sx={{ alignSelf: "center", mt: 0.5 }}>
+            Retry
+          </Button>
+        ) : null}
+      </Stack>
+    </Box>
   );
 }
 

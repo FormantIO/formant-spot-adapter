@@ -454,6 +454,18 @@ function patchNumericValue(
   });
 }
 
+function parseRealtimeJsonText<T>(
+  value: string | symbol,
+  parse: (payload: unknown) => T | undefined
+): T | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    return parse(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
+}
+
 function getLatestTelemetryPoint(
   streams: IStreamData[],
   name: string,
@@ -771,20 +783,32 @@ export function subscribeRealtimeSnapshot(
       warnings.delete(key);
     }
   };
+  const emitRealtimePatch = (now: number, patch: Partial<StreamSnapshot>) => {
+    emitPatch({
+      realtimeActivityTime: now,
+      ...patch
+    });
+  };
 
   subscribeWithWarning(
     cleanups,
     "navState",
     `Could not subscribe to ${config.navStateStreamName}`,
     () =>
-      live.subscribeToJson(
+      live.subscribeToText(
         deviceId,
-        buildRealtimeSource(config.navStateStreamName, "json"),
+        buildRealtimeSource(config.navStateStreamName, "text"),
         (value) => {
           const now = Date.now();
+          const navState = parseRealtimeJsonText(value, parseNavStateValue);
+          if (!navState) {
+            setWarning("navState", `Could not parse ${config.navStateStreamName}`);
+            emitPatch({});
+            return;
+          }
           setWarning("navState");
-          emitPatch({
-            navState: parseNavStateValue(value),
+          emitRealtimePatch(now, {
+            navState,
             navStateTime: now,
             navStateRealtimeTime: now
           });
@@ -799,11 +823,14 @@ export function subscribeRealtimeSnapshot(
     "mapImageMetadata",
     `Could not subscribe to ${config.mapImageMetadataStreamName}`,
     () =>
-      live.subscribeToJson(
+      live.subscribeToText(
         deviceId,
-        buildRealtimeSource(config.mapImageMetadataStreamName, "json"),
+        buildRealtimeSource(config.mapImageMetadataStreamName, "text"),
         (value) => {
-          const mapImageMetadata = parseGraphNavMapImageMetadataValue(value);
+          const mapImageMetadata = parseRealtimeJsonText(
+            value,
+            parseGraphNavMapImageMetadataValue
+          );
           if (!mapImageMetadata) {
             setWarning(
               "mapImageMetadata",
@@ -814,7 +841,7 @@ export function subscribeRealtimeSnapshot(
           }
           const now = Date.now();
           setWarning("mapImageMetadata");
-          emitPatch({
+          emitRealtimePatch(now, {
             mapImageMetadata,
             mapImageMetadataTime: now,
             mapImageMetadataRealtimeTime: now
@@ -830,11 +857,11 @@ export function subscribeRealtimeSnapshot(
     "overlay",
     `Could not subscribe to ${config.overlayStreamName}`,
     () =>
-      live.subscribeToJson(
+      live.subscribeToText(
         deviceId,
-        buildRealtimeSource(config.overlayStreamName, "json"),
+        buildRealtimeSource(config.overlayStreamName, "text"),
         (value) => {
-          const overlay = parseGraphNavOverlayValue(value);
+          const overlay = parseRealtimeJsonText(value, parseGraphNavOverlayValue);
           if (!overlay) {
             setWarning("overlay", `Could not parse ${config.overlayStreamName}`);
             emitPatch({});
@@ -842,7 +869,7 @@ export function subscribeRealtimeSnapshot(
           }
           const now = Date.now();
           setWarning("overlay");
-          emitPatch({
+          emitRealtimePatch(now, {
             overlay,
             overlayTime: now,
             overlayRealtimeTime: now
@@ -864,7 +891,7 @@ export function subscribeRealtimeSnapshot(
         (canvas) => {
           const now = Date.now();
           setWarning("mapImage");
-          emitPatch({
+          emitRealtimePatch(now, {
             mapImageCanvas: canvas,
             mapImageFrameVersion: now,
             mapImageTime: now,
@@ -886,6 +913,8 @@ export function subscribeRealtimeSnapshot(
         buildRealtimeSource(config.mapsStreamName, "text"),
         (value) => {
           setWarning("maps");
+          const now = Date.now();
+          emitRealtimePatch(now, {});
           patchMapListValue("maps", "mapsTime", value, emitPatch);
         }
       ),
@@ -903,6 +932,8 @@ export function subscribeRealtimeSnapshot(
         buildRealtimeSource(config.currentMapStreamName, "text"),
         (value) => {
           setWarning("currentMap");
+          const now = Date.now();
+          emitRealtimePatch(now, {});
           patchTextValue("currentMapId", "currentMapTime", value, emitPatch);
         }
       ),
@@ -920,6 +951,8 @@ export function subscribeRealtimeSnapshot(
         buildRealtimeSource(config.defaultMapStreamName, "text"),
         (value) => {
           setWarning("defaultMap");
+          const now = Date.now();
+          emitRealtimePatch(now, {});
           patchTextValue("defaultMapId", "defaultMapTime", value, emitPatch);
         }
       ),
@@ -940,7 +973,7 @@ export function subscribeRealtimeSnapshot(
           const normalized = normalizeOptionalText(value);
           if (typeof normalized === "undefined") return;
           const now = Date.now();
-          emitPatch({
+          emitRealtimePatch(now, {
             connectionState: normalized,
             connectionStateTime: now,
             realtimeConnectionState: normalized,
@@ -962,6 +995,8 @@ export function subscribeRealtimeSnapshot(
         buildRealtimeSource(config.dockingStateStreamName, "text"),
         (value) => {
           setWarning("dockingState");
+          const now = Date.now();
+          emitRealtimePatch(now, {});
           patchTextValue("dockingState", "dockingStateTime", value, emitPatch);
         }
       ),
@@ -979,6 +1014,8 @@ export function subscribeRealtimeSnapshot(
         buildRealtimeSource(config.motorPowerStateStreamName, "text"),
         (value) => {
           setWarning("motorPowerState");
+          const now = Date.now();
+          emitRealtimePatch(now, {});
           patchTextValue("motorPowerState", "motorPowerStateTime", value, emitPatch);
         }
       ),
@@ -996,6 +1033,8 @@ export function subscribeRealtimeSnapshot(
         buildRealtimeSource(config.behaviorStateStreamName, "text"),
         (value) => {
           setWarning("behaviorState");
+          const now = Date.now();
+          emitRealtimePatch(now, {});
           patchTextValue("behaviorState", "behaviorStateTime", value, emitPatch);
         }
       ),
@@ -1014,6 +1053,8 @@ export function subscribeRealtimeSnapshot(
           buildRealtimeSource(config.batteryStreamName, "numeric"),
           (value: number | symbol) => {
             setWarning("battery");
+            const now = Date.now();
+            emitRealtimePatch(now, {});
             patchNumericValue("batteryPct", "batteryTime", value, emitPatch);
           }
         ),

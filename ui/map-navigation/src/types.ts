@@ -159,6 +159,7 @@ export interface StreamSnapshot {
   connectionStateTime?: number;
   realtimeConnectionState?: string;
   realtimeConnectionStateTime?: number;
+  realtimeActivityTime?: number;
   dockingState?: string;
   dockingStateTime?: number;
   motorPowerState?: string;
