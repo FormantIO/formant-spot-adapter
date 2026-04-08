@@ -475,6 +475,23 @@ function getLatestTelemetryPoint(
   return latest;
 }
 
+function getLatestTelemetryPointForTypes(
+  streams: IStreamData[],
+  name: string,
+  types: string[]
+): TelemetryPoint | undefined {
+  let latest: TelemetryPoint | undefined;
+
+  for (const type of types) {
+    const point = getLatestTelemetryPoint(streams, name, type);
+    if (point && (!latest || point.time >= latest.time)) {
+      latest = point;
+    }
+  }
+
+  return latest;
+}
+
 async function resolveTelemetryText(value: unknown): Promise<string | undefined> {
   if (typeof value !== "string") return undefined;
   if (/^https?:\/\//.test(value)) {
@@ -562,13 +579,12 @@ export async function loadTelemetrySnapshot(
         config.overlayStreamName,
         config.navStateStreamName
       ],
-      ["json"],
+      ["text", "json"],
       DYNAMIC_LOOKBACK_MS
     )
   ]);
 
   const patch: Partial<StreamSnapshot> = {};
-  const now = Date.now();
 
   const mapsPoint = getLatestTelemetryPoint(catalogStreams, config.mapsStreamName, "text");
   if (mapsPoint) {
@@ -576,7 +592,7 @@ export async function loadTelemetrySnapshot(
     const maps = parseMapListText(mapsText ?? "");
     if (maps) {
       patch.maps = maps;
-      patch.mapsTime = now;
+      patch.mapsTime = mapsPoint.time;
     }
   }
 
@@ -590,7 +606,7 @@ export async function loadTelemetrySnapshot(
     const currentMapId = normalizeOptionalText(currentMapText ?? "");
     if (typeof currentMapId !== "undefined") {
       patch.currentMapId = currentMapId;
-      patch.currentMapTime = now;
+      patch.currentMapTime = currentMapPoint.time;
     }
   }
 
@@ -604,7 +620,7 @@ export async function loadTelemetrySnapshot(
     const defaultMapId = normalizeOptionalText(defaultMapText ?? "");
     if (typeof defaultMapId !== "undefined") {
       patch.defaultMapId = defaultMapId;
-      patch.defaultMapTime = now;
+      patch.defaultMapTime = defaultMapPoint.time;
     }
   }
 
@@ -669,10 +685,10 @@ export async function loadTelemetrySnapshot(
     }
   }
 
-  const metadataPoint = getLatestTelemetryPoint(
+  const metadataPoint = getLatestTelemetryPointForTypes(
     dynamicStreams,
     config.mapImageMetadataStreamName,
-    "json"
+    ["json", "text"]
   );
   if (metadataPoint) {
     const metadata = parseGraphNavMapImageMetadataValue(
@@ -684,7 +700,11 @@ export async function loadTelemetrySnapshot(
     }
   }
 
-  const overlayPoint = getLatestTelemetryPoint(dynamicStreams, config.overlayStreamName, "json");
+  const overlayPoint = getLatestTelemetryPointForTypes(
+    dynamicStreams,
+    config.overlayStreamName,
+    ["json", "text"]
+  );
   if (overlayPoint) {
     const overlay = parseGraphNavOverlayValue(await resolveTelemetryJson(overlayPoint.value));
     if (overlay) {
@@ -693,7 +713,11 @@ export async function loadTelemetrySnapshot(
     }
   }
 
-  const navStatePoint = getLatestTelemetryPoint(dynamicStreams, config.navStateStreamName, "json");
+  const navStatePoint = getLatestTelemetryPointForTypes(
+    dynamicStreams,
+    config.navStateStreamName,
+    ["json", "text"]
+  );
   if (navStatePoint) {
     patch.navState = parseNavStateValue(await resolveTelemetryJson(navStatePoint.value));
     patch.navStateTime = navStatePoint.time;

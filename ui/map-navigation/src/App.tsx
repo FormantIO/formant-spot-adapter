@@ -191,6 +191,8 @@ function buildSystemStatus(
   const motorFresh = isFresh(snapshot.motorPowerStateTime, 45000);
   const behaviorFresh = isFresh(snapshot.behaviorStateTime, 45000);
   const navFresh = isFresh(snapshot.navStateTime, 4000);
+  const mapImageFresh = isFresh(snapshot.mapImageTime, LIVE_MAP_VIEW_MAX_AGE_MS);
+  const mapMetadataFresh = isFresh(snapshot.mapImageMetadataTime, LIVE_MAP_VIEW_MAX_AGE_MS);
   const localizationStatus = getLocalizationStatus(snapshot);
   const mapSurfaceStatus = getMapSurfaceStatus(snapshot, catalogCurrentMapId, displayedMapUuid);
 
@@ -203,6 +205,13 @@ function buildSystemStatus(
   }
 
   if (mapSurfaceStatus !== "live") {
+    if (mapImageFresh && !mapMetadataFresh && catalogCurrentMapId) {
+      return {
+        title: "Live map visible",
+        detail: "Waiting for live map metadata before enabling precise navigation actions.",
+        severity: "info"
+      };
+    }
     return {
       title: "Map browsing available",
       detail: "Saved maps are available, but the live map view is unavailable.",
@@ -304,7 +313,11 @@ function buildBaseNavigationIssues(
   }
 
   if (requireLiveMapView && !mapFresh) {
-    issues.push("Live map view is unavailable.");
+    if (isFresh(snapshot.mapImageTime, LIVE_MAP_VIEW_MAX_AGE_MS)) {
+      issues.push("Live map metadata is unavailable.");
+    } else {
+      issues.push("Live map view is unavailable.");
+    }
   }
 
   return issues;
