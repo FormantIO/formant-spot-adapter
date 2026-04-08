@@ -354,7 +354,12 @@ export async function authenticateAndGetDevice(): Promise<Device> {
 }
 
 export async function getInitialModuleConfig(): Promise<ModuleConfig> {
-  return parseModuleConfig(await App.getCurrentModuleConfiguration());
+  try {
+    return parseModuleConfig(await App.getCurrentModuleConfiguration());
+  } catch (error) {
+    console.warn("Falling back to default module configuration.", error);
+    return DEFAULT_MODULE_CONFIG;
+  }
 }
 
 function buildRealtimeSource(name: string, streamType: string): RealtimeStreamSource {
