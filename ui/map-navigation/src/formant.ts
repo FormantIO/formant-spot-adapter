@@ -30,6 +30,7 @@ export const DEFAULT_MODULE_CONFIG: ModuleConfig = {
   batteryStreamName: "spot.robot_state.battery",
   mapLoadCommandName: "spot.map.load",
   mapSetDefaultCommandName: "spot.map.set_default",
+  waypointSaveCommandName: "spot.waypoint.save",
   waypointGotoCommandName: "spot.waypoint.goto",
   gotoPoseCommandName: "spot.graphnav.goto_pose",
   cancelNavCommandName: "spot.graphnav.cancel",
@@ -317,6 +318,10 @@ export function parseModuleConfig(raw: string | undefined): ModuleConfig {
       mapSetDefaultCommandName: asConfiguredName(
         value.mapSetDefaultCommandName,
         DEFAULT_MODULE_CONFIG.mapSetDefaultCommandName
+      ),
+      waypointSaveCommandName: asConfiguredName(
+        value.waypointSaveCommandName,
+        DEFAULT_MODULE_CONFIG.waypointSaveCommandName
       ),
       waypointGotoCommandName: asConfiguredName(
         value.waypointGotoCommandName,
@@ -984,6 +989,11 @@ export function formatGotoPosePayload(
 
 export function formatWaypointGotoPayload(mapUuid: string, waypointId: string): string {
   return `map_uuid=${mapUuid}, waypoint_id=${waypointId}`;
+}
+
+export function formatWaypointSavePayload(name: string): string | undefined {
+  const trimmed = name.trim();
+  return trimmed ? `name=${trimmed}` : undefined;
 }
 
 export function formatMapIdPayload(mapId: string): string {

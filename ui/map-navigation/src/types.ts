@@ -13,6 +13,7 @@ export interface ModuleConfig {
   batteryStreamName: string;
   mapLoadCommandName: string;
   mapSetDefaultCommandName: string;
+  waypointSaveCommandName: string;
   waypointGotoCommandName: string;
   gotoPoseCommandName: string;
   cancelNavCommandName: string;

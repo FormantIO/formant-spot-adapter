@@ -100,6 +100,12 @@
       "type": "string",
       "default": "spot.map.set_default"
     },
+    "waypointSaveCommandName": {
+      "title": "Waypoint Save Command Name",
+      "description": "Command template used to save the robot's current pose as a waypoint on the active map.",
+      "type": "string",
+      "default": "spot.waypoint.save"
+    },
     "waypointGotoCommandName": {
       "title": "Waypoint Goto Command Name",
       "description": "Command template used for waypoint-first navigation.",

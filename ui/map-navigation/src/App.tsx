@@ -26,6 +26,7 @@ import {
   formatGotoPosePayload,
   formatMapIdPayload,
   formatWaypointGotoPayload,
+  formatWaypointSavePayload,
   getInitialModuleConfig,
   loadTelemetrySnapshot,
   parseModuleConfig,
@@ -343,6 +344,26 @@ function buildPointNavigationIssues(
   return issues;
 }
 
+function buildWaypointSaveIssues(
+  snapshot: StreamSnapshot,
+  currentMapId: string
+): string[] {
+  const issues: string[] = [];
+  const connectionFresh = isFresh(snapshot.connectionStateTime, 45000);
+  if (!currentMapId) {
+    issues.push("Load a map before saving a waypoint.");
+  }
+  if (!connectionFresh) {
+    issues.push("Waiting for live robot connection.");
+  } else if (snapshot.connectionState !== "connected") {
+    issues.push("Robot is not connected.");
+  }
+  if (snapshot.navState?.active) {
+    issues.push("Finish the active navigation before saving a waypoint.");
+  }
+  return issues;
+}
+
 function uniqueIssues(issues: string[]): string[] {
   return Array.from(new Set(issues));
 }
@@ -639,6 +660,8 @@ export default function App() {
   const [selection, setSelection] = useState<Selection>();
   const [availableCommands, setAvailableCommands] = useState<string[]>([]);
   const [waypointSearch, setWaypointSearch] = useState("");
+  const [saveWaypointName, setSaveWaypointName] = useState("");
+  const [saveWaypointExpanded, setSaveWaypointExpanded] = useState(false);
   const [mapSearch, setMapSearch] = useState("");
   const [mapsExpanded, setMapsExpanded] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -733,6 +756,7 @@ export default function App() {
     if (snapshot.navState?.active) {
       setSelection(undefined);
       setSelectionMode("waypoints");
+      setSaveWaypointExpanded(false);
     }
   }, [snapshot.navState?.active, snapshot.navState?.command_id]);
 
@@ -764,6 +788,7 @@ export default function App() {
 
   const mapLoadCommandAvailable = availableCommands.includes(config.mapLoadCommandName);
   const mapSetDefaultCommandAvailable = availableCommands.includes(config.mapSetDefaultCommandName);
+  const waypointSaveCommandAvailable = availableCommands.includes(config.waypointSaveCommandName);
   const waypointCommandAvailable = availableCommands.includes(config.waypointGotoCommandName);
   const gotoPoseCommandAvailable = availableCommands.includes(config.gotoPoseCommandName);
   const cancelCommandAvailable = availableCommands.includes(config.cancelNavCommandName);
@@ -844,6 +869,10 @@ export default function App() {
     snapshot.navState?.active,
     waypointCommandAvailable
   ]);
+  const waypointSaveIssues = useMemo(
+    () => buildWaypointSaveIssues(snapshot, currentMapId),
+    [currentMapId, snapshot]
+  );
 
   const connectionStateFresh = isFresh(snapshot.connectionStateTime, 45000);
   const dockingStateFresh = isFresh(snapshot.dockingStateTime, 45000);
@@ -950,6 +979,7 @@ export default function App() {
   };
 
   const handleSelectWaypoint = (waypoint: GraphNavOverlayWaypoint) => {
+    setSaveWaypointExpanded(false);
     setSelection({
       kind: "waypoint",
       mapUuid: snapshot.overlay?.map_uuid || snapshot.mapImageMetadata?.map_uuid || "",
@@ -960,10 +990,30 @@ export default function App() {
     setCommandNotice(undefined);
   };
 
+  const handleSaveWaypoint = () => {
+    const trimmedName = saveWaypointName.trim();
+    setSelection(undefined);
+    setSelectionMode("waypoints");
+    setCommandError(undefined);
+    setCommandNotice(undefined);
+    setSaveWaypointExpanded(false);
+    setSaveWaypointName("");
+    void sendCommand(
+      config.waypointSaveCommandName,
+      formatWaypointSavePayload(trimmedName),
+      trimmedName ? `Saving ${trimmedName}...` : "Saving current pose as a waypoint...",
+      trimmedName
+        ? `${trimmedName} save command sent. Waiting for the waypoint list to update...`
+        : "Waypoint save command sent. Waiting for the waypoint list to update..."
+    );
+  };
+
   const handleLoadMap = (mapId: string) => {
     if (!mapId) return;
     setSelection(undefined);
     setSelectionMode("waypoints");
+    setSaveWaypointExpanded(false);
+    setSaveWaypointName("");
     setWaypointSearch("");
     setMapsExpanded(false);
     setCommandError(undefined);
@@ -990,6 +1040,7 @@ export default function App() {
 
   const handleSelectPoint = (target: TargetPose) => {
     const nextTarget = { ...target, yawDeg: getCurrentYawDeg(config, snapshot.navState) };
+    setSaveWaypointExpanded(false);
     setSelection({
       kind: "point",
       mapUuid: snapshot.mapImageMetadata?.map_uuid || "",
@@ -1065,6 +1116,10 @@ export default function App() {
   const selectionReady = Boolean(selection) && selectionReadinessIssues.length === 0;
   const canLoadMaps = mapLoadCommandAvailable && connectionReady && !snapshot.navState?.active;
   const canSetDefaultMaps = mapSetDefaultCommandAvailable;
+  const canSaveWaypoint =
+    waypointSaveCommandAvailable &&
+    waypointSaveIssues.length === 0 &&
+    pendingCommand !== config.waypointSaveCommandName;
 
   return (
     <ThemeProvider theme={theme}>
@@ -1414,6 +1469,7 @@ export default function App() {
                     if (!value) return;
                     setSelectionMode(value);
                     setSelection(undefined);
+                    setSaveWaypointExpanded(false);
                   }}
                 >
                   <ToggleButton value="waypoints">Waypoints</ToggleButton>
@@ -1549,6 +1605,74 @@ export default function App() {
 
                 {selectionMode === "waypoints" ? (
                   <>
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      alignItems="center"
+                      justifyContent="space-between"
+                    >
+                      <Typography variant="subtitle2">Waypoints</Typography>
+                      <Button
+                        size="small"
+                        variant={saveWaypointExpanded ? "contained" : "outlined"}
+                        disabled={
+                          !waypointSaveCommandAvailable ||
+                          pendingCommand === config.waypointSaveCommandName
+                        }
+                        onClick={() => {
+                          setSaveWaypointExpanded((current) => !current);
+                          setSelection(undefined);
+                        }}
+                      >
+                        Save Current
+                      </Button>
+                    </Stack>
+                    <Collapse in={saveWaypointExpanded} unmountOnExit>
+                      <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.03)" }}>
+                        <Stack spacing={1}>
+                          <Typography variant="body2" color="text.secondary">
+                            Save the robot&apos;s current pose as a waypoint on{" "}
+                            {currentMapId || "the active map"}.
+                          </Typography>
+                          <TextField
+                            label="Waypoint name"
+                            placeholder="Leave blank to auto-generate"
+                            size="small"
+                            value={saveWaypointName}
+                            onChange={(event) => setSaveWaypointName(event.target.value)}
+                          />
+                          {waypointSaveIssues.length ? (
+                            <Alert severity="warning">
+                              <Stack spacing={0.5}>
+                                {waypointSaveIssues.map((issue) => (
+                                  <Typography key={issue} variant="body2">
+                                    {issue}
+                                  </Typography>
+                                ))}
+                              </Stack>
+                            </Alert>
+                          ) : null}
+                          <Stack direction="row" spacing={1}>
+                            <Button
+                              variant="contained"
+                              onClick={handleSaveWaypoint}
+                              disabled={!canSaveWaypoint}
+                            >
+                              Save
+                            </Button>
+                            <Button
+                              variant="outlined"
+                              onClick={() => {
+                                setSaveWaypointExpanded(false);
+                                setSaveWaypointName("");
+                              }}
+                            >
+                              Cancel
+                            </Button>
+                          </Stack>
+                        </Stack>
+                      </Box>
+                    </Collapse>
                     <TextField
                       value={waypointSearch}
                       onChange={(event) => setWaypointSearch(event.target.value)}
@@ -1579,11 +1703,18 @@ export default function App() {
                         })}
                         {!sortedWaypoints.length ? (
                           <Typography variant="body2" color="text.secondary" sx={{ py: 1 }}>
-                            No waypoints available for the current map.
+                            {currentMapId
+                              ? "No saved waypoints yet for this map."
+                              : "Load a map to browse or save waypoints."}
                           </Typography>
                         ) : null}
                       </List>
                     </Box>
+                    {!waypointSaveCommandAvailable ? (
+                      <Typography variant="caption" color="warning.main">
+                        Waypoint save command is unavailable on this device.
+                      </Typography>
+                    ) : null}
                   </>
                 ) : (
                   <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.03)" }}>
