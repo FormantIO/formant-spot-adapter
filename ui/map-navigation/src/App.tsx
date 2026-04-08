@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Box,
@@ -7,18 +7,14 @@ import {
   CircularProgress,
   Collapse,
   CssBaseline,
-  Divider,
   List,
   ListItemButton,
   ListItemText,
   Stack,
   TextField,
-  ThemeProvider,
-  ToggleButton,
-  ToggleButtonGroup,
-  Typography,
-  createTheme
+  Typography
 } from "@mui/material";
+import { alpha, createTheme, ThemeProvider } from "@mui/material/styles";
 import { App as FormantApp } from "@formant/data-sdk";
 import {
   DEFAULT_MODULE_CONFIG,
@@ -35,12 +31,30 @@ import {
 } from "./formant";
 import { getCanvasSize, pixelToSeed, seedToPixel } from "./mapMath";
 import {
+  AsyncHealthState,
+  ConnectionScreenState,
+  INITIAL_CONNECT_TIMEOUT_MS,
+  NAV_STATE_MAX_AGE_MS,
+  ROBOT_STATE_MAX_AGE_MS,
+  buildConnectionScreenState,
+  deriveConnectionHealth,
+  deriveMapState,
+  deriveNavigationSummary,
+  deriveRobotMetrics,
+  isBehaviorNavigationReady,
+  isFresh
+} from "./statusModel";
+import {
   GraphNavOverlayWaypoint,
   ModuleConfig,
   NavState,
   StreamSnapshot,
   TargetPose
 } from "./types";
+
+const LOG_PREFIX = "[spot-nav]";
+const MAP_SURFACE_BACKGROUND = "#2a180f";
+const MAP_STAGE_BACKGROUND = "#341f15";
 
 const theme = createTheme({
   palette: {
@@ -51,11 +65,11 @@ const theme = createTheme({
     error: { main: "#ff6c7b" },
     background: {
       default: "#09131b",
-      paper: "#101c25"
+      paper: "#101821"
     }
   },
   shape: {
-    borderRadius: 14
+    borderRadius: 16
   },
   typography: {
     fontFamily: `"IBM Plex Sans", "Inter", sans-serif`,
@@ -66,112 +80,36 @@ const theme = createTheme({
 
 type SelectionMode = "waypoints" | "point";
 type PointHeadingMode = "current" | "path" | "custom";
-type LocalizationStatus = "localized" | "not_localized" | "unknown";
-type MapSurfaceStatus = "live" | "catalog" | "unavailable";
-type SystemStatusSeverity = "success" | "info" | "warning";
-type ConnectionPhase = "connecting" | "ready" | "failed";
-type ConnectionStepStatus = "pending" | "complete" | "failed";
 type Selection =
   | { kind: "waypoint"; mapUuid: string; waypoint: GraphNavOverlayWaypoint }
   | { kind: "point"; mapUuid: string; target: TargetPose; headingMode: PointHeadingMode };
 
-const LIVE_MAP_VIEW_MAX_AGE_MS = 20000;
-const FORMANT_BACKEND_MAX_AGE_MS = TELEMETRY_POLL_INTERVAL_MS * 3;
-const REALTIME_CONNECTION_MAX_AGE_MS = 12000;
-const LIVE_SESSION_MAX_AGE_MS = 15000;
-const INITIAL_CONNECT_TIMEOUT_MS = 10000;
-const RECONNECT_TIMEOUT_MS = 10000;
-const LOG_PREFIX = "[spot-nav]";
+const panelSurfaceSx = {
+  backdropFilter: "blur(18px)",
+  backgroundColor: "rgba(10, 19, 27, 0.88)",
+  border: "1px solid rgba(255,255,255,0.06)",
+  boxShadow: "0 18px 54px rgba(0,0,0,0.28)"
+} as const;
 
-interface AsyncHealthState {
-  status: "idle" | "pending" | "ready" | "failed";
-  lastSuccessAt?: number;
-  error?: string;
+const cardSx = {
+  p: 1.5,
+  borderRadius: 3,
+  backgroundColor: "rgba(255,255,255,0.03)",
+  border: "1px solid rgba(255,255,255,0.06)"
+} as const;
+
+function roundCoord(value: number): number {
+  return Math.round(value * 100);
 }
 
-interface ConnectionScreenState {
-  phase: ConnectionPhase;
-  title: string;
-  detail: string;
-  steps: Array<{
-    label: string;
-    detail: string;
-    status: ConnectionStepStatus;
-  }>;
-}
-
-interface ConnectionHealth {
-  formantBackendHealthy: boolean;
-  realtimeTransportHealthy: boolean;
-  realtimeConnectionFresh: boolean;
-  liveMapHealthy: boolean;
-  liveNavigationDataHealthy: boolean;
-  catalogHealthy: boolean;
-  transportReady: boolean;
-}
-
-function getWaypointKey(waypoint: GraphNavOverlayWaypoint): string {
-  return waypoint.id || waypoint.name;
-}
-
-function isFresh(timestamp: number | undefined, maxAgeMs: number, now = Date.now()): boolean {
-  return Boolean(timestamp && now - timestamp <= maxAgeMs);
-}
-
-function deriveConnectionHealth(
-  now: number,
-  snapshot: StreamSnapshot,
-  bootstrapState: AsyncHealthState,
-  telemetryState: AsyncHealthState
-): ConnectionHealth {
-  const formantBackendHealthy =
-    bootstrapState.status === "ready" &&
-    Boolean(
-      telemetryState.lastSuccessAt &&
-        now - telemetryState.lastSuccessAt <= FORMANT_BACKEND_MAX_AGE_MS
-    );
-  const realtimeTransportHealthy = isFresh(
-    snapshot.realtimeActivityTime,
-    REALTIME_CONNECTION_MAX_AGE_MS,
-    now
-  );
-  const realtimeConnectionFresh = isFresh(
-    snapshot.realtimeConnectionStateTime,
-    REALTIME_CONNECTION_MAX_AGE_MS,
-    now
-  );
-  const liveMapHealthy = isFresh(
-    snapshot.mapImageRealtimeTime,
-    LIVE_SESSION_MAX_AGE_MS,
-    now
-  );
-  const liveNavigationDataHealthy = [
-    snapshot.navStateRealtimeTime,
-    snapshot.mapImageMetadataRealtimeTime,
-    snapshot.overlayRealtimeTime
-  ].some((timestamp) => isFresh(timestamp, LIVE_SESSION_MAX_AGE_MS, now));
-  const catalogHealthy = Boolean(
-    telemetryState.lastSuccessAt &&
-      now - telemetryState.lastSuccessAt <= FORMANT_BACKEND_MAX_AGE_MS
-  );
-
-  return {
-    formantBackendHealthy,
-    realtimeTransportHealthy,
-    realtimeConnectionFresh,
-    liveMapHealthy,
-    liveNavigationDataHealthy,
-    catalogHealthy,
-    transportReady:
-      bootstrapState.status === "ready" &&
-      realtimeTransportHealthy &&
-      liveMapHealthy
-  };
-}
-
-function formatPose(target?: TargetPose): string {
-  if (!target) return "No target selected";
-  return `x=${target.x.toFixed(2)} m, y=${target.y.toFixed(2)} m, yaw=${target.yawDeg.toFixed(1)} deg`;
+function getWaypointSignature(waypoint: GraphNavOverlayWaypoint): string {
+  return [
+    waypoint.id || "",
+    waypoint.name,
+    roundCoord(waypoint.x),
+    roundCoord(waypoint.y),
+    waypoint.is_dock ? 1 : 0
+  ].join("|");
 }
 
 function getCurrentWaypointLabel(snapshot: StreamSnapshot): string {
@@ -179,6 +117,11 @@ function getCurrentWaypointLabel(snapshot: StreamSnapshot): string {
   if (currentWaypointName) return currentWaypointName;
   if (!snapshot.navState?.localized) return "Not localized";
   return "No saved waypoint nearby";
+}
+
+function formatPose(target?: TargetPose): string {
+  if (!target) return "No target selected";
+  return `x=${target.x.toFixed(2)} m, y=${target.y.toFixed(2)} m, yaw=${target.yawDeg.toFixed(1)} deg`;
 }
 
 function getCurrentYawDeg(config: ModuleConfig, navState?: NavState): number {
@@ -201,451 +144,20 @@ function computePathYawDeg(navState: NavState | undefined, target: TargetPose): 
   return (Math.atan2(dy, dx) * 180) / Math.PI;
 }
 
-function statusTone(
-  value: string | undefined
-): "default" | "primary" | "secondary" | "warning" | "error" {
-  switch (value) {
-    case "connected":
-    case "undocked":
-    case "on":
-    case "standing":
-      return "secondary";
-    case "connecting":
-    case "docking":
-    case "undocking":
-    case "transition":
-    case "stepping":
-      return "warning";
-    case "disconnected":
-    case "error":
-      return "error";
-    case "docked":
-    case "off":
-    case "not_ready":
-      return "default";
-    default:
-      return "default";
-  }
-}
-
-function navLifecycleTone(
-  result: string | undefined
-): "default" | "primary" | "secondary" | "warning" | "error" {
-  switch (result) {
-    case "reached":
-    case "held_position":
-      return "secondary";
-    case "interrupted":
-      return "warning";
-    case "failed":
-      return "error";
-    default:
-      return "default";
-  }
-}
-
-function isBehaviorNavigationReady(value: string | undefined): boolean {
-  return value === "standing" || value === "stepping" || value === "transition";
-}
-
-function getLocalizationStatus(snapshot: StreamSnapshot): LocalizationStatus {
-  if (!isFresh(snapshot.navStateTime, 4000)) return "unknown";
-  return snapshot.navState?.localized ? "localized" : "not_localized";
-}
-
-function getMapSurfaceStatus(
-  snapshot: StreamSnapshot,
-  catalogCurrentMapId: string,
-  displayedMapUuid: string
-): MapSurfaceStatus {
-  if (displayedMapUuid && isFresh(snapshot.mapImageMetadataTime, LIVE_MAP_VIEW_MAX_AGE_MS)) {
-    return "live";
-  }
-  if (catalogCurrentMapId) return "catalog";
-  return "unavailable";
-}
-
-function buildConnectionScreenState(
-  now: number,
-  health: ConnectionHealth,
-  snapshot: StreamSnapshot,
-  bootstrapState: AsyncHealthState,
-  telemetryState: AsyncHealthState,
-  attemptStartedAt: number,
-  hasReachedReady: boolean
-): ConnectionScreenState {
-  const timeoutMs = hasReachedReady ? RECONNECT_TIMEOUT_MS : INITIAL_CONNECT_TIMEOUT_MS;
-  const timedOut = now - attemptStartedAt >= timeoutMs;
-  const steps: ConnectionScreenState["steps"] = [
-    {
-      label: "Formant backend",
-      detail: health.formantBackendHealthy
-        ? "Authenticated and device state loaded."
-        : bootstrapState.status === "pending"
-          ? "Authenticating and loading device context."
-          : "Waiting for a healthy backend session.",
-      status: health.formantBackendHealthy ? "complete" : "pending"
-    },
-    {
-      label: "Live session",
-      detail: health.realtimeTransportHealthy
-        ? "Realtime transport is active."
-        : "Starting the realtime connection.",
-      status: health.realtimeTransportHealthy ? "complete" : "pending"
-    },
-    {
-      label: "Map video",
-      detail: health.liveMapHealthy
-        ? "Receiving live map video."
-        : "Waiting for the first live map frame.",
-      status: health.liveMapHealthy ? "complete" : "pending"
-    },
-    {
-      label: "Navigation data",
-      detail: health.liveNavigationDataHealthy
-        ? "Navigation metadata is available."
-        : "Waiting for live navigation metadata.",
-      status: health.liveNavigationDataHealthy ? "complete" : "pending"
-    },
-    {
-      label: "Catalog state",
-      detail: health.catalogHealthy
-        ? "Saved maps and sidebar state are available."
-        : "Waiting for telemetry-backed catalog data.",
-      status: health.catalogHealthy ? "complete" : "pending"
-    }
-  ];
-
-  if (health.transportReady) {
-    return {
-      phase: "ready",
-      title: "Connected",
-      detail: "Formant and the live robot session are healthy.",
-      steps
-    };
-  }
-
-  if (bootstrapState.status === "failed") {
-    return {
-      phase: "failed",
-      title: "Could not connect to Formant",
-      detail:
-        bootstrapState.error ||
-        "Authentication or device bootstrap failed before the navigation session could start.",
-      steps: steps.map((step, index) =>
-        index === 0 ? { ...step, status: "failed" } : step
-      )
-    };
-  }
-
-  if (timedOut) {
-    if (bootstrapState.status !== "ready") {
-      return {
-        phase: "failed",
-        title: "Formant connection failed",
-        detail:
-          telemetryState.error ||
-          "The module could not confirm a healthy connection to the Formant API backend.",
-        steps: steps.map((step, index) =>
-          index === 0 && step.status !== "complete"
-            ? { ...step, status: "failed" }
-            : step
-        )
-      };
-    }
-
-    if (!health.realtimeTransportHealthy) {
-      return {
-        phase: "failed",
-        title: "Live robot connection timed out",
-        detail: "The realtime transport never became active.",
-        steps: steps.map((step, index) =>
-          index === 1 && step.status !== "complete"
-            ? { ...step, status: "failed" }
-            : step
-        )
-      };
-    }
-
-    if (health.realtimeConnectionFresh &&
-        snapshot.realtimeConnectionState !== "connected") {
-      return {
-        phase: "failed",
-        title: "Robot is not connected",
-        detail:
-          "Formant is reachable, but the robot reported a disconnected live state.",
-        steps: steps.map((step, index) =>
-          index === 1 && step.status !== "complete"
-            ? { ...step, status: "failed" }
-            : step
-        )
-      };
-    }
-
-    return {
-      phase: "failed",
-      title: "Live map video is unavailable",
-      detail: "The realtime session connected, but the live map video did not arrive in time.",
-      steps: steps.map((step, index) =>
-        index === 2 && step.status !== "complete"
-          ? { ...step, status: "failed" }
-          : step
-      )
-    };
-  }
-
-  if (bootstrapState.status !== "ready") {
-    return {
-      phase: "connecting",
-      title: "Connecting to Formant",
-      detail:
-        telemetryState.status === "pending"
-          ? "Checking the Formant API backend and loading the latest device state."
-          : "Waiting for a healthy Formant backend connection.",
-      steps
-      };
-  }
-
-  if (!health.realtimeTransportHealthy) {
-    return {
-      phase: "connecting",
-      title: "Connecting to live robot session",
-      detail: "Waiting for the realtime session to become active.",
-      steps
-    };
-  }
-
-  if (
-    health.realtimeConnectionFresh &&
-    snapshot.realtimeConnectionState !== "connected"
-  ) {
-    return {
-      phase: "connecting",
-      title: "Waiting for robot connection",
-      detail:
-        "Formant is reachable, but the robot has not reported a healthy live connection yet.",
-      steps
-    };
-  }
-
-  return {
-    phase: "connecting",
-    title: health.liveNavigationDataHealthy
-      ? "Starting live navigation session"
-      : "Receiving navigation data",
-    detail:
-      health.liveNavigationDataHealthy
-        ? "The live map is ready. Finalizing the navigation session."
-        : "The live map is ready. Waiting for navigation metadata before enabling the full interface.",
-    steps
-  };
-}
-
-function buildSystemStatus(
-  snapshot: StreamSnapshot,
-  catalogCurrentMapId: string,
-  displayedMapUuid: string
-): { title: string; detail: string; severity: SystemStatusSeverity } {
-  const connectionFresh = isFresh(snapshot.connectionStateTime, 45000);
-  const dockingFresh = isFresh(snapshot.dockingStateTime, 45000);
-  const motorFresh = isFresh(snapshot.motorPowerStateTime, 45000);
-  const behaviorFresh = isFresh(snapshot.behaviorStateTime, 45000);
-  const navFresh = isFresh(snapshot.navStateTime, 4000);
-  const mapImageFresh = isFresh(snapshot.mapImageTime, LIVE_MAP_VIEW_MAX_AGE_MS);
-  const mapMetadataFresh = isFresh(snapshot.mapImageMetadataTime, LIVE_MAP_VIEW_MAX_AGE_MS);
-  const localizationStatus = getLocalizationStatus(snapshot);
-  const mapSurfaceStatus = getMapSurfaceStatus(snapshot, catalogCurrentMapId, displayedMapUuid);
-
-  if (!catalogCurrentMapId && mapSurfaceStatus === "unavailable") {
-    return {
-      title: "No map selected",
-      detail: "Load a saved map to browse it or prepare navigation.",
-      severity: "warning"
-    };
-  }
-
-  if (mapSurfaceStatus !== "live") {
-    if (mapImageFresh && !mapMetadataFresh && catalogCurrentMapId) {
-      return {
-        title: "Live map visible",
-        detail: "Waiting for live map metadata before enabling precise navigation actions.",
-        severity: "info"
-      };
-    }
-    return {
-      title: "Map browsing available",
-      detail: "Saved maps are available, but the live map view is unavailable.",
-      severity: "info"
-    };
-  }
-
-  if (!connectionFresh || !navFresh) {
-    return {
-      title: "Waiting for live robot state",
-      detail: "The live map is visible, but robot state or navigation state is not current yet.",
-      severity: "info"
-    };
-  }
-
-  if (snapshot.connectionState !== "connected") {
-    return {
-      title: "Robot disconnected",
-      detail: "Reconnect the robot to enable live navigation actions.",
-      severity: "warning"
-    };
-  }
-
-  if (localizationStatus === "not_localized") {
-    return {
-      title: "Robot not localized",
-      detail: "Use GraphNav localization before sending navigation commands.",
-      severity: "warning"
-    };
-  }
-
-  if (dockingFresh && snapshot.dockingState === "docked") {
-    return {
-      title: "Robot docked",
-      detail: "Map management remains available. Undock to enable movement commands.",
-      severity: "info"
-    };
-  }
-
-  if (motorFresh && snapshot.motorPowerState !== "on") {
-    return {
-      title: "Robot idle",
-      detail: "Turn motor power on to enable movement commands.",
-      severity: "info"
-    };
-  }
-
-  if (behaviorFresh && !isBehaviorNavigationReady(snapshot.behaviorState)) {
-    return {
-      title: "Robot not ready to navigate",
-      detail: "Stand the robot before sending navigation commands.",
-      severity: "info"
-    };
-  }
-
-  return {
-    title: "Live navigation ready",
-    detail: "Live map, localization, and robot state are ready for navigation.",
-    severity: "success"
-  };
-}
-
-function buildBaseNavigationIssues(
-  snapshot: StreamSnapshot,
-  targetMapUuid: string,
-  requireLiveMapView: boolean
-): string[] {
-  const issues: string[] = [];
-  const connectionFresh = isFresh(snapshot.connectionStateTime, 45000);
-  const dockingFresh = isFresh(snapshot.dockingStateTime, 45000);
-  const motorFresh = isFresh(snapshot.motorPowerStateTime, 45000);
-  const behaviorFresh = isFresh(snapshot.behaviorStateTime, 45000);
-  const navFresh = isFresh(snapshot.navStateTime, 4000);
-  const mapFresh = isFresh(snapshot.mapImageMetadataTime, LIVE_MAP_VIEW_MAX_AGE_MS);
-
-  if (!targetMapUuid) {
-    issues.push("Selected map is unavailable.");
-  }
-  if (!connectionFresh) {
-    issues.push("Waiting for live robot connection.");
-  } else if (snapshot.connectionState !== "connected") {
-    issues.push("Robot is not connected.");
-  }
-
-  if (!navFresh) {
-    issues.push("Waiting for live navigation state.");
-  } else if (!snapshot.navState?.localized) {
-    issues.push("Robot is not localized.");
-  }
-
-  if (!motorFresh || !dockingFresh || !behaviorFresh) {
-    issues.push("Waiting for live robot state.");
-  } else {
-    if (snapshot.dockingState === "docked") issues.push("Undock the robot first.");
-    if (snapshot.motorPowerState !== "on") issues.push("Turn motor power on.");
-    if (!isBehaviorNavigationReady(snapshot.behaviorState)) {
-      issues.push("Stand the robot before navigating.");
-    }
-  }
-
-  if (requireLiveMapView && !mapFresh) {
-    if (isFresh(snapshot.mapImageTime, LIVE_MAP_VIEW_MAX_AGE_MS)) {
-      issues.push("Live map metadata is unavailable.");
-    } else {
-      issues.push("Live map view is unavailable.");
-    }
-  }
-
-  return issues;
-}
-
-function buildWaypointNavigationIssues(
-  snapshot: StreamSnapshot,
-  selection: Extract<Selection, { kind: "waypoint" }>,
-  displayedMapUuid: string
-): string[] {
-  const issues = buildBaseNavigationIssues(
-    snapshot,
-    selection.mapUuid || displayedMapUuid,
-    false
-  );
-  if (!isFresh(snapshot.overlayTime, 15000)) {
-    issues.push("Waypoint list is stale.");
-  }
-  if (!snapshot.overlay) {
-    issues.push("Waypoint list is unavailable.");
-  } else if (!snapshot.overlay.waypoints.some((waypoint) => waypoint.name === selection.waypoint.name)) {
-    issues.push("Selected waypoint is no longer available.");
-  }
-  const overlayMapUuid = snapshot.overlay?.map_uuid || "";
-  if (selection.mapUuid && overlayMapUuid && selection.mapUuid !== overlayMapUuid) {
-    issues.push("Selected waypoint no longer matches the active map.");
-  }
-  return issues;
-}
-
-function buildPointNavigationIssues(
-  snapshot: StreamSnapshot,
-  selection: Extract<Selection, { kind: "point" }>,
-  displayedMapUuid: string
-): string[] {
-  const issues = buildBaseNavigationIssues(
-    snapshot,
-    selection.mapUuid || displayedMapUuid,
-    true
-  );
-  if (selection.mapUuid && displayedMapUuid && selection.mapUuid !== displayedMapUuid) {
-    issues.push("Selected point no longer matches the displayed map.");
-  }
-  return issues;
-}
-
-function buildWaypointSaveIssues(
-  snapshot: StreamSnapshot,
-  currentMapId: string
-): string[] {
-  const issues: string[] = [];
-  const connectionFresh = isFresh(snapshot.connectionStateTime, 45000);
-  if (!currentMapId) {
-    issues.push("Load a map before saving a waypoint.");
-  }
-  if (!connectionFresh) {
-    issues.push("Waiting for live robot connection.");
-  } else if (snapshot.connectionState !== "connected") {
-    issues.push("Robot is not connected.");
-  }
-  if (snapshot.navState?.active) {
-    issues.push("Finish the active navigation before saving a waypoint.");
-  }
-  return issues;
-}
-
 function uniqueIssues(issues: string[]): string[] {
-  return Array.from(new Set(issues));
+  return Array.from(new Set(issues.filter(Boolean)));
+}
+
+function dedupeWaypoints(waypoints: GraphNavOverlayWaypoint[]): GraphNavOverlayWaypoint[] {
+  const seen = new Set<string>();
+  const deduped: GraphNavOverlayWaypoint[] = [];
+  for (const waypoint of waypoints) {
+    const signature = getWaypointSignature(waypoint);
+    if (seen.has(signature)) continue;
+    seen.add(signature);
+    deduped.push(waypoint);
+  }
+  return deduped;
 }
 
 function clientToSvgPoint(
@@ -660,6 +172,402 @@ function clientToSvgPoint(
   if (!ctm) return null;
   const point = screenPoint.matrixTransform(ctm.inverse());
   return { x: point.x, y: point.y };
+}
+
+function fitRect(
+  containerWidth: number,
+  containerHeight: number,
+  aspectRatio: number,
+  padding = 28
+): { width: number; height: number } {
+  const availableWidth = Math.max(containerWidth - (padding * 2), 0);
+  const availableHeight = Math.max(containerHeight - (padding * 2), 0);
+  if (!availableWidth || !availableHeight || !Number.isFinite(aspectRatio) || aspectRatio <= 0) {
+    return { width: 0, height: 0 };
+  }
+
+  let width = availableWidth;
+  let height = width / aspectRatio;
+  if (height > availableHeight) {
+    height = availableHeight;
+    width = height * aspectRatio;
+  }
+
+  return {
+    width: Math.max(width, 0),
+    height: Math.max(height, 0)
+  };
+}
+
+function useElementSize<T extends HTMLElement>() {
+  const ref = useRef<T | null>(null);
+  const [size, setSize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return undefined;
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      setSize({
+        width: entry.contentRect.width,
+        height: entry.contentRect.height
+      });
+    });
+
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  return [ref, size] as const;
+}
+
+function navLifecycleTone(
+  result: string | undefined
+): "default" | "secondary" | "warning" | "error" {
+  switch (result) {
+    case "reached":
+    case "held_position":
+      return "secondary";
+    case "interrupted":
+      return "warning";
+    case "failed":
+      return "error";
+    default:
+      return "default";
+  }
+}
+
+function buildBaseNavigationIssues(
+  snapshot: StreamSnapshot,
+  currentMapUuid: string,
+  preciseMapReady: boolean,
+  requirePreciseMap: boolean,
+  now: number
+): string[] {
+  const issues: string[] = [];
+  const navFresh = isFresh(snapshot.navStateTime, NAV_STATE_MAX_AGE_MS, now);
+
+  if (!currentMapUuid) {
+    issues.push("No live map is available for navigation.");
+  }
+
+  if (!isFresh(snapshot.connectionStateTime, ROBOT_STATE_MAX_AGE_MS, now)) {
+    issues.push("Waiting for the robot connection state.");
+  } else if (snapshot.connectionState !== "connected") {
+    issues.push("Robot is not connected.");
+  }
+
+  if (!navFresh) {
+    issues.push("Waiting for live navigation state.");
+  } else if (!snapshot.navState?.localized) {
+    issues.push("Robot is not localized.");
+  }
+
+  if (!isFresh(snapshot.dockingStateTime, ROBOT_STATE_MAX_AGE_MS, now)) {
+    issues.push("Waiting for docking state.");
+  } else if (snapshot.dockingState === "docked") {
+    issues.push("Robot is docked.");
+  }
+
+  if (!isFresh(snapshot.motorPowerStateTime, ROBOT_STATE_MAX_AGE_MS, now)) {
+    issues.push("Waiting for motor power state.");
+  } else if (snapshot.motorPowerState !== "on") {
+    issues.push("Motor power is off.");
+  }
+
+  if (!isFresh(snapshot.behaviorStateTime, ROBOT_STATE_MAX_AGE_MS, now)) {
+    issues.push("Waiting for behavior state.");
+  } else if (!isBehaviorNavigationReady(snapshot.behaviorState)) {
+    issues.push("Robot is not in a navigation-ready stance.");
+  }
+
+  if (requirePreciseMap && !preciseMapReady) {
+    issues.push("Precise map metadata is still syncing.");
+  }
+
+  return issues;
+}
+
+function buildWaypointNavigationIssues(
+  snapshot: StreamSnapshot,
+  selection: Extract<Selection, { kind: "waypoint" }>,
+  currentMapUuid: string,
+  overlayWaypoints: GraphNavOverlayWaypoint[],
+  now: number
+): string[] {
+  const issues = buildBaseNavigationIssues(snapshot, currentMapUuid, true, false, now);
+
+  if (!isFresh(snapshot.overlayTime, ROBOT_STATE_MAX_AGE_MS, now)) {
+    issues.push("Saved waypoint data is stale.");
+  }
+
+  const selectedSignature = getWaypointSignature(selection.waypoint);
+  const waypointStillPresent = overlayWaypoints.some(
+    (waypoint) => getWaypointSignature(waypoint) === selectedSignature
+  );
+  if (!waypointStillPresent) {
+    issues.push("Selected waypoint is no longer available.");
+  }
+
+  const overlayMapUuid = snapshot.overlay?.map_uuid || "";
+  if (selection.mapUuid && overlayMapUuid && selection.mapUuid !== overlayMapUuid) {
+    issues.push("Selected waypoint no longer matches the active map.");
+  }
+
+  return issues;
+}
+
+function buildPointNavigationIssues(
+  snapshot: StreamSnapshot,
+  selection: Extract<Selection, { kind: "point" }>,
+  currentMapUuid: string,
+  preciseMapReady: boolean,
+  now: number
+): string[] {
+  const issues = buildBaseNavigationIssues(
+    snapshot,
+    currentMapUuid,
+    preciseMapReady,
+    true,
+    now
+  );
+
+  if (selection.mapUuid && currentMapUuid && selection.mapUuid !== currentMapUuid) {
+    issues.push("Selected point no longer matches the displayed map.");
+  }
+
+  return issues;
+}
+
+function buildWaypointSaveIssues(
+  snapshot: StreamSnapshot,
+  currentMapId: string,
+  now: number
+): string[] {
+  const issues: string[] = [];
+  if (!currentMapId) {
+    issues.push("Load a map before saving a waypoint.");
+  }
+  if (!isFresh(snapshot.connectionStateTime, ROBOT_STATE_MAX_AGE_MS, now)) {
+    issues.push("Waiting for the robot connection.");
+  } else if (snapshot.connectionState !== "connected") {
+    issues.push("Robot is not connected.");
+  }
+  if (snapshot.navState?.active) {
+    issues.push("Finish the active navigation before saving a waypoint.");
+  }
+  return issues;
+}
+
+interface SectionCardProps {
+  title: string;
+  subtitle?: string;
+  actions?: ReactNode;
+  children: ReactNode;
+}
+
+function SectionCard({ title, subtitle, actions, children }: SectionCardProps) {
+  return (
+    <Box sx={cardSx}>
+      <Stack spacing={1.25}>
+        <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
+          <Stack spacing={0.35} sx={{ minWidth: 0 }}>
+            <Typography variant="subtitle2">{title}</Typography>
+            {subtitle ? (
+              <Typography variant="caption" color="text.secondary">
+                {subtitle}
+              </Typography>
+            ) : null}
+          </Stack>
+          {actions}
+        </Stack>
+        {children}
+      </Stack>
+    </Box>
+  );
+}
+
+function StatusTile({
+  label,
+  value,
+  tone
+}: {
+  label: string;
+  value: string;
+  tone: "good" | "neutral" | "caution" | "bad";
+}) {
+  const toneColor =
+    tone === "good"
+      ? alpha("#89f3c7", 0.16)
+      : tone === "caution"
+        ? alpha("#ffb44d", 0.14)
+        : tone === "bad"
+          ? alpha("#ff6c7b", 0.14)
+          : "rgba(255,255,255,0.04)";
+
+  return (
+    <Box
+      sx={{
+        px: 1.2,
+        py: 1,
+        borderRadius: 2,
+        border: "1px solid rgba(255,255,255,0.06)",
+        backgroundColor: toneColor
+      }}
+    >
+      <Typography variant="caption" color="text.secondary">
+        {label}
+      </Typography>
+      <Typography variant="body2" sx={{ fontWeight: 600 }}>
+        {value}
+      </Typography>
+    </Box>
+  );
+}
+
+function ModeSelector({
+  value,
+  onChange
+}: {
+  value: SelectionMode;
+  onChange: (value: SelectionMode) => void;
+}) {
+  return (
+    <Stack
+      direction="row"
+      spacing={0.75}
+      sx={{
+        p: 0.5,
+        borderRadius: 2,
+        bgcolor: "rgba(255,255,255,0.03)",
+        border: "1px solid rgba(255,255,255,0.06)"
+      }}
+    >
+      {([
+        ["waypoints", "Waypoints"],
+        ["point", "Point"]
+      ] as const).map(([mode, label]) => {
+        const selected = value === mode;
+        return (
+          <Button
+            key={mode}
+            fullWidth
+            variant={selected ? "contained" : "text"}
+            color={selected ? "primary" : "inherit"}
+            onClick={() => onChange(mode)}
+            sx={{
+              minHeight: 40,
+              color: selected ? undefined : "text.secondary",
+              bgcolor: selected ? undefined : "transparent"
+            }}
+          >
+            {label}
+          </Button>
+        );
+      })}
+    </Stack>
+  );
+}
+
+function ConnectionScreen({
+  state,
+  onRetry
+}: {
+  state: ConnectionScreenState;
+  onRetry: () => void;
+}) {
+  return (
+    <Box
+      sx={{
+        width: "100%",
+        height: "100%",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        px: 3
+      }}
+    >
+      <Stack spacing={2.5} sx={{ width: "min(460px, 100%)", textAlign: "center" }}>
+        <Box sx={{ height: 48, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          {state.phase === "connecting" ? (
+            <CircularProgress size={34} color="primary" />
+          ) : (
+            <Box
+              sx={{
+                width: 38,
+                height: 38,
+                borderRadius: "50%",
+                border: "2px solid rgba(255,255,255,0.22)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: 22,
+                fontWeight: 700,
+                color: "warning.main"
+              }}
+            >
+              !
+            </Box>
+          )}
+        </Box>
+
+        <Stack spacing={1}>
+          <Typography variant="h6">{state.title}</Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ minHeight: 40 }}>
+            {state.detail}
+          </Typography>
+        </Stack>
+
+        <Stack spacing={1}>
+          {state.steps.map((step) => (
+            <Box
+              key={step.label}
+              sx={{
+                p: 1.15,
+                borderRadius: 2,
+                textAlign: "left",
+                border: "1px solid rgba(255,255,255,0.06)",
+                backgroundColor: "rgba(255,255,255,0.03)"
+              }}
+            >
+              <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                <Typography variant="subtitle2">{step.label}</Typography>
+                <Chip
+                  size="small"
+                  label={
+                    step.status === "complete"
+                      ? "Ready"
+                      : step.status === "failed"
+                        ? "Failed"
+                        : "Waiting"
+                  }
+                  color={
+                    step.status === "complete"
+                      ? "secondary"
+                      : step.status === "failed"
+                        ? "warning"
+                        : "default"
+                  }
+                  variant={step.status === "complete" ? "filled" : "outlined"}
+                />
+              </Stack>
+              <Typography variant="caption" color="text.secondary">
+                {step.detail}
+              </Typography>
+            </Box>
+          ))}
+        </Stack>
+
+        {state.phase === "failed" ? (
+          <Button variant="contained" onClick={onRetry} sx={{ alignSelf: "center", minWidth: 120 }}>
+            Retry
+          </Button>
+        ) : null}
+      </Stack>
+    </Box>
+  );
 }
 
 interface PoseMarkerProps {
@@ -681,37 +589,42 @@ function PoseMarker({ x, y, yawRad, fill, outline, size = 14 }: PoseMarkerProps)
   );
 }
 
-interface MapViewProps {
+interface MapStageProps {
   snapshot: StreamSnapshot;
   selectionMode: SelectionMode;
   selection?: Selection;
-  showWaypointLabels: boolean;
+  waypoints: GraphNavOverlayWaypoint[];
+  labeledWaypointKeys: Set<string>;
   onSelectWaypoint: (waypoint: GraphNavOverlayWaypoint) => void;
   onSelectPoint: (target: TargetPose) => void;
 }
 
-function MapView({
+function MapStage({
   snapshot,
   selectionMode,
   selection,
-  showWaypointLabels,
+  waypoints,
+  labeledWaypointKeys,
   onSelectWaypoint,
   onSelectPoint
-}: MapViewProps) {
+}: MapStageProps) {
+  const [containerRef, containerSize] = useElementSize<HTMLDivElement>();
   const overlayRef = useRef<SVGSVGElement | null>(null);
-  const realtimeCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const canvas = getCanvasSize(snapshot.mapImageMetadata);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const canvasSize = getCanvasSize(snapshot.mapImageMetadata);
+  const aspectRatio = canvasSize.x / canvasSize.y;
+  const stageSize = fitRect(containerSize.width, containerSize.height, aspectRatio, 32);
 
   useEffect(() => {
-    if (!snapshot.mapImageCanvas || !realtimeCanvasRef.current) return;
-    const target = realtimeCanvasRef.current;
+    if (!snapshot.mapImageCanvas || !canvasRef.current) return;
+    const target = canvasRef.current;
     target.width = snapshot.mapImageCanvas.width;
     target.height = snapshot.mapImageCanvas.height;
     const context = target.getContext("2d");
     context?.drawImage(snapshot.mapImageCanvas, 0, 0);
   }, [snapshot.mapImageCanvas, snapshot.mapImageFrameVersion]);
 
-  const waypointPixels = (snapshot.overlay?.waypoints || [])
+  const waypointPixels = waypoints
     .map((waypoint) => {
       const point = seedToPixel(snapshot.mapImageMetadata, waypoint.x, waypoint.y);
       return point ? { waypoint, point } : null;
@@ -723,8 +636,9 @@ function MapView({
 
   const handleMapClick = (event: React.MouseEvent<SVGSVGElement>) => {
     if (selectionMode !== "point") return;
+    if (!snapshot.mapImageMetadata) return;
     const svg = overlayRef.current;
-    if (!svg || !snapshot.mapImageMetadata) return;
+    if (!svg) return;
     const point = clientToSvgPoint(svg, event.clientX, event.clientY);
     if (!point) return;
     const seed = pixelToSeed(snapshot.mapImageMetadata, point.x, point.y);
@@ -770,280 +684,169 @@ function MapView({
 
   return (
     <Box
+      ref={containerRef}
       sx={{
         position: "relative",
         flex: 1,
         minHeight: 0,
         overflow: "hidden",
-        background:
-          "radial-gradient(circle at top, rgba(43,182,255,0.09), rgba(9,19,27,0.96) 52%)"
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: `linear-gradient(180deg, ${MAP_STAGE_BACKGROUND}, ${MAP_SURFACE_BACKGROUND})`
       }}
     >
-      {snapshot.mapImageCanvas ? (
-        <canvas
-          ref={realtimeCanvasRef}
-          style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
-        />
-      ) : (
-        <Stack
-          alignItems="center"
-          justifyContent="center"
-          sx={{ position: "absolute", inset: 0, textAlign: "center", p: 3 }}
-          spacing={1}
-        >
-          <Typography variant="h6">
-            {snapshot.mapImageMetadata?.status_title || "Waiting for GraphNav map"}
-          </Typography>
-          <Typography variant="body2" color="text.secondary">
-            {snapshot.mapImageMetadata?.status_detail ||
-              "The adapter has not published the global map image yet."}
-          </Typography>
-        </Stack>
-      )}
-
-      <svg
-        ref={overlayRef}
-        viewBox={`0 0 ${canvas.x} ${canvas.y}`}
-        onClick={handleMapClick}
-        style={{
-          position: "absolute",
-          inset: 0,
-          width: "100%",
-          height: "100%",
-          cursor: selectionMode === "point" ? "crosshair" : "default"
+      <Box
+        sx={{
+          position: "relative",
+          width: `${stageSize.width}px`,
+          height: `${stageSize.height}px`,
+          maxWidth: "100%",
+          maxHeight: "100%",
+          borderRadius: 3,
+          overflow: "hidden",
+          backgroundColor: MAP_SURFACE_BACKGROUND,
+          boxShadow: "0 28px 72px rgba(0,0,0,0.28)"
         }}
       >
-        {snapshot.mapImageMetadata?.draw_rect ? (
-          <rect
-            x={snapshot.mapImageMetadata.draw_rect.x}
-            y={snapshot.mapImageMetadata.draw_rect.y}
-            width={snapshot.mapImageMetadata.draw_rect.width}
-            height={snapshot.mapImageMetadata.draw_rect.height}
-            fill="none"
-            stroke="rgba(255,255,255,0.13)"
-            strokeDasharray="6 6"
+        {snapshot.mapImageCanvas ? (
+          <canvas
+            ref={canvasRef}
+            style={{ width: "100%", height: "100%", display: "block" }}
           />
-        ) : null}
+        ) : (
+          <Stack
+            alignItems="center"
+            justifyContent="center"
+            sx={{ position: "absolute", inset: 0, textAlign: "center", p: 3 }}
+            spacing={1}
+          >
+            <Typography variant="h6">
+              {snapshot.mapImageMetadata?.status_title || "Waiting for GraphNav map"}
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              {snapshot.mapImageMetadata?.status_detail ||
+                "The adapter has not published the global map image yet."}
+            </Typography>
+          </Stack>
+        )}
 
-        {waypointPixels.map(({ waypoint, point }) => {
-          const isCurrent =
-            snapshot.overlay?.current_waypoint_name === waypoint.name ||
-            (waypoint.id && snapshot.overlay?.current_waypoint_id === waypoint.id);
-          const isSelected =
-            selection?.kind === "waypoint" && selection.waypoint.name === waypoint.name;
-          return (
-            <g
-              key={getWaypointKey(waypoint)}
-              onClick={(event) => {
-                event.stopPropagation();
-                onSelectWaypoint(waypoint);
-              }}
-              style={{ cursor: "pointer" }}
-            >
-              {isCurrent ? (
+        <svg
+          ref={overlayRef}
+          viewBox={`0 0 ${canvasSize.x} ${canvasSize.y}`}
+          onClick={handleMapClick}
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            cursor: selectionMode === "point" ? "crosshair" : "default"
+          }}
+        >
+          {waypointPixels.map(({ waypoint, point }) => {
+            const waypointSignature = getWaypointSignature(waypoint);
+            const currentWaypointMatches =
+              (waypoint.id && snapshot.overlay?.current_waypoint_id === waypoint.id) ||
+              snapshot.overlay?.current_waypoint_name === waypoint.name;
+            const isSelected =
+              selection?.kind === "waypoint" &&
+              getWaypointSignature(selection.waypoint) === waypointSignature;
+            const showLabel = labeledWaypointKeys.has(waypointSignature);
+
+            return (
+              <g
+                key={waypointSignature}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onSelectWaypoint(waypoint);
+                }}
+                style={{ cursor: "pointer" }}
+              >
+                {currentWaypointMatches ? (
+                  <circle
+                    cx={point.x}
+                    cy={point.y}
+                    r={waypoint.is_dock ? 12 : 10}
+                    fill="rgba(137,243,199,0.18)"
+                  />
+                ) : null}
                 <circle
                   cx={point.x}
                   cy={point.y}
-                  r={waypoint.is_dock ? 12 : 10}
-                  fill="rgba(137,243,199,0.18)"
+                  r={isSelected ? 9 : waypoint.is_dock ? 7 : 5.5}
+                  fill={waypoint.is_dock ? "#ffb44d" : "#2bb6ff"}
+                  stroke={isSelected ? "#ffffff" : "rgba(255,255,255,0.82)"}
+                  strokeWidth={isSelected ? 2.2 : 1.4}
                 />
-              ) : null}
+                {showLabel && waypoint.name.trim() ? (
+                  <text
+                    x={point.x + 10}
+                    y={point.y - 8}
+                    fill="white"
+                    fontSize="13"
+                    fontFamily="IBM Plex Sans, sans-serif"
+                    stroke="rgba(9,19,27,0.94)"
+                    strokeWidth="3"
+                    paintOrder="stroke"
+                  >
+                    {waypoint.name}
+                  </text>
+                ) : null}
+              </g>
+            );
+          })}
+
+          {robotPixel && typeof snapshot.navState?.current_seed_yaw_rad === "number" ? (
+            <PoseMarker
+              x={robotPixel.x}
+              y={robotPixel.y}
+              yawRad={snapshot.navState.current_seed_yaw_rad}
+              fill="#89f3c7"
+              outline="#071218"
+            />
+          ) : null}
+
+          {activeTargetPixel && typeof snapshot.navState?.target_seed_yaw_rad === "number" ? (
+            <PoseMarker
+              x={activeTargetPixel.x}
+              y={activeTargetPixel.y}
+              yawRad={snapshot.navState.target_seed_yaw_rad}
+              fill="#ff8f5a"
+              outline="#251208"
+              size={12}
+            />
+          ) : null}
+
+          {selectedPixel ? (
+            <g>
               <circle
-                cx={point.x}
-                cy={point.y}
-                r={isSelected ? 9 : waypoint.is_dock ? 7 : 5.5}
-                fill={waypoint.is_dock ? "#ffb44d" : "#2bb6ff"}
-                stroke={isSelected ? "#ffffff" : "rgba(255,255,255,0.82)"}
-                strokeWidth={isSelected ? 2.2 : 1.4}
+                cx={selectedPixel.x}
+                cy={selectedPixel.y}
+                r="12"
+                fill="none"
+                stroke="#ffffff"
+                strokeWidth="2"
               />
-              {showWaypointLabels && waypoint.name.trim() ? (
-                <text
-                  x={point.x + 10}
-                  y={point.y - 8}
-                  fill="white"
-                  fontSize="13"
-                  fontFamily="IBM Plex Sans, sans-serif"
-                  stroke="rgba(9,19,27,0.92)"
-                  strokeWidth="3"
-                  paintOrder="stroke"
-                >
-                  {waypoint.name}
-                </text>
-              ) : null}
+              <line
+                x1={selectedPixel.x - 14}
+                y1={selectedPixel.y}
+                x2={selectedPixel.x + 14}
+                y2={selectedPixel.y}
+                stroke="#ffffff"
+                strokeWidth="2"
+              />
+              <line
+                x1={selectedPixel.x}
+                y1={selectedPixel.y - 14}
+                x2={selectedPixel.x}
+                y2={selectedPixel.y + 14}
+                stroke="#ffffff"
+                strokeWidth="2"
+              />
             </g>
-          );
-        })}
-
-        {robotPixel && typeof snapshot.navState?.current_seed_yaw_rad === "number" ? (
-          <PoseMarker
-            x={robotPixel.x}
-            y={robotPixel.y}
-            yawRad={snapshot.navState.current_seed_yaw_rad}
-            fill="#89f3c7"
-            outline="#071218"
-          />
-        ) : null}
-
-        {activeTargetPixel && typeof snapshot.navState?.target_seed_yaw_rad === "number" ? (
-          <PoseMarker
-            x={activeTargetPixel.x}
-            y={activeTargetPixel.y}
-            yawRad={snapshot.navState.target_seed_yaw_rad}
-            fill="#ff8f5a"
-            outline="#251208"
-            size={12}
-          />
-        ) : null}
-
-        {selectedPixel ? (
-          <g>
-            <circle
-              cx={selectedPixel.x}
-              cy={selectedPixel.y}
-              r="12"
-              fill="none"
-              stroke="#ffffff"
-              strokeWidth="2"
-            />
-            <line
-              x1={selectedPixel.x - 14}
-              y1={selectedPixel.y}
-              x2={selectedPixel.x + 14}
-              y2={selectedPixel.y}
-              stroke="#ffffff"
-              strokeWidth="2"
-            />
-            <line
-              x1={selectedPixel.x}
-              y1={selectedPixel.y - 14}
-              x2={selectedPixel.x}
-              y2={selectedPixel.y + 14}
-              stroke="#ffffff"
-              strokeWidth="2"
-            />
-          </g>
-        ) : null}
-      </svg>
-    </Box>
-  );
-}
-
-const panelSurfaceSx = {
-  backdropFilter: "blur(18px)",
-  backgroundColor: "rgba(10, 19, 27, 0.82)",
-  border: "1px solid rgba(255,255,255,0.06)",
-  boxShadow: "0 18px 54px rgba(0,0,0,0.26)"
-} as const;
-
-function ConnectionScreen({
-  state,
-  onRetry
-}: {
-  state: ConnectionScreenState;
-  onRetry: () => void;
-}) {
-  return (
-    <Box sx={{ position: "relative", width: "100%", height: "100%", px: 3 }}>
-      <Box
-        sx={{
-          position: "absolute",
-          top: "50%",
-          left: "50%",
-          transform: "translate(-50%, -50%)",
-          width: 52,
-          height: 52,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center"
-        }}
-      >
-        {state.phase === "connecting" ? (
-          <CircularProgress size={32} color="primary" />
-        ) : (
-          <Box
-            sx={{
-              width: 34,
-              height: 34,
-              borderRadius: "50%",
-              border: "2px solid rgba(255,255,255,0.24)",
-              color: "warning.main",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              fontWeight: 700,
-              fontSize: 20
-            }}
-          >
-            !
-          </Box>
-        )}
+          ) : null}
+        </svg>
       </Box>
-
-      <Stack
-        spacing={1.5}
-        sx={{
-          position: "absolute",
-          top: "calc(50% + 56px)",
-          left: "50%",
-          transform: "translateX(-50%)",
-          width: "min(420px, calc(100% - 32px))",
-          textAlign: "center"
-        }}
-      >
-        <Typography variant="h6">{state.title}</Typography>
-        <Typography
-          variant="body2"
-          color="text.secondary"
-          sx={{ minHeight: 40, maxWidth: 420, mx: "auto" }}
-        >
-          {state.detail}
-        </Typography>
-
-        <Stack spacing={1} sx={{ textAlign: "left" }}>
-          {state.steps.map((step) => (
-            <Box
-              key={step.label}
-              sx={{
-                p: 1.15,
-                borderRadius: 1.5,
-                bgcolor: "rgba(255,255,255,0.03)",
-                border: "1px solid rgba(255,255,255,0.06)"
-              }}
-            >
-              <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
-                <Typography variant="subtitle2">{step.label}</Typography>
-                <Chip
-                  size="small"
-                  label={
-                    step.status === "complete"
-                      ? "Ready"
-                      : step.status === "failed"
-                        ? "Failed"
-                        : "Waiting"
-                  }
-                  color={
-                    step.status === "complete"
-                      ? "secondary"
-                      : step.status === "failed"
-                        ? "warning"
-                        : "default"
-                  }
-                  variant={step.status === "complete" ? "filled" : "outlined"}
-                />
-              </Stack>
-              <Typography variant="caption" color="text.secondary">
-                {step.detail}
-              </Typography>
-            </Box>
-          ))}
-        </Stack>
-
-        {state.phase === "failed" ? (
-          <Button variant="contained" onClick={onRetry} sx={{ alignSelf: "center", mt: 0.5 }}>
-            Retry
-          </Button>
-        ) : null}
-      </Stack>
     </Box>
   );
 }
@@ -1074,9 +877,7 @@ export default function App() {
 
   useEffect(() => {
     const intervalId = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => {
-      window.clearInterval(intervalId);
-    };
+    return () => window.clearInterval(intervalId);
   }, []);
 
   useEffect(() => {
@@ -1194,40 +995,34 @@ export default function App() {
     if (snapshot.navState?.phase === "active" || snapshot.navState?.phase === "terminal") {
       setCommandNotice(undefined);
     }
-  }, [snapshot.navState?.phase, snapshot.navState?.last_completed_command_id, snapshot.navState?.command_id]);
+  }, [
+    snapshot.navState?.phase,
+    snapshot.navState?.last_completed_command_id,
+    snapshot.navState?.command_id
+  ]);
 
-  const catalogCurrentMapId = snapshot.currentMapId || "";
-  const displayedMapId =
-    snapshot.mapImageMetadata?.map_id ||
-    snapshot.overlay?.map_id ||
-    snapshot.navState?.map_id ||
-    "";
-  const displayedMapUuid =
-    snapshot.mapImageMetadata?.map_uuid ||
-    snapshot.overlay?.map_uuid ||
-    snapshot.navState?.map_uuid ||
-    "";
-  const currentMapId = catalogCurrentMapId || displayedMapId;
-  const defaultMapId = snapshot.defaultMapId || "";
+  const overlayWaypoints = useMemo(
+    () => dedupeWaypoints(snapshot.overlay?.waypoints || []),
+    [snapshot.overlay?.waypoints]
+  );
+
+  const duplicateWaypointNames = useMemo(() => {
+    const counts = new Map<string, number>();
+    overlayWaypoints.forEach((waypoint) => {
+      counts.set(waypoint.name, (counts.get(waypoint.name) || 0) + 1);
+    });
+    return counts;
+  }, [overlayWaypoints]);
+
+  const mapState = useMemo(() => deriveMapState(snapshot, now), [snapshot, now]);
+  const robotMetrics = useMemo(() => deriveRobotMetrics(snapshot, now), [snapshot, now]);
+  const navigationSummary = useMemo(
+    () => deriveNavigationSummary(snapshot, mapState, now),
+    [snapshot, mapState, now]
+  );
   const connectionHealth = useMemo(
     () => deriveConnectionHealth(now, snapshot, bootstrapState, telemetryState),
     [now, snapshot, bootstrapState, telemetryState]
-  );
-
-  useEffect(() => {
-    if (connectionHealth.transportReady === connectionReadyRef.current) return;
-    connectionReadyRef.current = connectionHealth.transportReady;
-    setConnectionAttemptStartedAt(Date.now());
-    if (connectionHealth.transportReady) {
-      setHasReachedReady(true);
-    }
-  }, [connectionHealth.transportReady]);
-
-  const localizationStatus = getLocalizationStatus(snapshot);
-  const mapSurfaceStatus = getMapSurfaceStatus(snapshot, catalogCurrentMapId, displayedMapUuid);
-  const systemStatus = useMemo(
-    () => buildSystemStatus(snapshot, catalogCurrentMapId, displayedMapUuid),
-    [snapshot, catalogCurrentMapId, displayedMapUuid]
   );
   const connectionScreenState = useMemo(
     () =>
@@ -1252,15 +1047,22 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (connectionHealth.transportReady === connectionReadyRef.current) return;
+    connectionReadyRef.current = connectionHealth.transportReady;
+    setConnectionAttemptStartedAt(Date.now());
+    if (connectionHealth.transportReady) {
+      setHasReachedReady(true);
+    }
+  }, [connectionHealth.transportReady]);
+
+  useEffect(() => {
     const signature = JSON.stringify({
       phase: connectionScreenState.phase,
       title: connectionScreenState.title,
       bootstrapStatus: bootstrapState.status,
       telemetryStatus: telemetryState.status,
       transportReady: connectionHealth.transportReady,
-      realtimeTransportHealthy: connectionHealth.realtimeTransportHealthy,
       liveMapHealthy: connectionHealth.liveMapHealthy,
-      liveNavigationDataHealthy: connectionHealth.liveNavigationDataHealthy,
       catalogHealthy: connectionHealth.catalogHealthy
     });
     if (phaseLogRef.current === signature) return;
@@ -1302,19 +1104,14 @@ export default function App() {
     telemetryState
   ]);
 
-  const mapLoadCommandAvailable = availableCommands.includes(config.mapLoadCommandName);
-  const mapSetDefaultCommandAvailable = availableCommands.includes(config.mapSetDefaultCommandName);
-  const waypointSaveCommandAvailable = availableCommands.includes(config.waypointSaveCommandName);
-  const waypointCommandAvailable = availableCommands.includes(config.waypointGotoCommandName);
-  const gotoPoseCommandAvailable = availableCommands.includes(config.gotoPoseCommandName);
-  const cancelCommandAvailable = availableCommands.includes(config.cancelNavCommandName);
-  const returnAndDockCommandAvailable = availableCommands.includes(config.returnAndDockCommandName);
-  const undockCommandAvailable = availableCommands.includes(config.undockCommandName);
+  const currentMapId = mapState.currentMapId;
+  const displayedMapUuid = mapState.displayedMapUuid;
+  const defaultMapId = mapState.defaultMapId;
 
   const sortedWaypoints = useMemo(() => {
     const currentWaypointName = snapshot.overlay?.current_waypoint_name || "";
     const filter = waypointSearch.trim().toLowerCase();
-    return [...(snapshot.overlay?.waypoints || [])]
+    return [...overlayWaypoints]
       .filter((waypoint) => {
         if (!filter) return true;
         return waypoint.name.toLowerCase().includes(filter);
@@ -1326,18 +1123,18 @@ export default function App() {
         }
         return left.name.localeCompare(right.name);
       });
-  }, [snapshot.overlay?.waypoints, snapshot.overlay?.current_waypoint_name, waypointSearch]);
+  }, [overlayWaypoints, snapshot.overlay?.current_waypoint_name, waypointSearch]);
 
   const allMapIds = useMemo(() => {
     const ids = new Set<string>();
     (snapshot.maps || []).forEach((mapId) => {
       if (mapId) ids.add(mapId);
     });
-    if (catalogCurrentMapId) ids.add(catalogCurrentMapId);
-    if (displayedMapId) ids.add(displayedMapId);
-    if (defaultMapId) ids.add(defaultMapId);
+    if (mapState.currentMapId) ids.add(mapState.currentMapId);
+    if (mapState.displayedMapId) ids.add(mapState.displayedMapId);
+    if (mapState.defaultMapId) ids.add(mapState.defaultMapId);
     return [...ids];
-  }, [snapshot.maps, catalogCurrentMapId, displayedMapId, defaultMapId]);
+  }, [mapState.currentMapId, mapState.defaultMapId, mapState.displayedMapId, snapshot.maps]);
 
   const sortedMaps = useMemo(() => {
     const filter = mapSearch.trim().toLowerCase();
@@ -1356,76 +1153,98 @@ export default function App() {
       });
   }, [allMapIds, currentMapId, defaultMapId, mapSearch]);
 
+  const labeledWaypointKeys = useMemo(() => {
+    const keys = new Set<string>();
+    const searchActive = waypointSearch.trim().length > 0;
+    const addIfPresent = (waypoint: GraphNavOverlayWaypoint | undefined) => {
+      if (waypoint) keys.add(getWaypointSignature(waypoint));
+    };
+
+    if (selection?.kind === "waypoint") {
+      addIfPresent(selection.waypoint);
+    }
+
+    const currentWaypoint = overlayWaypoints.find(
+      (waypoint) =>
+        (waypoint.id && waypoint.id === snapshot.overlay?.current_waypoint_id) ||
+        waypoint.name === snapshot.overlay?.current_waypoint_name
+    );
+    addIfPresent(currentWaypoint);
+
+    const dockWaypoint = overlayWaypoints.find((waypoint) => waypoint.is_dock);
+    addIfPresent(dockWaypoint);
+
+    if (searchActive) {
+      sortedWaypoints.slice(0, 8).forEach((waypoint) => keys.add(getWaypointSignature(waypoint)));
+    }
+
+    return keys;
+  }, [
+    overlayWaypoints,
+    selection,
+    snapshot.overlay?.current_waypoint_id,
+    snapshot.overlay?.current_waypoint_name,
+    sortedWaypoints,
+    waypointSearch
+  ]);
+
   const selectionReadinessIssues = useMemo(() => {
     if (!selection) return [];
     if (selection.kind === "waypoint") {
-      const issues = buildWaypointNavigationIssues(snapshot, selection, displayedMapUuid);
-      if (!waypointCommandAvailable) issues.push("Waypoint goto command is unavailable.");
+      const issues = buildWaypointNavigationIssues(
+        snapshot,
+        selection,
+        displayedMapUuid,
+        overlayWaypoints,
+        now
+      );
+      if (!availableCommands.includes(config.waypointGotoCommandName)) {
+        issues.push("Waypoint goto command is unavailable.");
+      }
       if (snapshot.navState?.active) {
         issues.push("Hold or complete the active navigation before sending a new destination.");
       }
       return uniqueIssues(issues);
     }
-    const issues = buildPointNavigationIssues(snapshot, selection, displayedMapUuid);
-    if (!gotoPoseCommandAvailable) issues.push("Point goto command is unavailable.");
+
+    const issues = buildPointNavigationIssues(
+      snapshot,
+      selection,
+      displayedMapUuid,
+      mapState.precisionFresh,
+      now
+    );
+    if (!availableCommands.includes(config.gotoPoseCommandName)) {
+      issues.push("Point goto command is unavailable.");
+    }
     if (snapshot.navState?.active) {
       issues.push("Hold or complete the active navigation before sending a new destination.");
     }
     return uniqueIssues(issues);
   }, [
+    availableCommands,
+    config.gotoPoseCommandName,
+    config.waypointGotoCommandName,
     displayedMapUuid,
-    gotoPoseCommandAvailable,
+    mapState.precisionFresh,
+    now,
+    overlayWaypoints,
     selection,
-    snapshot.overlay,
-    snapshot.overlayTime,
-    snapshot.navState?.active,
-    waypointCommandAvailable
+    snapshot
   ]);
+
   const waypointSaveIssues = useMemo(
-    () => buildWaypointSaveIssues(snapshot, currentMapId),
-    [currentMapId, snapshot]
+    () => buildWaypointSaveIssues(snapshot, currentMapId, now),
+    [snapshot, currentMapId, now]
   );
 
-  const connectionStateFresh = isFresh(snapshot.connectionStateTime, 45000);
-  const dockingStateFresh = isFresh(snapshot.dockingStateTime, 45000);
-  const motorStateFresh = isFresh(snapshot.motorPowerStateTime, 45000);
-  const behaviorStateFresh = isFresh(snapshot.behaviorStateTime, 45000);
-  const connectionReady =
-    connectionStateFresh && snapshot.connectionState === "connected";
-  const dockingReady = dockingStateFresh;
-  const navReady = isFresh(snapshot.navStateTime, 4000);
-  const motorReady =
-    motorStateFresh && snapshot.motorPowerState === "on";
-  const localizedReady = navReady && Boolean(snapshot.navState?.localized);
-  const mapsReady = isFresh(snapshot.mapsTime, 60000);
-  const currentMapReady = !catalogCurrentMapId || isFresh(snapshot.currentMapTime, 60000);
-  const defaultMapReady = !defaultMapId || isFresh(snapshot.defaultMapTime, 60000);
-
-  const mapChipLabel = currentMapId || "No map";
-  const mapSurfaceLabel =
-    mapSurfaceStatus === "live"
-      ? "Live map"
-      : mapSurfaceStatus === "catalog"
-        ? "Catalog only"
-        : "Map unavailable";
-  const localizationChipLabel =
-    localizationStatus === "localized"
-      ? "Localized"
-      : localizationStatus === "not_localized"
-        ? "Not localized"
-        : "Localization unknown";
-  const connectionChipLabel = connectionStateFresh
-    ? snapshot.connectionState || "connection unknown"
-    : "connection unknown";
-  const dockingChipLabel = dockingStateFresh
-    ? snapshot.dockingState || "docking unknown"
-    : "docking unknown";
-  const motorChipLabel = motorStateFresh
-    ? `motors ${snapshot.motorPowerState || "unknown"}`
-    : "motors unknown";
-  const behaviorChipLabel = behaviorStateFresh
-    ? snapshot.behaviorState || "behavior unknown"
-    : "behavior unknown";
+  const selectionReady = Boolean(selection) && selectionReadinessIssues.length === 0;
+  const currentPoseLabel =
+    snapshot.navState?.has_current_seed_pose &&
+    typeof snapshot.navState.current_seed_x === "number" &&
+    typeof snapshot.navState.current_seed_y === "number"
+      ? `x=${snapshot.navState.current_seed_x.toFixed(2)} m, y=${snapshot.navState.current_seed_y.toFixed(2)} m`
+      : "No live pose";
 
   const activeNavLabel =
     snapshot.navState?.target_name ||
@@ -1437,19 +1256,36 @@ export default function App() {
         ? `x=${snapshot.navState.target_seed_x.toFixed(1)} m, y=${snapshot.navState.target_seed_y.toFixed(1)} m`
         : "No active destination");
 
-  const currentPoseLabel =
-    snapshot.navState?.has_current_seed_pose &&
-    typeof snapshot.navState.current_seed_x === "number" &&
-    typeof snapshot.navState.current_seed_y === "number"
-      ? `x=${snapshot.navState.current_seed_x.toFixed(2)} m, y=${snapshot.navState.current_seed_y.toFixed(2)} m`
-      : "No live pose";
+  const mapLoadCommandAvailable = availableCommands.includes(config.mapLoadCommandName);
+  const mapSetDefaultCommandAvailable = availableCommands.includes(config.mapSetDefaultCommandName);
+  const waypointSaveCommandAvailable = availableCommands.includes(config.waypointSaveCommandName);
+  const cancelCommandAvailable = availableCommands.includes(config.cancelNavCommandName);
+  const returnAndDockCommandAvailable = availableCommands.includes(config.returnAndDockCommandName);
+  const undockCommandAvailable = availableCommands.includes(config.undockCommandName);
 
-  const batteryLabel =
-    typeof snapshot.batteryPct === "number" ? `battery ${snapshot.batteryPct.toFixed(0)}%` : "battery";
+  const connectionReady =
+    isFresh(snapshot.connectionStateTime, ROBOT_STATE_MAX_AGE_MS, now) &&
+    snapshot.connectionState === "connected";
+  const dockingReady =
+    isFresh(snapshot.dockingStateTime, ROBOT_STATE_MAX_AGE_MS, now);
+  const motorReady =
+    isFresh(snapshot.motorPowerStateTime, ROBOT_STATE_MAX_AGE_MS, now) &&
+    snapshot.motorPowerState === "on";
+  const localizedReady =
+    isFresh(snapshot.navStateTime, NAV_STATE_MAX_AGE_MS, now) &&
+    Boolean(snapshot.navState?.localized);
+  const mapsReady = isFresh(snapshot.mapsTime, ROBOT_STATE_MAX_AGE_MS, now);
 
+  const canLoadMaps = mapLoadCommandAvailable && connectionReady && !snapshot.navState?.active;
+  const canSetDefaultMaps = mapSetDefaultCommandAvailable;
+  const canSaveWaypoint =
+    waypointSaveCommandAvailable &&
+    waypointSaveIssues.length === 0 &&
+    pendingCommand !== config.waypointSaveCommandName;
+
+  const mapsPanelVisible = mapsExpanded || !currentMapId || sortedMaps.length === 0;
   const navTerminalVisible =
     snapshot.navState?.phase === "terminal" && Boolean(snapshot.navState?.terminal_result);
-  const mapsPanelVisible = mapsExpanded || !currentMapId || sortedMaps.length === 0;
 
   useEffect(() => {
     setSelection((current) => {
@@ -1457,15 +1293,16 @@ export default function App() {
       if (current.mapUuid && displayedMapUuid && current.mapUuid !== displayedMapUuid) {
         return undefined;
       }
-      if (current.kind === "waypoint" && snapshot.overlay) {
-        const stillPresent = snapshot.overlay.waypoints.some(
-          (waypoint) => waypoint.name === current.waypoint.name
+      if (current.kind === "waypoint") {
+        const stillPresent = overlayWaypoints.some(
+          (waypoint) =>
+            getWaypointSignature(waypoint) === getWaypointSignature(current.waypoint)
         );
         if (!stillPresent) return undefined;
       }
       return current;
     });
-  }, [displayedMapUuid, snapshot.overlay]);
+  }, [displayedMapUuid, overlayWaypoints]);
 
   const handleRetryConnection = () => {
     connectionReadyRef.current = false;
@@ -1513,36 +1350,6 @@ export default function App() {
     }
   };
 
-  const handleSelectWaypoint = (waypoint: GraphNavOverlayWaypoint) => {
-    setSaveWaypointExpanded(false);
-    setSelection({
-      kind: "waypoint",
-      mapUuid: snapshot.overlay?.map_uuid || snapshot.mapImageMetadata?.map_uuid || "",
-      waypoint
-    });
-    setSelectionMode("waypoints");
-    setCommandError(undefined);
-    setCommandNotice(undefined);
-  };
-
-  const handleSaveWaypoint = () => {
-    const trimmedName = saveWaypointName.trim();
-    setSelection(undefined);
-    setSelectionMode("waypoints");
-    setCommandError(undefined);
-    setCommandNotice(undefined);
-    setSaveWaypointExpanded(false);
-    setSaveWaypointName("");
-    void sendCommand(
-      config.waypointSaveCommandName,
-      formatWaypointSavePayload(trimmedName),
-      trimmedName ? `Saving ${trimmedName}...` : "Saving current pose as a waypoint...",
-      trimmedName
-        ? `${trimmedName} save command sent. Waiting for the waypoint list to update...`
-        : "Waypoint save command sent. Waiting for the waypoint list to update..."
-    );
-  };
-
   const handleLoadMap = (mapId: string) => {
     if (!mapId) return;
     setSelection(undefined);
@@ -1569,8 +1376,20 @@ export default function App() {
       config.mapSetDefaultCommandName,
       formatMapIdPayload(mapId),
       `Setting ${mapId} as default...`,
-      `Default map command sent. Waiting for the adapter state to update...`
+      "Default map command sent. Waiting for the adapter state to update..."
     );
+  };
+
+  const handleSelectWaypoint = (waypoint: GraphNavOverlayWaypoint) => {
+    setSaveWaypointExpanded(false);
+    setSelection({
+      kind: "waypoint",
+      mapUuid: snapshot.overlay?.map_uuid || snapshot.mapImageMetadata?.map_uuid || "",
+      waypoint
+    });
+    setSelectionMode("waypoints");
+    setCommandError(undefined);
+    setCommandNotice(undefined);
   };
 
   const handleSelectPoint = (target: TargetPose) => {
@@ -1617,13 +1436,31 @@ export default function App() {
     });
   };
 
+  const handleSaveWaypoint = () => {
+    const trimmedName = saveWaypointName.trim();
+    setSelection(undefined);
+    setSelectionMode("waypoints");
+    setCommandError(undefined);
+    setCommandNotice(undefined);
+    setSaveWaypointExpanded(false);
+    setSaveWaypointName("");
+    void sendCommand(
+      config.waypointSaveCommandName,
+      formatWaypointSavePayload(trimmedName),
+      trimmedName ? `Saving ${trimmedName}...` : "Saving current pose as a waypoint...",
+      trimmedName
+        ? `${trimmedName} save command sent. Waiting for the waypoint list to update...`
+        : "Waypoint save command sent. Waiting for the waypoint list to update..."
+    );
+  };
+
   const confirmWaypointNavigation = () => {
     if (selection?.kind !== "waypoint" || !displayedMapUuid) return;
     const payload = formatWaypointGotoByNamePayload(displayedMapUuid, selection.waypoint.name);
     void sendCommand(
       config.waypointGotoCommandName,
       payload,
-      `Sending ${selection.waypoint.name} to Formant...`,
+      `Sending ${selection.waypoint.name}...`,
       `${selection.waypoint.name} command sent. Waiting for navigation state...`
     );
   };
@@ -1639,7 +1476,7 @@ export default function App() {
     void sendCommand(
       config.gotoPoseCommandName,
       payload,
-      "Sending point target to Formant...",
+      "Sending point target...",
       "Point target command sent. Waiting for navigation state..."
     );
   };
@@ -1647,14 +1484,6 @@ export default function App() {
   const invokeAction = (name: string, optimisticNotice: string, successNotice: string) => {
     void sendCommand(name, undefined, optimisticNotice, successNotice);
   };
-
-  const selectionReady = Boolean(selection) && selectionReadinessIssues.length === 0;
-  const canLoadMaps = mapLoadCommandAvailable && connectionReady && !snapshot.navState?.active;
-  const canSetDefaultMaps = mapSetDefaultCommandAvailable;
-  const canSaveWaypoint =
-    waypointSaveCommandAvailable &&
-    waypointSaveIssues.length === 0 &&
-    pendingCommand !== config.waypointSaveCommandName;
 
   return (
     <ThemeProvider theme={theme}>
@@ -1678,90 +1507,28 @@ export default function App() {
               height: "100%"
             }}
           >
-            <Box sx={{ position: "relative", flex: 1, minHeight: { xs: "55%", md: 0 } }}>
-              <MapView
+            <Box
+              sx={{
+                flex: 1,
+                minHeight: { xs: "55%", md: 0 },
+                display: "flex",
+                backgroundColor: MAP_SURFACE_BACKGROUND
+              }}
+            >
+              <MapStage
                 snapshot={snapshot}
                 selectionMode={selectionMode}
                 selection={selection}
-                showWaypointLabels={config.showWaypointLabels}
+                waypoints={overlayWaypoints}
+                labeledWaypointKeys={labeledWaypointKeys}
                 onSelectWaypoint={handleSelectWaypoint}
                 onSelectPoint={handleSelectPoint}
               />
-
-              <Stack
-                direction="row"
-                spacing={1}
-                flexWrap="wrap"
-                useFlexGap
-                sx={{ position: "absolute", top: 12, left: 12, right: 12 }}
-              >
-                <Chip label={mapChipLabel} color="primary" />
-                <Chip
-                  label={mapSurfaceLabel}
-                  color={
-                    mapSurfaceStatus === "live"
-                      ? "secondary"
-                      : mapSurfaceStatus === "unavailable"
-                        ? "warning"
-                        : "default"
-                  }
-                  variant="outlined"
-                />
-                <Chip
-                  label={localizationChipLabel}
-                  color={
-                    localizationStatus === "localized"
-                      ? "secondary"
-                      : localizationStatus === "not_localized"
-                        ? "warning"
-                        : "default"
-                  }
-                  variant={localizationStatus === "localized" ? "filled" : "outlined"}
-                />
-                <Chip
-                  label={connectionChipLabel}
-                  color={statusTone(snapshot.connectionState)}
-                  variant="outlined"
-                />
-                <Chip
-                  label={dockingChipLabel}
-                  color={statusTone(snapshot.dockingState)}
-                  variant="outlined"
-                />
-                <Chip
-                  label={motorChipLabel}
-                  color={statusTone(snapshot.motorPowerState)}
-                  variant="outlined"
-                />
-                <Chip
-                  label={behaviorChipLabel}
-                  color={statusTone(snapshot.behaviorState)}
-                  variant="outlined"
-                />
-                <Chip
-                  label={batteryLabel}
-                  color={
-                    typeof snapshot.batteryPct === "number" && snapshot.batteryPct <= 20
-                      ? "warning"
-                      : "default"
-                  }
-                  variant={isFresh(snapshot.batteryTime, 15000) ? "outlined" : "filled"}
-                />
-                {snapshot.navState?.active && snapshot.navState.status_name ? (
-                  <Chip label={snapshot.navState.status_name} color="warning" />
-                ) : null}
-                {navTerminalVisible ? (
-                  <Chip
-                    label={snapshot.navState?.terminal_result || "terminal"}
-                    color={navLifecycleTone(snapshot.navState?.terminal_result)}
-                  />
-                ) : null}
-              </Stack>
             </Box>
 
             <Box
               sx={{
-                width: { xs: "100%", md: 368 },
+                width: { xs: "100%", md: 388 },
                 borderLeft: { md: "1px solid rgba(255,255,255,0.06)" },
                 borderTop: { xs: "1px solid rgba(255,255,255,0.06)", md: "none" },
                 ...panelSurfaceSx
@@ -1769,9 +1536,6 @@ export default function App() {
             >
               <Stack spacing={2} sx={{ height: "100%", p: 2 }}>
                 <Stack spacing={0.5}>
-                  <Typography variant="subtitle2" color="text.secondary">
-                    Spot Navigation
-                  </Typography>
                   <Typography variant="h6">{device?.name || "Current device"}</Typography>
                   <Typography variant="body2" color="text.secondary">
                     Current waypoint: {getCurrentWaypointLabel(snapshot)}
@@ -1781,80 +1545,49 @@ export default function App() {
                   </Typography>
                 </Stack>
 
-                <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.03)" }}>
-                  <Stack spacing={1.25}>
-                    <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="flex-start">
-                      <Stack spacing={0.35} sx={{ minWidth: 0, flex: 1 }}>
-                        <Typography variant="subtitle2">Map</Typography>
-                        <Typography
-                          variant="body1"
-                          sx={{
-                            fontWeight: 600,
-                            whiteSpace: "nowrap",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis"
-                          }}
-                        >
-                          {currentMapId || "No active map"}
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          {defaultMapId
-                            ? defaultMapId === currentMapId
-                              ? "Current map is also the default."
-                              : `Default map: ${defaultMapId}`
-                            : allMapIds.length
-                              ? "No default map configured."
-                              : "No saved maps published yet."}
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          {mapSurfaceStatus === "live"
-                            ? "Live map view is available."
-                            : currentMapId
-                              ? "Map catalog is available; live map view is unavailable."
-                              : "No live map view available."}
-                        </Typography>
-                      </Stack>
-                      <Stack direction="row" spacing={1}>
-                        {currentMapId && currentMapId !== defaultMapId ? (
-                          <Button
-                            size="small"
-                            variant="text"
-                            disabled={
-                              !canSetDefaultMaps ||
-                              pendingCommand === config.mapSetDefaultCommandName
-                            }
-                            onClick={() => handleSetDefaultMap(currentMapId)}
-                          >
-                            Set Default
-                          </Button>
-                        ) : null}
-                        {allMapIds.length > 1 ? (
-                          <Button
-                            size="small"
-                            variant="outlined"
-                            onClick={() => setMapsExpanded((current) => !current)}
-                          >
-                            {mapsExpanded ? "Hide" : "Change"}
-                          </Button>
-                        ) : null}
-                      </Stack>
-                    </Stack>
+                <SectionCard
+                  title="Map"
+                  subtitle={mapState.headline}
+                  actions={
+                    allMapIds.length > 1 ? (
+                      <Button
+                        size="small"
+                        variant={mapsExpanded ? "contained" : "outlined"}
+                        onClick={() => setMapsExpanded((current) => !current)}
+                      >
+                        {mapsExpanded ? "Close" : "Catalog"}
+                      </Button>
+                    ) : undefined
+                  }
+                >
+                  <Stack spacing={1}>
+                    <Typography variant="body1" sx={{ fontWeight: 600 }}>
+                      {currentMapId || "No active map"}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      {defaultMapId
+                        ? defaultMapId === currentMapId
+                          ? "Current map is also the default."
+                          : `Default map: ${defaultMapId}`
+                        : allMapIds.length
+                          ? "No default map configured."
+                          : "No saved maps published yet."}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      {mapState.detail}
+                    </Typography>
 
                     <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
                       {currentMapId ? <Chip size="small" label="Active" color="primary" /> : null}
                       {defaultMapId === currentMapId && currentMapId ? (
                         <Chip size="small" label="Default" color="secondary" />
                       ) : null}
-                      {allMapIds.length ? (
-                        <Chip size="small" label={`${allMapIds.length} saved`} variant="outlined" />
-                      ) : null}
-                      <Chip
-                        size="small"
-                        label={mapSurfaceStatus === "live" ? "Live view" : "Catalog"}
-                        variant="outlined"
-                      />
-                      {!mapsReady ? (
-                        <Chip size="small" label="Catalog stale" color="warning" variant="outlined" />
+                      {mapState.savedCount ? (
+                        <Chip
+                          size="small"
+                          label={`${mapState.savedCount} saved`}
+                          variant="outlined"
+                        />
                       ) : null}
                     </Stack>
 
@@ -1869,7 +1602,7 @@ export default function App() {
                           />
                         ) : null}
 
-                        <Box sx={{ maxHeight: 216, overflow: "auto" }}>
+                        <Box sx={{ maxHeight: 232, overflow: "auto" }}>
                           <Stack spacing={0.75}>
                             {sortedMaps.map((mapId) => {
                               const isCurrent = mapId === currentMapId;
@@ -1879,20 +1612,20 @@ export default function App() {
                                   key={mapId}
                                   sx={{
                                     p: 1.15,
-                                    borderRadius: 1.5,
-                                    bgcolor: isCurrent
-                                      ? "rgba(43,182,255,0.08)"
-                                      : "rgba(255,255,255,0.02)",
-                                    border: "1px solid rgba(255,255,255,0.06)"
+                                    borderRadius: 2,
+                                    border: "1px solid rgba(255,255,255,0.06)",
+                                    backgroundColor: isCurrent
+                                      ? alpha("#2bb6ff", 0.1)
+                                      : "rgba(255,255,255,0.02)"
                                   }}
                                 >
-                                  <Stack
-                                    direction="row"
-                                    spacing={1}
-                                    justifyContent="space-between"
-                                    alignItems="center"
-                                  >
-                                    <Stack spacing={0.6} sx={{ minWidth: 0, flex: 1 }}>
+                                  <Stack spacing={1}>
+                                    <Stack
+                                      direction="row"
+                                      justifyContent="space-between"
+                                      alignItems="center"
+                                      spacing={1}
+                                    >
                                       <Typography
                                         variant="body2"
                                         sx={{
@@ -1918,33 +1651,34 @@ export default function App() {
                                         ) : null}
                                       </Stack>
                                     </Stack>
-                                    <Stack direction="row" spacing={0.75}>
-                                      {!isCurrent ? (
-                                        <Button
-                                          size="small"
-                                          variant="outlined"
-                                          disabled={
-                                            !canLoadMaps ||
-                                            pendingCommand === config.mapLoadCommandName
-                                          }
-                                          onClick={() => handleLoadMap(mapId)}
-                                        >
-                                          Load
-                                        </Button>
-                                      ) : null}
-                                      {!isDefault ? (
-                                        <Button
-                                          size="small"
-                                          variant="text"
-                                          disabled={
-                                            !canSetDefaultMaps ||
-                                            pendingCommand === config.mapSetDefaultCommandName
-                                          }
-                                          onClick={() => handleSetDefaultMap(mapId)}
-                                        >
-                                          Default
-                                        </Button>
-                                      ) : null}
+
+                                    <Stack direction="row" spacing={1}>
+                                      <Button
+                                        fullWidth
+                                        size="small"
+                                        variant={isCurrent ? "outlined" : "contained"}
+                                        disabled={
+                                          isCurrent ||
+                                          !canLoadMaps ||
+                                          pendingCommand === config.mapLoadCommandName
+                                        }
+                                        onClick={() => handleLoadMap(mapId)}
+                                      >
+                                        {isCurrent ? "Loaded" : "Load"}
+                                      </Button>
+                                      <Button
+                                        fullWidth
+                                        size="small"
+                                        variant={isDefault ? "outlined" : "text"}
+                                        disabled={
+                                          isDefault ||
+                                          !canSetDefaultMaps ||
+                                          pendingCommand === config.mapSetDefaultCommandName
+                                        }
+                                        onClick={() => handleSetDefaultMap(mapId)}
+                                      >
+                                        {isDefault ? "Default" : "Set Default"}
+                                      </Button>
                                     </Stack>
                                   </Stack>
                                 </Box>
@@ -1971,132 +1705,390 @@ export default function App() {
                             Set-default command is unavailable on this device.
                           </Typography>
                         ) : null}
-                        {snapshot.navState?.active ? (
+                        {!mapsReady ? (
                           <Typography variant="caption" color="text.secondary">
-                            Finish the current navigation before loading a different map.
-                          </Typography>
-                        ) : null}
-                        {!currentMapReady && currentMapId ? (
-                          <Typography variant="caption" color="warning.main">
-                            Active map state is stale. Wait for the map streams to settle before switching.
-                          </Typography>
-                        ) : null}
-                        {!defaultMapReady && defaultMapId ? (
-                          <Typography variant="caption" color="warning.main">
-                            Default map state is stale.
+                            Map catalog is refreshing.
                           </Typography>
                         ) : null}
                       </Stack>
                     </Collapse>
                   </Stack>
-                </Box>
+                </SectionCard>
 
-                <ToggleButtonGroup
-                  exclusive
-                  size="small"
-                  value={selectionMode}
-                  onChange={(_event, value: SelectionMode | null) => {
-                    if (!value) return;
-                    setSelectionMode(value);
-                    setSelection(undefined);
-                    setSaveWaypointExpanded(false);
-                  }}
-                >
-                  <ToggleButton value="waypoints">Waypoints</ToggleButton>
-                  <ToggleButton value="point">Point</ToggleButton>
-                </ToggleButtonGroup>
-
-                <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    disabled={
-                      !undockCommandAvailable ||
-                      !connectionReady ||
-                      !dockingReady ||
-                      snapshot.dockingState !== "docked" ||
-                      pendingCommand === config.undockCommandName
-                    }
-                    onClick={() =>
-                      invokeAction(
-                        config.undockCommandName,
-                        "Sending undock command...",
-                        "Undock command accepted."
-                      )
-                    }
+                <SectionCard title="Robot State">
+                  <Box
+                    sx={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                      gap: 1
+                    }}
                   >
-                    Undock
-                  </Button>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    disabled={
-                      !returnAndDockCommandAvailable ||
-                      !connectionReady ||
-                      !dockingReady ||
-                      !motorReady ||
-                      !localizedReady ||
-                      snapshot.dockingState !== "undocked" ||
-                      pendingCommand === config.returnAndDockCommandName
-                    }
-                    onClick={() =>
-                      invokeAction(
-                        config.returnAndDockCommandName,
-                        "Sending return-and-dock command...",
-                        "Return-and-dock command accepted."
-                      )
-                    }
-                  >
-                    Return & Dock
-                  </Button>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    color="warning"
-                    disabled={
-                      !cancelCommandAvailable ||
-                      !navReady ||
-                      !snapshot.navState?.active ||
-                      pendingCommand === config.cancelNavCommandName
-                    }
-                    onClick={() =>
-                      invokeAction(
-                        config.cancelNavCommandName,
-                        "Sending hold-position override...",
-                        "Hold-position command sent. Waiting for navigation state..."
-                      )
-                    }
-                  >
-                    Hold Position
-                  </Button>
-                </Stack>
-
-                <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.03)" }}>
-                  <Stack spacing={0.75}>
-                    <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
-                      <Typography variant="subtitle2">System Status</Typography>
-                      <Chip
-                        size="small"
-                        label={systemStatus.title}
-                        color={
-                          systemStatus.severity === "success"
-                            ? "secondary"
-                            : systemStatus.severity === "warning"
-                              ? "warning"
-                              : "default"
-                        }
-                        variant={systemStatus.severity === "success" ? "filled" : "outlined"}
+                    {robotMetrics.map((metric) => (
+                      <StatusTile
+                        key={metric.label}
+                        label={metric.label}
+                        value={metric.value}
+                        tone={metric.tone}
                       />
-                    </Stack>
-                    <Typography variant="body2" color="text.secondary">
-                      {systemStatus.detail}
-                    </Typography>
+                    ))}
+                  </Box>
+                </SectionCard>
+
+                <SectionCard title="Robot Actions">
+                  <Stack spacing={1}>
+                    <Button
+                      fullWidth
+                      variant={snapshot.dockingState === "docked" ? "contained" : "outlined"}
+                      disabled={
+                        !undockCommandAvailable ||
+                        !connectionReady ||
+                        !dockingReady ||
+                        snapshot.dockingState !== "docked" ||
+                        pendingCommand === config.undockCommandName
+                      }
+                      onClick={() =>
+                        invokeAction(
+                          config.undockCommandName,
+                          "Sending undock command...",
+                          "Undock command accepted."
+                        )
+                      }
+                    >
+                      Undock
+                    </Button>
+                    <Button
+                      fullWidth
+                      variant={
+                        snapshot.dockingState === "undocked" && localizedReady
+                          ? "contained"
+                          : "outlined"
+                      }
+                      disabled={
+                        !returnAndDockCommandAvailable ||
+                        !connectionReady ||
+                        !dockingReady ||
+                        !motorReady ||
+                        !localizedReady ||
+                        snapshot.dockingState !== "undocked" ||
+                        pendingCommand === config.returnAndDockCommandName
+                      }
+                      onClick={() =>
+                        invokeAction(
+                          config.returnAndDockCommandName,
+                          "Sending return-and-dock command...",
+                          "Return-and-dock command accepted."
+                        )
+                      }
+                    >
+                      Return & Dock
+                    </Button>
+                    <Button
+                      fullWidth
+                      color="warning"
+                      variant={snapshot.navState?.active ? "contained" : "outlined"}
+                      disabled={
+                        !cancelCommandAvailable ||
+                        !isFresh(snapshot.navStateTime, NAV_STATE_MAX_AGE_MS, now) ||
+                        !snapshot.navState?.active ||
+                        pendingCommand === config.cancelNavCommandName
+                      }
+                      onClick={() =>
+                        invokeAction(
+                          config.cancelNavCommandName,
+                          "Sending hold-position override...",
+                          "Hold-position command sent. Waiting for navigation state..."
+                        )
+                      }
+                    >
+                      Hold Position
+                    </Button>
                   </Stack>
-                </Box>
+                </SectionCard>
+
+                <SectionCard title="Navigate" subtitle={navigationSummary.title}>
+                  <Stack spacing={1.25}>
+                    <Typography variant="body2" color="text.secondary">
+                      {navigationSummary.detail}
+                    </Typography>
+
+                    <ModeSelector
+                      value={selectionMode}
+                      onChange={(value) => {
+                        setSelectionMode(value);
+                        setSelection(undefined);
+                        setSaveWaypointExpanded(false);
+                      }}
+                    />
+
+                    {selectionMode === "waypoints" ? (
+                      <Stack spacing={1.25}>
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          justifyContent="space-between"
+                          alignItems="center"
+                        >
+                          <Typography variant="subtitle2">Saved Waypoints</Typography>
+                          <Button
+                            size="small"
+                            variant={saveWaypointExpanded ? "contained" : "outlined"}
+                            disabled={
+                              !waypointSaveCommandAvailable ||
+                              pendingCommand === config.waypointSaveCommandName
+                            }
+                            onClick={() => {
+                              setSaveWaypointExpanded((current) => !current);
+                              setSelection(undefined);
+                            }}
+                          >
+                            Save Current
+                          </Button>
+                        </Stack>
+
+                        <Collapse in={saveWaypointExpanded} unmountOnExit>
+                          <Box
+                            sx={{
+                              p: 1.5,
+                              borderRadius: 2,
+                              border: "1px solid rgba(255,255,255,0.06)",
+                              backgroundColor: "rgba(255,255,255,0.02)"
+                            }}
+                          >
+                            <Stack spacing={1}>
+                              <Typography variant="body2" color="text.secondary">
+                                Save the robot&apos;s current pose as a waypoint on{" "}
+                                {currentMapId || "the active map"}.
+                              </Typography>
+                              <TextField
+                                label="Waypoint name"
+                                placeholder="Leave blank to auto-generate"
+                                size="small"
+                                value={saveWaypointName}
+                                onChange={(event) => setSaveWaypointName(event.target.value)}
+                              />
+                              {waypointSaveIssues.length ? (
+                                <Alert severity="warning">
+                                  <Stack spacing={0.5}>
+                                    {waypointSaveIssues.map((issue) => (
+                                      <Typography key={issue} variant="body2">
+                                        {issue}
+                                      </Typography>
+                                    ))}
+                                  </Stack>
+                                </Alert>
+                              ) : null}
+                              <Stack direction="row" spacing={1}>
+                                <Button
+                                  variant="contained"
+                                  onClick={handleSaveWaypoint}
+                                  disabled={!canSaveWaypoint}
+                                >
+                                  Save
+                                </Button>
+                                <Button
+                                  variant="outlined"
+                                  onClick={() => {
+                                    setSaveWaypointExpanded(false);
+                                    setSaveWaypointName("");
+                                  }}
+                                >
+                                  Cancel
+                                </Button>
+                              </Stack>
+                            </Stack>
+                          </Box>
+                        </Collapse>
+
+                        <TextField
+                          value={waypointSearch}
+                          onChange={(event) => setWaypointSearch(event.target.value)}
+                          size="small"
+                          label="Search waypoints"
+                        />
+
+                        <Box
+                          sx={{
+                            maxHeight: 260,
+                            overflow: "auto",
+                            borderRadius: 2,
+                            border: "1px solid rgba(255,255,255,0.06)",
+                            backgroundColor: "rgba(255,255,255,0.02)"
+                          }}
+                        >
+                          <List dense disablePadding sx={{ p: 0.75 }}>
+                            {sortedWaypoints.map((waypoint) => {
+                              const isSelected =
+                                selection?.kind === "waypoint" &&
+                                getWaypointSignature(selection.waypoint) ===
+                                  getWaypointSignature(waypoint);
+                              const duplicateNameCount =
+                                duplicateWaypointNames.get(waypoint.name) || 0;
+                              const secondaryParts = [
+                                waypoint.is_dock ? "Dock" : "",
+                                snapshot.overlay?.current_waypoint_name === waypoint.name
+                                  ? "Current"
+                                  : "",
+                                duplicateNameCount > 1
+                                  ? `${waypoint.x.toFixed(1)}, ${waypoint.y.toFixed(1)}`
+                                  : ""
+                              ].filter(Boolean);
+
+                              return (
+                                <ListItemButton
+                                  key={getWaypointSignature(waypoint)}
+                                  selected={isSelected}
+                                  onClick={() => handleSelectWaypoint(waypoint)}
+                                  sx={{ borderRadius: 1.5, mb: 0.5 }}
+                                >
+                                  <ListItemText
+                                    primary={waypoint.name}
+                                    secondary={secondaryParts.join(" · ") || undefined}
+                                  />
+                                </ListItemButton>
+                              );
+                            })}
+                            {!sortedWaypoints.length ? (
+                              <Typography variant="body2" color="text.secondary" sx={{ p: 1 }}>
+                                {currentMapId
+                                  ? "No saved waypoints yet for this map."
+                                  : "Load a map to browse or save waypoints."}
+                              </Typography>
+                            ) : null}
+                          </List>
+                        </Box>
+
+                        {!waypointSaveCommandAvailable ? (
+                          <Typography variant="caption" color="warning.main">
+                            Waypoint save command is unavailable on this device.
+                          </Typography>
+                        ) : null}
+                      </Stack>
+                    ) : (
+                      <Box
+                        sx={{
+                          p: 1.5,
+                          borderRadius: 2,
+                          border: "1px solid rgba(255,255,255,0.06)",
+                          backgroundColor: "rgba(255,255,255,0.02)"
+                        }}
+                      >
+                        <Typography variant="body2" color="text.secondary">
+                          Click the map to place a precise target. Point navigation is an advanced
+                          tool; saved waypoints remain the safer default.
+                        </Typography>
+                      </Box>
+                    )}
+                  </Stack>
+                </SectionCard>
+
+                {selection ? (
+                  <Box sx={cardSx}>
+                    {selection.kind === "waypoint" ? (
+                      <Stack spacing={1}>
+                        <Typography variant="subtitle2">Confirm Waypoint</Typography>
+                        <Typography variant="body1" sx={{ fontWeight: 600 }}>
+                          {selection.waypoint.name}
+                        </Typography>
+                        <Typography variant="body2" color="text.secondary">
+                          {selection.waypoint.is_dock ? "Dock waypoint" : "Saved waypoint"}
+                        </Typography>
+                        {selectionReadinessIssues.length ? (
+                          <Alert severity="warning">
+                            <Stack spacing={0.5}>
+                              {selectionReadinessIssues.map((issue) => (
+                                <Typography key={issue} variant="body2">
+                                  {issue}
+                                </Typography>
+                              ))}
+                            </Stack>
+                          </Alert>
+                        ) : null}
+                        <Stack direction="row" spacing={1}>
+                          <Button
+                            variant="contained"
+                            onClick={confirmWaypointNavigation}
+                            disabled={
+                              !selectionReady ||
+                              pendingCommand === config.waypointGotoCommandName
+                            }
+                          >
+                            Confirm
+                          </Button>
+                          <Button variant="outlined" onClick={() => setSelection(undefined)}>
+                            Cancel
+                          </Button>
+                        </Stack>
+                      </Stack>
+                    ) : (
+                      <Stack spacing={1}>
+                        <Typography variant="subtitle2">Confirm Point Target</Typography>
+                        <Typography variant="body2" color="text.secondary">
+                          {formatPose(selection.target)}
+                        </Typography>
+
+                        <Stack direction="row" spacing={0.75}>
+                          {([
+                            ["current", "Keep Heading"],
+                            ["path", "Face Path"],
+                            ["custom", "Custom"]
+                          ] as const).map(([mode, label]) => {
+                            const selected = selection.headingMode === mode;
+                            return (
+                              <Button
+                                key={mode}
+                                fullWidth
+                                variant={selected ? "contained" : "outlined"}
+                                onClick={() => updatePointHeadingMode(mode)}
+                              >
+                                {label}
+                              </Button>
+                            );
+                          })}
+                        </Stack>
+
+                        {selection.headingMode === "custom" ? (
+                          <TextField
+                            label="Yaw (deg)"
+                            type="number"
+                            size="small"
+                            value={selection.target.yawDeg}
+                            onChange={(event) => updatePointYawDeg(Number(event.target.value))}
+                            inputProps={{ step: 1 }}
+                          />
+                        ) : null}
+
+                        {selectionReadinessIssues.length ? (
+                          <Alert severity="warning">
+                            <Stack spacing={0.5}>
+                              {selectionReadinessIssues.map((issue) => (
+                                <Typography key={issue} variant="body2">
+                                  {issue}
+                                </Typography>
+                              ))}
+                            </Stack>
+                          </Alert>
+                        ) : null}
+
+                        <Stack direction="row" spacing={1}>
+                          <Button
+                            variant="contained"
+                            onClick={confirmPointNavigation}
+                            disabled={!selectionReady || pendingCommand === config.gotoPoseCommandName}
+                          >
+                            Confirm
+                          </Button>
+                          <Button variant="outlined" onClick={() => setSelection(undefined)}>
+                            Cancel
+                          </Button>
+                        </Stack>
+                      </Stack>
+                    )}
+                  </Box>
+                ) : null}
 
                 {snapshot.navState?.active ? (
-                  <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.03)" }}>
-                    <Stack spacing={0.75}>
+                  <Alert severity="info">
+                    <Stack spacing={0.5}>
                       <Typography variant="subtitle2">Active Navigation</Typography>
                       <Typography variant="body2">{activeNavLabel}</Typography>
                       <Typography variant="body2" color="text.secondary">
@@ -2105,11 +2097,8 @@ export default function App() {
                       <Typography variant="body2" color="text.secondary">
                         Remaining route: {snapshot.navState.remaining_route_length_m.toFixed(2)} m
                       </Typography>
-                      {snapshot.navState.auto_recovered ? (
-                        <Chip label="Auto-recovered" color="warning" size="small" />
-                      ) : null}
                     </Stack>
-                  </Box>
+                  </Alert>
                 ) : null}
 
                 {navTerminalVisible ? (
@@ -2131,240 +2120,6 @@ export default function App() {
                   </Alert>
                 ) : null}
 
-                <Divider />
-
-                {selectionMode === "waypoints" ? (
-                  <>
-                    <Stack
-                      direction="row"
-                      spacing={1}
-                      alignItems="center"
-                      justifyContent="space-between"
-                    >
-                      <Typography variant="subtitle2">Waypoints</Typography>
-                      <Button
-                        size="small"
-                        variant={saveWaypointExpanded ? "contained" : "outlined"}
-                        disabled={
-                          !waypointSaveCommandAvailable ||
-                          pendingCommand === config.waypointSaveCommandName
-                        }
-                        onClick={() => {
-                          setSaveWaypointExpanded((current) => !current);
-                          setSelection(undefined);
-                        }}
-                      >
-                        Save Current
-                      </Button>
-                    </Stack>
-                    <Collapse in={saveWaypointExpanded} unmountOnExit>
-                      <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.03)" }}>
-                        <Stack spacing={1}>
-                          <Typography variant="body2" color="text.secondary">
-                            Save the robot&apos;s current pose as a waypoint on{" "}
-                            {currentMapId || "the active map"}.
-                          </Typography>
-                          <TextField
-                            label="Waypoint name"
-                            placeholder="Leave blank to auto-generate"
-                            size="small"
-                            value={saveWaypointName}
-                            onChange={(event) => setSaveWaypointName(event.target.value)}
-                          />
-                          {waypointSaveIssues.length ? (
-                            <Alert severity="warning">
-                              <Stack spacing={0.5}>
-                                {waypointSaveIssues.map((issue) => (
-                                  <Typography key={issue} variant="body2">
-                                    {issue}
-                                  </Typography>
-                                ))}
-                              </Stack>
-                            </Alert>
-                          ) : null}
-                          <Stack direction="row" spacing={1}>
-                            <Button
-                              variant="contained"
-                              onClick={handleSaveWaypoint}
-                              disabled={!canSaveWaypoint}
-                            >
-                              Save
-                            </Button>
-                            <Button
-                              variant="outlined"
-                              onClick={() => {
-                                setSaveWaypointExpanded(false);
-                                setSaveWaypointName("");
-                              }}
-                            >
-                              Cancel
-                            </Button>
-                          </Stack>
-                        </Stack>
-                      </Box>
-                    </Collapse>
-                    <TextField
-                      value={waypointSearch}
-                      onChange={(event) => setWaypointSearch(event.target.value)}
-                      size="small"
-                      label="Search waypoints"
-                    />
-                    <Box sx={{ minHeight: 0, flex: 1, overflow: "auto" }}>
-                      <List dense disablePadding>
-                        {sortedWaypoints.map((waypoint) => {
-                          const isSelected =
-                            selection?.kind === "waypoint" && selection.waypoint.name === waypoint.name;
-                          const secondary = [
-                            waypoint.is_dock ? "Dock" : "",
-                            snapshot.overlay?.current_waypoint_name === waypoint.name ? "Current" : ""
-                          ]
-                            .filter(Boolean)
-                            .join(" · ");
-                          return (
-                            <ListItemButton
-                              key={getWaypointKey(waypoint)}
-                              selected={isSelected}
-                              onClick={() => handleSelectWaypoint(waypoint)}
-                              sx={{ borderRadius: 1.5, mb: 0.5 }}
-                            >
-                              <ListItemText
-                                primary={waypoint.name}
-                                secondary={secondary || undefined}
-                              />
-                            </ListItemButton>
-                          );
-                        })}
-                        {!sortedWaypoints.length ? (
-                          <Typography variant="body2" color="text.secondary" sx={{ py: 1 }}>
-                            {currentMapId
-                              ? "No saved waypoints yet for this map."
-                              : "Load a map to browse or save waypoints."}
-                          </Typography>
-                        ) : null}
-                      </List>
-                    </Box>
-                    {!waypointSaveCommandAvailable ? (
-                      <Typography variant="caption" color="warning.main">
-                        Waypoint save command is unavailable on this device.
-                      </Typography>
-                    ) : null}
-                  </>
-                ) : (
-                  <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.03)" }}>
-                    <Stack spacing={1}>
-                      <Typography variant="subtitle2">Point Navigation</Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        Click the map to place a target. Point mode is intended for advanced use;
-                        waypoint navigation is the safer default.
-                      </Typography>
-                    </Stack>
-                  </Box>
-                )}
-
-                {selection ? (
-                  <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.04)" }}>
-                    {selection.kind === "waypoint" ? (
-                      <Stack spacing={1}>
-                        <Typography variant="subtitle2">Confirm Waypoint</Typography>
-                        <Typography variant="body2">{selection.waypoint.name}</Typography>
-                        <Typography variant="body2" color="text.secondary">
-                          {selection.waypoint.is_dock ? "Dock waypoint" : "Standard waypoint"}
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          {displayedMapUuid
-                            ? formatWaypointGotoByNamePayload(displayedMapUuid, selection.waypoint.name)
-                            : "No command payload"}
-                        </Typography>
-                        {selectionReadinessIssues.length ? (
-                          <Alert severity="warning">
-                            <Stack spacing={0.5}>
-                              {selectionReadinessIssues.map((issue) => (
-                                <Typography key={issue} variant="body2">
-                                  {issue}
-                                </Typography>
-                              ))}
-                            </Stack>
-                          </Alert>
-                        ) : null}
-                        <Stack direction="row" spacing={1}>
-                          <Button
-                            variant="contained"
-                            onClick={confirmWaypointNavigation}
-                            disabled={!selectionReady || pendingCommand === config.waypointGotoCommandName}
-                          >
-                            Confirm
-                          </Button>
-                          <Button variant="outlined" onClick={() => setSelection(undefined)}>
-                            Cancel
-                          </Button>
-                        </Stack>
-                      </Stack>
-                    ) : (
-                      <Stack spacing={1}>
-                        <Typography variant="subtitle2">Confirm Point Target</Typography>
-                        <Typography variant="body2" color="text.secondary">
-                          {formatPose(selection.target)}
-                        </Typography>
-                        <ToggleButtonGroup
-                          exclusive
-                          size="small"
-                          value={selection.headingMode}
-                          onChange={(_event, value: PointHeadingMode | null) => {
-                            if (value) updatePointHeadingMode(value);
-                          }}
-                        >
-                          <ToggleButton value="current">Keep Heading</ToggleButton>
-                          <ToggleButton value="path">Face Path</ToggleButton>
-                          <ToggleButton value="custom">Custom</ToggleButton>
-                        </ToggleButtonGroup>
-                        {selection.headingMode === "custom" ? (
-                          <TextField
-                            label="Yaw (deg)"
-                            type="number"
-                            size="small"
-                            value={selection.target.yawDeg}
-                            onChange={(event) => updatePointYawDeg(Number(event.target.value))}
-                            inputProps={{ step: 1 }}
-                          />
-                        ) : null}
-                        <Typography variant="caption" color="text.secondary">
-                          {displayedMapUuid
-                            ? formatGotoPosePayload(
-                                displayedMapUuid,
-                                selection.target.x,
-                                selection.target.y,
-                                selection.target.yawDeg
-                              )
-                            : "No command payload"}
-                        </Typography>
-                        {selectionReadinessIssues.length ? (
-                          <Alert severity="warning">
-                            <Stack spacing={0.5}>
-                              {selectionReadinessIssues.map((issue) => (
-                                <Typography key={issue} variant="body2">
-                                  {issue}
-                                </Typography>
-                              ))}
-                            </Stack>
-                          </Alert>
-                        ) : null}
-                        <Stack direction="row" spacing={1}>
-                          <Button
-                            variant="contained"
-                            onClick={confirmPointNavigation}
-                            disabled={!selectionReady || pendingCommand === config.gotoPoseCommandName}
-                          >
-                            Confirm
-                          </Button>
-                          <Button variant="outlined" onClick={() => setSelection(undefined)}>
-                            Cancel
-                          </Button>
-                        </Stack>
-                      </Stack>
-                    )}
-                  </Box>
-                ) : null}
-
                 {snapshot.warnings?.length ? (
                   <Alert severity="warning">
                     <Stack spacing={0.5}>
@@ -2379,12 +2134,6 @@ export default function App() {
 
                 {commandError ? <Alert severity="error">{commandError}</Alert> : null}
                 {commandNotice ? <Alert severity="info">{commandNotice}</Alert> : null}
-
-                <Box sx={{ mt: "auto" }}>
-                  <Typography variant="caption" color="text.secondary">
-                    Map view: {isFresh(snapshot.mapImageMetadataTime, LIVE_MAP_VIEW_MAX_AGE_MS) ? "live" : "stale"} · Nav state: {isFresh(snapshot.navStateTime, 4000) ? "live" : "stale"} · Overlay: {isFresh(snapshot.overlayTime, 15000) ? "live" : "stale"} · Catalog: {mapsReady ? "ready" : "stale"}
-                  </Typography>
-                </Box>
               </Stack>
             </Box>
           </Box>
