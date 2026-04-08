@@ -65,6 +65,9 @@ const theme = createTheme({
 
 type SelectionMode = "waypoints" | "point";
 type PointHeadingMode = "current" | "path" | "custom";
+type LocalizationStatus = "localized" | "not_localized" | "unknown";
+type MapSurfaceStatus = "live" | "catalog" | "unavailable";
+type SystemStatusSeverity = "success" | "info" | "warning";
 type Selection =
   | { kind: "waypoint"; mapUuid: string; waypoint: GraphNavOverlayWaypoint }
   | { kind: "point"; mapUuid: string; target: TargetPose; headingMode: PointHeadingMode };
@@ -76,16 +79,6 @@ function isFresh(timestamp: number | undefined, maxAgeMs: number): boolean {
 function formatPose(target?: TargetPose): string {
   if (!target) return "No target selected";
   return `x=${target.x.toFixed(2)} m, y=${target.y.toFixed(2)} m, yaw=${target.yawDeg.toFixed(1)} deg`;
-}
-
-function getMapLabel(snapshot: StreamSnapshot): string {
-  return (
-    snapshot.currentMapId ||
-    snapshot.mapImageMetadata?.map_id ||
-    snapshot.navState?.map_id ||
-    snapshot.overlay?.map_id ||
-    "Unknown map"
-  );
 }
 
 function getCurrentWaypointLabel(snapshot: StreamSnapshot): string {
@@ -163,46 +156,190 @@ function isBehaviorNavigationReady(value: string | undefined): boolean {
   return value === "standing" || value === "stepping" || value === "transition";
 }
 
-function buildMovementReadiness(snapshot: StreamSnapshot, mapUuid: string): string[] {
-  const issues: string[] = [];
-  const navFresh = isFresh(snapshot.navStateTime, 4000);
-  const mapFresh = isFresh(snapshot.mapImageMetadataTime, 8000);
+function getLocalizationStatus(snapshot: StreamSnapshot): LocalizationStatus {
+  if (!isFresh(snapshot.navStateTime, 4000)) return "unknown";
+  return snapshot.navState?.localized ? "localized" : "not_localized";
+}
+
+function getMapSurfaceStatus(
+  snapshot: StreamSnapshot,
+  catalogCurrentMapId: string,
+  displayedMapUuid: string
+): MapSurfaceStatus {
+  if (displayedMapUuid && isFresh(snapshot.mapImageMetadataTime, 8000)) {
+    return "live";
+  }
+  if (catalogCurrentMapId) return "catalog";
+  return "unavailable";
+}
+
+function buildSystemStatus(
+  snapshot: StreamSnapshot,
+  catalogCurrentMapId: string,
+  displayedMapUuid: string
+): { title: string; detail: string; severity: SystemStatusSeverity } {
   const connectionFresh = isFresh(snapshot.connectionStateTime, 45000);
   const dockingFresh = isFresh(snapshot.dockingStateTime, 45000);
   const motorFresh = isFresh(snapshot.motorPowerStateTime, 45000);
   const behaviorFresh = isFresh(snapshot.behaviorStateTime, 45000);
+  const navFresh = isFresh(snapshot.navStateTime, 4000);
+  const localizationStatus = getLocalizationStatus(snapshot);
+  const mapSurfaceStatus = getMapSurfaceStatus(snapshot, catalogCurrentMapId, displayedMapUuid);
 
-  if (!navFresh) issues.push("Navigation state is stale.");
-  if (!mapFresh) issues.push("Map metadata is stale.");
-  if (!connectionFresh) issues.push("Connection state is stale.");
-  if (!dockingFresh) issues.push("Docking state is stale.");
-  if (!motorFresh) issues.push("Motor power state is stale.");
-  if (!behaviorFresh) issues.push("Behavior state is stale.");
-  if (connectionFresh && snapshot.connectionState !== "connected") issues.push("Robot is not connected.");
-  if (motorFresh && snapshot.motorPowerState !== "on") issues.push("Motor power is not on.");
-  if (dockingFresh && snapshot.dockingState !== "undocked") {
-    issues.push("Robot must be undocked before moving.");
+  if (!catalogCurrentMapId && mapSurfaceStatus === "unavailable") {
+    return {
+      title: "No map selected",
+      detail: "Load a saved map to browse it or prepare navigation.",
+      severity: "warning"
+    };
   }
+
+  if (mapSurfaceStatus !== "live") {
+    return {
+      title: "Map browsing available",
+      detail: "Saved maps are available, but the live map view is unavailable.",
+      severity: "info"
+    };
+  }
+
+  if (!connectionFresh || !navFresh) {
+    return {
+      title: "Waiting for live robot state",
+      detail: "The live map is visible, but robot state or navigation state is not current yet.",
+      severity: "info"
+    };
+  }
+
+  if (snapshot.connectionState !== "connected") {
+    return {
+      title: "Robot disconnected",
+      detail: "Reconnect the robot to enable live navigation actions.",
+      severity: "warning"
+    };
+  }
+
+  if (localizationStatus === "not_localized") {
+    return {
+      title: "Robot not localized",
+      detail: "Use GraphNav localization before sending navigation commands.",
+      severity: "warning"
+    };
+  }
+
+  if (dockingFresh && snapshot.dockingState === "docked") {
+    return {
+      title: "Robot docked",
+      detail: "Map management remains available. Undock to enable movement commands.",
+      severity: "info"
+    };
+  }
+
+  if (motorFresh && snapshot.motorPowerState !== "on") {
+    return {
+      title: "Robot idle",
+      detail: "Turn motor power on to enable movement commands.",
+      severity: "info"
+    };
+  }
+
   if (behaviorFresh && !isBehaviorNavigationReady(snapshot.behaviorState)) {
-    issues.push("Robot is not in a navigation-ready behavior state.");
+    return {
+      title: "Robot not ready to navigate",
+      detail: "Stand the robot before sending navigation commands.",
+      severity: "info"
+    };
   }
-  if (navFresh && !snapshot.navState?.localized) issues.push("Robot is not localized.");
-  if (!mapUuid) issues.push("No active map is available.");
+
+  return {
+    title: "Live navigation ready",
+    detail: "Live map, localization, and robot state are ready for navigation.",
+    severity: "success"
+  };
+}
+
+function buildBaseNavigationIssues(
+  snapshot: StreamSnapshot,
+  targetMapUuid: string,
+  requireLiveMapView: boolean
+): string[] {
+  const issues: string[] = [];
+  const connectionFresh = isFresh(snapshot.connectionStateTime, 45000);
+  const dockingFresh = isFresh(snapshot.dockingStateTime, 45000);
+  const motorFresh = isFresh(snapshot.motorPowerStateTime, 45000);
+  const behaviorFresh = isFresh(snapshot.behaviorStateTime, 45000);
+  const navFresh = isFresh(snapshot.navStateTime, 4000);
+  const mapFresh = isFresh(snapshot.mapImageMetadataTime, 8000);
+
+  if (!targetMapUuid) {
+    issues.push("Selected map is unavailable.");
+  }
+  if (!connectionFresh) {
+    issues.push("Waiting for live robot connection.");
+  } else if (snapshot.connectionState !== "connected") {
+    issues.push("Robot is not connected.");
+  }
+
+  if (!navFresh) {
+    issues.push("Waiting for live navigation state.");
+  } else if (!snapshot.navState?.localized) {
+    issues.push("Robot is not localized.");
+  }
+
+  if (!motorFresh || !dockingFresh || !behaviorFresh) {
+    issues.push("Waiting for live robot state.");
+  } else {
+    if (snapshot.dockingState === "docked") issues.push("Undock the robot first.");
+    if (snapshot.motorPowerState !== "on") issues.push("Turn motor power on.");
+    if (!isBehaviorNavigationReady(snapshot.behaviorState)) {
+      issues.push("Stand the robot before navigating.");
+    }
+  }
+
+  if (requireLiveMapView && !mapFresh) {
+    issues.push("Live map view is unavailable.");
+  }
+
   return issues;
 }
 
-function buildMapConsistencyIssues(snapshot: StreamSnapshot, displayedMapUuid: string): string[] {
-  const issues: string[] = [];
+function buildWaypointNavigationIssues(
+  snapshot: StreamSnapshot,
+  selection: Extract<Selection, { kind: "waypoint" }>,
+  displayedMapUuid: string
+): string[] {
+  const issues = buildBaseNavigationIssues(
+    snapshot,
+    selection.mapUuid || displayedMapUuid,
+    false
+  );
+  if (!isFresh(snapshot.overlayTime, 15000)) {
+    issues.push("Waypoint list is stale.");
+  }
+  if (!snapshot.overlay) {
+    issues.push("Waypoint list is unavailable.");
+  } else if (!snapshot.overlay.waypoints.some((waypoint) => waypoint.id === selection.waypoint.id)) {
+    issues.push("Selected waypoint is no longer available.");
+  }
   const overlayMapUuid = snapshot.overlay?.map_uuid || "";
-  const navMapUuid = snapshot.navState?.map_uuid || "";
-
-  if (displayedMapUuid && overlayMapUuid && overlayMapUuid !== displayedMapUuid) {
-    issues.push("Waypoint overlay does not match the displayed map.");
+  if (selection.mapUuid && overlayMapUuid && selection.mapUuid !== overlayMapUuid) {
+    issues.push("Selected waypoint no longer matches the active map.");
   }
-  if (displayedMapUuid && navMapUuid && navMapUuid !== displayedMapUuid) {
-    issues.push("Navigation state does not match the displayed map.");
-  }
+  return issues;
+}
 
+function buildPointNavigationIssues(
+  snapshot: StreamSnapshot,
+  selection: Extract<Selection, { kind: "point" }>,
+  displayedMapUuid: string
+): string[] {
+  const issues = buildBaseNavigationIssues(
+    snapshot,
+    selection.mapUuid || displayedMapUuid,
+    true
+  );
+  if (selection.mapUuid && displayedMapUuid && selection.mapUuid !== displayedMapUuid) {
+    issues.push("Selected point no longer matches the displayed map.");
+  }
   return issues;
 }
 
@@ -605,25 +742,24 @@ export default function App() {
     }
   }, [snapshot.navState?.phase, snapshot.navState?.last_completed_command_id, snapshot.navState?.command_id]);
 
-  const displayedMapUuid = snapshot.mapImageMetadata?.map_uuid || "";
-  const currentMapId =
-    snapshot.currentMapId ||
+  const catalogCurrentMapId = snapshot.currentMapId || "";
+  const displayedMapId =
     snapshot.mapImageMetadata?.map_id ||
-    snapshot.navState?.map_id ||
     snapshot.overlay?.map_id ||
+    snapshot.navState?.map_id ||
     "";
+  const displayedMapUuid =
+    snapshot.mapImageMetadata?.map_uuid ||
+    snapshot.overlay?.map_uuid ||
+    snapshot.navState?.map_uuid ||
+    "";
+  const currentMapId = catalogCurrentMapId || displayedMapId;
   const defaultMapId = snapshot.defaultMapId || "";
-
-  const movementReadinessIssues = useMemo(
-    () =>
-      uniqueIssues([
-        ...buildMovementReadiness(snapshot, displayedMapUuid),
-        ...buildMapConsistencyIssues(snapshot, displayedMapUuid),
-        ...(snapshot.navState?.active
-          ? ["Active navigation must be held or completed before sending a new destination."]
-          : [])
-      ]),
-    [snapshot, displayedMapUuid]
+  const localizationStatus = getLocalizationStatus(snapshot);
+  const mapSurfaceStatus = getMapSurfaceStatus(snapshot, catalogCurrentMapId, displayedMapUuid);
+  const systemStatus = useMemo(
+    () => buildSystemStatus(snapshot, catalogCurrentMapId, displayedMapUuid),
+    [snapshot, catalogCurrentMapId, displayedMapUuid]
   );
 
   const mapLoadCommandAvailable = availableCommands.includes(config.mapLoadCommandName);
@@ -660,10 +796,11 @@ export default function App() {
     (snapshot.maps || []).forEach((mapId) => {
       if (mapId) ids.add(mapId);
     });
-    if (currentMapId) ids.add(currentMapId);
+    if (catalogCurrentMapId) ids.add(catalogCurrentMapId);
+    if (displayedMapId) ids.add(displayedMapId);
     if (defaultMapId) ids.add(defaultMapId);
     return [...ids];
-  }, [snapshot.maps, currentMapId, defaultMapId]);
+  }, [snapshot.maps, catalogCurrentMapId, displayedMapId, defaultMapId]);
 
   const sortedMaps = useMemo(() => {
     const filter = mapSearch.trim().toLowerCase();
@@ -684,51 +821,70 @@ export default function App() {
 
   const selectionReadinessIssues = useMemo(() => {
     if (!selection) return [];
-
-    const issues = [...movementReadinessIssues];
-    if (selection.mapUuid && displayedMapUuid && selection.mapUuid !== displayedMapUuid) {
-      issues.push("The selected target no longer matches the displayed map.");
-    }
-
     if (selection.kind === "waypoint") {
+      const issues = buildWaypointNavigationIssues(snapshot, selection, displayedMapUuid);
       if (!waypointCommandAvailable) issues.push("Waypoint goto command is unavailable.");
-      if (!isFresh(snapshot.overlayTime, 15000)) issues.push("Waypoint overlay is stale.");
-      if (!snapshot.overlay) {
-        issues.push("Waypoint overlay is unavailable.");
-      } else if (!snapshot.overlay.waypoints.some((waypoint) => waypoint.id === selection.waypoint.id)) {
-        issues.push("Selected waypoint is no longer available.");
+      if (snapshot.navState?.active) {
+        issues.push("Hold or complete the active navigation before sending a new destination.");
       }
-    } else {
-      if (!gotoPoseCommandAvailable) issues.push("Point goto command is unavailable.");
-      if (!isFresh(snapshot.mapImageMetadataTime, 8000)) {
-        issues.push("Displayed map metadata is stale.");
-      }
+      return uniqueIssues(issues);
     }
-
+    const issues = buildPointNavigationIssues(snapshot, selection, displayedMapUuid);
+    if (!gotoPoseCommandAvailable) issues.push("Point goto command is unavailable.");
+    if (snapshot.navState?.active) {
+      issues.push("Hold or complete the active navigation before sending a new destination.");
+    }
     return uniqueIssues(issues);
   }, [
     displayedMapUuid,
     gotoPoseCommandAvailable,
-    movementReadinessIssues,
     selection,
-    snapshot.mapImageMetadataTime,
     snapshot.overlay,
     snapshot.overlayTime,
+    snapshot.navState?.active,
     waypointCommandAvailable
   ]);
 
+  const connectionStateFresh = isFresh(snapshot.connectionStateTime, 45000);
+  const dockingStateFresh = isFresh(snapshot.dockingStateTime, 45000);
+  const motorStateFresh = isFresh(snapshot.motorPowerStateTime, 45000);
+  const behaviorStateFresh = isFresh(snapshot.behaviorStateTime, 45000);
   const connectionReady =
-    isFresh(snapshot.connectionStateTime, 45000) && snapshot.connectionState === "connected";
-  const dockingReady = isFresh(snapshot.dockingStateTime, 45000);
+    connectionStateFresh && snapshot.connectionState === "connected";
+  const dockingReady = dockingStateFresh;
   const navReady = isFresh(snapshot.navStateTime, 4000);
   const motorReady =
-    isFresh(snapshot.motorPowerStateTime, 45000) && snapshot.motorPowerState === "on";
+    motorStateFresh && snapshot.motorPowerState === "on";
   const localizedReady = navReady && Boolean(snapshot.navState?.localized);
   const mapsReady = isFresh(snapshot.mapsTime, 60000);
-  const currentMapReady =
-    Boolean(currentMapId) &&
-    (Boolean(snapshot.mapImageMetadata?.map_id) || isFresh(snapshot.currentMapTime, 60000));
+  const currentMapReady = !catalogCurrentMapId || isFresh(snapshot.currentMapTime, 60000);
   const defaultMapReady = !defaultMapId || isFresh(snapshot.defaultMapTime, 60000);
+
+  const mapChipLabel = currentMapId || "No map";
+  const mapSurfaceLabel =
+    mapSurfaceStatus === "live"
+      ? "Live map"
+      : mapSurfaceStatus === "catalog"
+        ? "Catalog only"
+        : "Map unavailable";
+  const localizationChipLabel =
+    localizationStatus === "localized"
+      ? "Localized"
+      : localizationStatus === "not_localized"
+        ? "Not localized"
+        : "Localization unknown";
+  const connectionChipLabel = connectionStateFresh
+    ? snapshot.connectionState || "connection unknown"
+    : "connection unknown";
+  const dockingChipLabel = dockingStateFresh
+    ? snapshot.dockingState || "docking unknown"
+    : "docking unknown";
+  const motorChipLabel = motorStateFresh
+    ? `motors ${snapshot.motorPowerState || "unknown"}`
+    : "motors unknown";
+  const behaviorChipLabel = behaviorStateFresh
+    ? snapshot.behaviorState || "behavior unknown"
+    : "behavior unknown";
 
   const activeNavLabel =
     snapshot.navState?.target_name ||
@@ -908,7 +1064,7 @@ export default function App() {
 
   const selectionReady = Boolean(selection) && selectionReadinessIssues.length === 0;
   const canLoadMaps = mapLoadCommandAvailable && connectionReady && !snapshot.navState?.active;
-  const canSetDefaultMaps = mapSetDefaultCommandAvailable && connectionReady;
+  const canSetDefaultMaps = mapSetDefaultCommandAvailable;
 
   return (
     <ThemeProvider theme={theme}>
@@ -954,29 +1110,46 @@ export default function App() {
                 useFlexGap
                 sx={{ position: "absolute", top: 12, left: 12, right: 12 }}
               >
-                <Chip label={getMapLabel(snapshot)} color="primary" />
+                <Chip label={mapChipLabel} color="primary" />
                 <Chip
-                  label={snapshot.navState?.localized ? "Localized" : "Not localized"}
-                  color={snapshot.navState?.localized ? "secondary" : "default"}
-                  variant={snapshot.navState?.localized ? "filled" : "outlined"}
+                  label={mapSurfaceLabel}
+                  color={
+                    mapSurfaceStatus === "live"
+                      ? "secondary"
+                      : mapSurfaceStatus === "unavailable"
+                        ? "warning"
+                        : "default"
+                  }
+                  variant="outlined"
                 />
                 <Chip
-                  label={snapshot.connectionState || "connection"}
+                  label={localizationChipLabel}
+                  color={
+                    localizationStatus === "localized"
+                      ? "secondary"
+                      : localizationStatus === "not_localized"
+                        ? "warning"
+                        : "default"
+                  }
+                  variant={localizationStatus === "localized" ? "filled" : "outlined"}
+                />
+                <Chip
+                  label={connectionChipLabel}
                   color={statusTone(snapshot.connectionState)}
                   variant="outlined"
                 />
                 <Chip
-                  label={snapshot.dockingState || "docking"}
+                  label={dockingChipLabel}
                   color={statusTone(snapshot.dockingState)}
                   variant="outlined"
                 />
                 <Chip
-                  label={`motors ${snapshot.motorPowerState || "unknown"}`}
+                  label={motorChipLabel}
                   color={statusTone(snapshot.motorPowerState)}
                   variant="outlined"
                 />
                 <Chip
-                  label={snapshot.behaviorState || "behavior"}
+                  label={behaviorChipLabel}
                   color={statusTone(snapshot.behaviorState)}
                   variant="outlined"
                 />
@@ -1048,6 +1221,13 @@ export default function App() {
                               ? "No default map configured."
                               : "No saved maps published yet."}
                         </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {mapSurfaceStatus === "live"
+                            ? "Live map view is available."
+                            : currentMapId
+                              ? "Map catalog is available; live map view is unavailable."
+                              : "No live map view available."}
+                        </Typography>
                       </Stack>
                       <Stack direction="row" spacing={1}>
                         {currentMapId && currentMapId !== defaultMapId ? (
@@ -1083,8 +1263,13 @@ export default function App() {
                       {allMapIds.length ? (
                         <Chip size="small" label={`${allMapIds.length} saved`} variant="outlined" />
                       ) : null}
+                      <Chip
+                        size="small"
+                        label={mapSurfaceStatus === "live" ? "Live view" : "Catalog"}
+                        variant="outlined"
+                      />
                       {!mapsReady ? (
-                        <Chip size="small" label="Map list stale" color="warning" variant="outlined" />
+                        <Chip size="small" label="Catalog stale" color="warning" variant="outlined" />
                       ) : null}
                     </Stack>
 
@@ -1300,20 +1485,28 @@ export default function App() {
                   </Button>
                 </Stack>
 
-                {movementReadinessIssues.length ? (
-                  <Alert severity="warning">
-                    <Stack spacing={0.5}>
-                      <Typography variant="subtitle2">Movement blocked</Typography>
-                      {movementReadinessIssues.map((issue) => (
-                        <Typography key={issue} variant="body2">
-                          {issue}
-                        </Typography>
-                      ))}
+                <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.03)" }}>
+                  <Stack spacing={0.75}>
+                    <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Typography variant="subtitle2">System Status</Typography>
+                      <Chip
+                        size="small"
+                        label={systemStatus.title}
+                        color={
+                          systemStatus.severity === "success"
+                            ? "secondary"
+                            : systemStatus.severity === "warning"
+                              ? "warning"
+                              : "default"
+                        }
+                        variant={systemStatus.severity === "success" ? "filled" : "outlined"}
+                      />
                     </Stack>
-                  </Alert>
-                ) : (
-                  <Alert severity="success">Robot is ready for waypoint or point navigation.</Alert>
-                )}
+                    <Typography variant="body2" color="text.secondary">
+                      {systemStatus.detail}
+                    </Typography>
+                  </Stack>
+                </Box>
 
                 {snapshot.navState?.active ? (
                   <Box sx={{ p: 1.5, borderRadius: 2, bgcolor: "rgba(255,255,255,0.03)" }}>
