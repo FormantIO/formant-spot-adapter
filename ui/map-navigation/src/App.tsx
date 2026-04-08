@@ -398,31 +398,69 @@ function StatusTile({
   value: string;
   tone: "good" | "neutral" | "caution" | "bad";
 }) {
-  const toneColor =
+  const lightColor =
     tone === "good"
-      ? alpha("#89f3c7", 0.16)
+      ? "#89f3c7"
       : tone === "caution"
-        ? alpha("#ffb44d", 0.14)
+        ? "#ffb44d"
         : tone === "bad"
-          ? alpha("#ff6c7b", 0.14)
-          : "rgba(255,255,255,0.04)";
+          ? "#ff6c7b"
+          : "rgba(255,255,255,0.34)";
+  const glowColor =
+    tone === "good"
+      ? alpha("#89f3c7", 0.22)
+      : tone === "caution"
+        ? alpha("#ffb44d", 0.2)
+        : tone === "bad"
+          ? alpha("#ff6c7b", 0.2)
+          : "rgba(255,255,255,0.06)";
 
   return (
     <Box
       sx={{
-        px: 1.2,
-        py: 1,
-        borderRadius: 2,
+        px: 1,
+        py: 0.9,
+        minHeight: 58,
+        borderRadius: 1.75,
         border: "1px solid rgba(255,255,255,0.06)",
-        backgroundColor: toneColor
+        backgroundColor: "rgba(255,255,255,0.025)"
       }}
     >
-      <Typography variant="caption" color="text.secondary">
-        {label}
-      </Typography>
-      <Typography variant="body2" sx={{ fontWeight: 600 }}>
-        {value}
-      </Typography>
+      <Stack spacing={0.45}>
+        <Stack direction="row" spacing={0.75} alignItems="center">
+          <Box
+            sx={{
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              flexShrink: 0,
+              backgroundColor: lightColor,
+              boxShadow: `0 0 0 4px ${glowColor}`
+            }}
+          />
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            sx={{ lineHeight: 1.1, whiteSpace: "nowrap" }}
+          >
+            {label}
+          </Typography>
+        </Stack>
+        <Typography
+          variant="body2"
+          sx={{
+            fontWeight: 600,
+            lineHeight: 1.1,
+            fontSize: "0.83rem",
+            pl: 1.9,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis"
+          }}
+        >
+          {value}
+        </Typography>
+      </Stack>
     </Box>
   );
 }
@@ -1719,8 +1757,8 @@ export default function App() {
                   <Box
                     sx={{
                       display: "grid",
-                      gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-                      gap: 1
+                      gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                      gap: 0.8
                     }}
                   >
                     {robotMetrics.map((metric) => (
