@@ -16,6 +16,7 @@ struct Config {
   std::string formant_agent_target{"localhost:5501"};
 
   std::string teleop_twist_stream{"Joystick"};
+  std::string teleop_joy_stream{""};
   std::string teleop_buttons_stream{"Buttons"};
   std::string stand_button_stream{"Stand"};
   std::string sit_button_stream{"Sit"};
@@ -29,6 +30,24 @@ struct Config {
   std::string dock_button_stream{"Dock"};
   std::string can_dock_stream{"spot.can_dock"};
   std::string stateful_mode_stream{"spot.mode_state"};
+
+  int joy_axis_forward{1};
+  int joy_axis_strafe{0};
+  int joy_axis_yaw{2};
+  int joy_axis_body_pitch{3};
+  bool joy_axis_forward_inverted{true};
+  bool joy_axis_strafe_inverted{true};
+  bool joy_axis_yaw_inverted{true};
+  bool joy_axis_body_pitch_inverted{true};
+  int joy_button_stand{0};
+  int joy_button_sit{1};
+  int joy_button_reset_arm{2};
+  int joy_button_recover{-1};
+  int joy_button_walk{12};
+  int joy_button_stairs{15};
+  int joy_button_crawl{14};
+  int joy_button_dock{-1};
+  int joy_button_estop{-1};
 
   std::string camera_source{"hand_color_image"};
   std::string camera_stream_name{"spot.hand.image"};

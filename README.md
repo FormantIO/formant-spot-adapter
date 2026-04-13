@@ -14,7 +14,7 @@ Boston Dynamics.
 
 ## What It Does
 
-- Teleop motion from Formant twist control.
+- Teleop motion from Formant twist control, with optional adapter-side gamepad (`Joy`) mapping.
 - Stand/Sit, E-Stop, Recover, Dock, locomotion mode, and arm mode controls.
 - Arm stow hold while lease is active.
 - Image publishing from hand, left, right, and back cameras.
@@ -30,6 +30,7 @@ Boston Dynamics.
 | Stream name (default) | Type | Used for | Notes |
 |---|---|---|---|
 | `Joystick` | `Twist` | Drive + body pitch | `linear.x` forward/back, `linear.y` strafe, `angular.z` yaw, `angular.y` body pitch |
+| `Gamepad` | `Joy` | Optional gamepad bridge | Adapter maps configured controller axes/buttons onto the same motion + action handlers used by `Joystick`/button streams. Default mapping expects the teleop app `joy-bridge` / browser gamepad layout |
 | `Buttons` | `Bitset` | Multi-button input | Recognized keys: `Stand`, `Sit`, `E-Stop`, `Recover`, `Dock`, `Walk`, `Stairs`, `Crawl`, `Reset Arm` |
 | `Stand` | `Bitset`/boolean-to-device | Stand command | Any `true` bit triggers stand |
 | `Sit` | `Bitset`/boolean-to-device | Sit command | Any `true` bit triggers sit |

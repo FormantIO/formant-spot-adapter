@@ -37,6 +37,7 @@ class Adapter {
   void HandleTeleop(const v1::model::ControlDatapoint& dp);
   void HandleHeartbeat(const v1::agent::GetTeleopHeartbeatStreamResponse& hb);
   void HandleCommand(const v1::model::CommandRequest& request);
+  void HandleJoy(const v1::model::Joy& joy);
   void HandleButtons(const v1::model::Bitset& bitset, const std::string& source_stream);
   void HandleButtonPress(const std::string& button_key, const std::string& source_stream);
   bool EnsureLeaseForCommand(const std::string& action_name);
@@ -68,6 +69,7 @@ class Adapter {
   bool RetryActiveGraphNavCommandWithRecovery(const std::string& action_name,
                                               uint32_t* out_command_id);
   void HandleTwist(const v1::model::Twist& twist);
+  void ApplyTeleopTwist(const v1::model::Twist& twist, int source_id, const char* source_name);
   void DockLoop();
   void ApplyDesiredArmMode(bool force = false);
   bool IsArmLikelyStowed();
@@ -202,7 +204,9 @@ class Adapter {
   std::atomic<long long> last_lease_attempt_ms_{0};
   std::atomic<long long> dock_cooldown_until_ms_{0};
   std::atomic<int> resolved_dock_id_{-1};
+  std::atomic<int> active_motion_source_{0};
   std::string last_logged_control_stream_;
+  std::vector<int> last_joy_buttons_;
 
   std::vector<std::thread> camera_threads_;
   std::thread surround_image_thread_;

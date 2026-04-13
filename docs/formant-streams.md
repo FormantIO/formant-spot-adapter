@@ -18,6 +18,24 @@ If you rename a stream from its default, use the renamed stream name in `streamC
 - `angular.z` = yaw left/right
 - `angular.y` = body pitch up/down (clamped by `maxBodyPitchRad`)
 
+- `Gamepad` (type: `sensor_msgs/Joy` equivalent RTC joy stream, optional)
+- Intended for the teleop app `joy-bridge` module / browser gamepad support.
+- Adapter-side mapping translates it into the same motion path used by `Joystick`.
+- Default axis mapping:
+- axis `1` (inverted) -> `linear.x`
+- axis `0` (inverted) -> `linear.y`
+- axis `2` (inverted) -> `angular.z`
+- axis `3` (inverted) -> `angular.y`
+- Default button mapping:
+- button `0` -> `Stand`
+- button `1` -> `Sit`
+- button `2` -> `Reset Arm`
+- button `12` -> `Walk`
+- button `15` -> `Stairs`
+- button `14` -> `Crawl`
+- `Recover`, `Dock`, and `E-Stop` are intentionally unmapped by default.
+- `teleopJoyStream` is empty by default; set it explicitly to enable this path.
+
 - `Buttons` (type: Bitset)
 - Include at least two buttons:
 - `Stand`

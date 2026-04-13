@@ -135,6 +135,24 @@ const char* motion_mode_state_name(int raw_mode) {
   }
 }
 
+constexpr int kMotionSourceNone = 0;
+constexpr int kMotionSourceTwist = 1;
+constexpr int kMotionSourceJoy = 2;
+
+double joy_axis_value(const v1::model::Joy& joy, int index, bool inverted) {
+  if (index < 0 || index >= joy.axes_size()) return 0.0;
+  const double value = static_cast<double>(joy.axes(index));
+  return inverted ? -value : value;
+}
+
+bool joy_button_pressed(const std::vector<int>& buttons, int index) {
+  return index >= 0 && index < static_cast<int>(buttons.size()) && buttons[index] > 0;
+}
+
+bool joy_button_pressed(const v1::model::Joy& joy, int index) {
+  return index >= 0 && index < joy.buttons_size() && joy.buttons(index) > 0;
+}
+
 const char* docking_state_name(int status) {
   switch (status) {
     case ::bosdyn::api::docking::DockState_DockedStatus_DOCK_STATUS_DOCKED:
@@ -2077,6 +2095,7 @@ bool Adapter::Init() {
   last_control_ms_ = now_ms();
   moving_ = false;
   desired_twist_valid_ = false;
+  active_motion_source_ = kMotionSourceNone;
   {
     std::lock_guard<std::mutex> lk(twist_cmd_mu_);
     desired_vx_ = 0.0;
@@ -2148,8 +2167,9 @@ void Adapter::Run() {
   running_ = true;
   std::cerr << "[adapter] starting teleop loops" << std::endl;
 
-  std::vector<std::string> stream_filter{cfg_.teleop_twist_stream, cfg_.teleop_buttons_stream,
-                                         cfg_.stand_button_stream, cfg_.sit_button_stream,
+  std::vector<std::string> stream_filter{cfg_.teleop_twist_stream, cfg_.teleop_joy_stream,
+                                         cfg_.teleop_buttons_stream, cfg_.stand_button_stream,
+                                         cfg_.sit_button_stream,
                                          cfg_.estop_button_stream, cfg_.recover_button_stream,
                                          cfg_.walk_button_stream, cfg_.stairs_button_stream,
                                          cfg_.crawl_button_stream, cfg_.reset_arm_button_stream,
@@ -2283,6 +2303,7 @@ void Adapter::Run() {
         }
         lease_owned_ = false;
         desired_twist_valid_ = false;
+  active_motion_source_ = kMotionSourceNone;
         {
           std::lock_guard<std::mutex> lk(twist_cmd_mu_);
           desired_vx_ = 0.0;
@@ -2304,6 +2325,7 @@ void Adapter::Run() {
       const int stale_twist_timeout_ms = std::max(250, cfg_.teleop_idle_timeout_ms);
       if (has_desired && twist_age_ms > stale_twist_timeout_ms) {
         desired_twist_valid_ = false;
+  active_motion_source_ = kMotionSourceNone;
         has_desired = false;
         {
           std::lock_guard<std::mutex> lk(twist_cmd_mu_);
@@ -3562,6 +3584,7 @@ void Adapter::SetSpotDisconnected(const std::string& reason) {
   graphnav_navigation_active_ = false;
   last_graph_nav_command_id_ = 0;
   desired_twist_valid_ = false;
+  active_motion_source_ = kMotionSourceNone;
   {
     std::lock_guard<std::mutex> lk(twist_cmd_mu_);
     desired_vx_ = 0.0;
@@ -3643,6 +3666,7 @@ void Adapter::ApplySoftRecoveryForRobotState(const SpotClient::RobotStateSnapsho
   if (!degraded) return;
 
   desired_twist_valid_ = false;
+  active_motion_source_ = kMotionSourceNone;
   {
     std::lock_guard<std::mutex> lk(twist_cmd_mu_);
     desired_vx_ = 0.0;
@@ -4199,6 +4223,11 @@ void Adapter::HandleTeleop(const v1::model::ControlDatapoint& dp) {
       last_non_bitset_press_ms[dp.stream()] = now;
       HandleButtonPress(dp.stream(), dp.stream());
     }
+    return;
+  }
+
+  if (dp.stream() == cfg_.teleop_joy_stream && dp.has_joy()) {
+    HandleJoy(dp.joy());
     return;
   }
 
@@ -5003,6 +5032,41 @@ bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
   return false;
 }
 
+void Adapter::HandleJoy(const v1::model::Joy& joy) {
+  const std::vector<int> previous_buttons = last_joy_buttons_;
+  last_joy_buttons_.assign(joy.buttons().begin(), joy.buttons().end());
+
+  const std::string source_stream = cfg_.teleop_joy_stream.empty() ? std::string("Joy")
+                                                                    : cfg_.teleop_joy_stream;
+  const auto handle_mapped_button = [&](int button_index, const std::string& target_stream) {
+    if (button_index < 0 || target_stream.empty()) return;
+    if (joy_button_pressed(joy, button_index) && !joy_button_pressed(previous_buttons, button_index)) {
+      HandleButtonPress(target_stream, source_stream);
+    }
+  };
+
+  handle_mapped_button(cfg_.joy_button_stand, cfg_.stand_button_stream);
+  handle_mapped_button(cfg_.joy_button_sit, cfg_.sit_button_stream);
+  handle_mapped_button(cfg_.joy_button_estop, cfg_.estop_button_stream);
+  handle_mapped_button(cfg_.joy_button_recover, cfg_.recover_button_stream);
+  handle_mapped_button(cfg_.joy_button_walk, cfg_.walk_button_stream);
+  handle_mapped_button(cfg_.joy_button_stairs, cfg_.stairs_button_stream);
+  handle_mapped_button(cfg_.joy_button_crawl, cfg_.crawl_button_stream);
+  handle_mapped_button(cfg_.joy_button_reset_arm, cfg_.reset_arm_button_stream);
+  handle_mapped_button(cfg_.joy_button_dock, cfg_.dock_button_stream);
+
+  v1::model::Twist twist;
+  twist.mutable_linear()->set_x(
+      joy_axis_value(joy, cfg_.joy_axis_forward, cfg_.joy_axis_forward_inverted));
+  twist.mutable_linear()->set_y(
+      joy_axis_value(joy, cfg_.joy_axis_strafe, cfg_.joy_axis_strafe_inverted));
+  twist.mutable_angular()->set_z(
+      joy_axis_value(joy, cfg_.joy_axis_yaw, cfg_.joy_axis_yaw_inverted));
+  twist.mutable_angular()->set_y(
+      joy_axis_value(joy, cfg_.joy_axis_body_pitch, cfg_.joy_axis_body_pitch_inverted));
+  ApplyTeleopTwist(twist, kMotionSourceJoy, "joy");
+}
+
 void Adapter::HandleButtons(const v1::model::Bitset& bitset, const std::string& source_stream) {
   for (const auto& b : bitset.bits()) {
     if (!b.value()) continue;
@@ -5299,6 +5363,11 @@ bool Adapter::WaitForArmStow(int timeout_ms) {
 }
 
 void Adapter::HandleTwist(const v1::model::Twist& twist) {
+  ApplyTeleopTwist(twist, kMotionSourceTwist, "twist");
+}
+
+void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
+                               const char* source_name) {
   static constexpr long long kPitchZeroDropoutGraceMs = 80;
   if (now_ms() < dock_cooldown_until_ms_.load()) return;
   if (!TeleopSessionActive()) return;
@@ -5307,7 +5376,6 @@ void Adapter::HandleTwist(const v1::model::Twist& twist) {
   if (spot_degraded_non_estop_.load()) return;
   if (!lease_owned_) return;
   const long long now = now_ms();
-  last_twist_ms_ = now;
 
   const double raw_x = twist.linear().x();
   const double raw_y = twist.linear().y();
@@ -5331,6 +5399,19 @@ void Adapter::HandleTwist(const v1::model::Twist& twist) {
 
   const bool translational_cmd_nonzero = (vx != 0.0 || vy != 0.0 || wz != 0.0);
   const bool pitch_cmd_nonzero = (body_pitch != 0.0);
+  const bool has_motion = translational_cmd_nonzero || pitch_cmd_nonzero;
+  const int active_source = active_motion_source_.load();
+  if (has_motion) {
+    if (active_source != source_id) {
+      active_motion_source_ = source_id;
+      EmitLog(std::string("[teleop] motion source active=") + source_name);
+    }
+  } else if (active_source != source_id) {
+    return;
+  }
+
+  last_twist_ms_ = now;
+
   if (pitch_cmd_nonzero) {
     last_nonzero_cmd_ms_ = now;
   } else if (!translational_cmd_nonzero) {
@@ -5487,6 +5568,7 @@ void Adapter::DockLoop() {
       graphnav_navigation_active_ = true;
       nav_auto_recovered_ = false;
       desired_twist_valid_ = false;
+  active_motion_source_ = kMotionSourceNone;
       {
         std::lock_guard<std::mutex> lk(twist_cmd_mu_);
         desired_vx_ = 0.0;

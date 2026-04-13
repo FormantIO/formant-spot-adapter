@@ -90,6 +90,7 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_spot_host()) c->spot_host = j.spot_host().value();
   if (j.has_formant_agent_target()) c->formant_agent_target = j.formant_agent_target().value();
   if (j.has_teleop_twist_stream()) c->teleop_twist_stream = j.teleop_twist_stream().value();
+  if (j.has_teleop_joy_stream()) c->teleop_joy_stream = j.teleop_joy_stream().value();
   if (j.has_teleop_buttons_stream()) c->teleop_buttons_stream = j.teleop_buttons_stream().value();
   if (j.has_stand_button_stream()) c->stand_button_stream = j.stand_button_stream().value();
   if (j.has_sit_button_stream()) c->sit_button_stream = j.sit_button_stream().value();
@@ -103,6 +104,31 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_dock_button_stream()) c->dock_button_stream = j.dock_button_stream().value();
   if (j.has_can_dock_stream()) c->can_dock_stream = j.can_dock_stream().value();
   if (j.has_stateful_mode_stream()) c->stateful_mode_stream = j.stateful_mode_stream().value();
+  if (j.has_joy_axis_forward()) c->joy_axis_forward = j.joy_axis_forward().value();
+  if (j.has_joy_axis_strafe()) c->joy_axis_strafe = j.joy_axis_strafe().value();
+  if (j.has_joy_axis_yaw()) c->joy_axis_yaw = j.joy_axis_yaw().value();
+  if (j.has_joy_axis_body_pitch()) c->joy_axis_body_pitch = j.joy_axis_body_pitch().value();
+  if (j.has_joy_axis_forward_inverted()) {
+    c->joy_axis_forward_inverted = j.joy_axis_forward_inverted().value();
+  }
+  if (j.has_joy_axis_strafe_inverted()) {
+    c->joy_axis_strafe_inverted = j.joy_axis_strafe_inverted().value();
+  }
+  if (j.has_joy_axis_yaw_inverted()) {
+    c->joy_axis_yaw_inverted = j.joy_axis_yaw_inverted().value();
+  }
+  if (j.has_joy_axis_body_pitch_inverted()) {
+    c->joy_axis_body_pitch_inverted = j.joy_axis_body_pitch_inverted().value();
+  }
+  if (j.has_joy_button_stand()) c->joy_button_stand = j.joy_button_stand().value();
+  if (j.has_joy_button_sit()) c->joy_button_sit = j.joy_button_sit().value();
+  if (j.has_joy_button_reset_arm()) c->joy_button_reset_arm = j.joy_button_reset_arm().value();
+  if (j.has_joy_button_recover()) c->joy_button_recover = j.joy_button_recover().value();
+  if (j.has_joy_button_walk()) c->joy_button_walk = j.joy_button_walk().value();
+  if (j.has_joy_button_stairs()) c->joy_button_stairs = j.joy_button_stairs().value();
+  if (j.has_joy_button_crawl()) c->joy_button_crawl = j.joy_button_crawl().value();
+  if (j.has_joy_button_dock()) c->joy_button_dock = j.joy_button_dock().value();
+  if (j.has_joy_button_estop()) c->joy_button_estop = j.joy_button_estop().value();
   if (j.has_camera_source()) c->camera_source = j.camera_source().value();
   if (j.has_camera_stream_name()) c->camera_stream_name = j.camera_stream_name().value();
   if (j.has_left_camera_source()) c->left_camera_source = j.left_camera_source().value();
@@ -216,6 +242,7 @@ Config load_config_from_env() {
   c.formant_agent_target = getenv_or("FORMANT_AGENT_TARGET", c.formant_agent_target);
 
   c.teleop_twist_stream = getenv_or("TELEOP_TWIST_STREAM", c.teleop_twist_stream);
+  c.teleop_joy_stream = getenv_or("TELEOP_JOY_STREAM", c.teleop_joy_stream);
   c.teleop_buttons_stream = getenv_or("TELEOP_BUTTONS_STREAM", c.teleop_buttons_stream);
   c.stand_button_stream = getenv_or("STAND_BUTTON_STREAM", c.stand_button_stream);
   c.sit_button_stream = getenv_or("SIT_BUTTON_STREAM", c.sit_button_stream);
@@ -229,6 +256,27 @@ Config load_config_from_env() {
   c.dock_button_stream = getenv_or("DOCK_BUTTON_STREAM", c.dock_button_stream);
   c.can_dock_stream = getenv_or("CAN_DOCK_STREAM", c.can_dock_stream);
   c.stateful_mode_stream = getenv_or("STATEFUL_MODE_STREAM", c.stateful_mode_stream);
+  c.joy_axis_forward = getenv_int_or("JOY_AXIS_FORWARD", c.joy_axis_forward);
+  c.joy_axis_strafe = getenv_int_or("JOY_AXIS_STRAFE", c.joy_axis_strafe);
+  c.joy_axis_yaw = getenv_int_or("JOY_AXIS_YAW", c.joy_axis_yaw);
+  c.joy_axis_body_pitch = getenv_int_or("JOY_AXIS_BODY_PITCH", c.joy_axis_body_pitch);
+  c.joy_axis_forward_inverted =
+      getenv_bool_or("JOY_AXIS_FORWARD_INVERTED", c.joy_axis_forward_inverted);
+  c.joy_axis_strafe_inverted =
+      getenv_bool_or("JOY_AXIS_STRAFE_INVERTED", c.joy_axis_strafe_inverted);
+  c.joy_axis_yaw_inverted =
+      getenv_bool_or("JOY_AXIS_YAW_INVERTED", c.joy_axis_yaw_inverted);
+  c.joy_axis_body_pitch_inverted =
+      getenv_bool_or("JOY_AXIS_BODY_PITCH_INVERTED", c.joy_axis_body_pitch_inverted);
+  c.joy_button_stand = getenv_int_or("JOY_BUTTON_STAND", c.joy_button_stand);
+  c.joy_button_sit = getenv_int_or("JOY_BUTTON_SIT", c.joy_button_sit);
+  c.joy_button_reset_arm = getenv_int_or("JOY_BUTTON_RESET_ARM", c.joy_button_reset_arm);
+  c.joy_button_recover = getenv_int_or("JOY_BUTTON_RECOVER", c.joy_button_recover);
+  c.joy_button_walk = getenv_int_or("JOY_BUTTON_WALK", c.joy_button_walk);
+  c.joy_button_stairs = getenv_int_or("JOY_BUTTON_STAIRS", c.joy_button_stairs);
+  c.joy_button_crawl = getenv_int_or("JOY_BUTTON_CRAWL", c.joy_button_crawl);
+  c.joy_button_dock = getenv_int_or("JOY_BUTTON_DOCK", c.joy_button_dock);
+  c.joy_button_estop = getenv_int_or("JOY_BUTTON_ESTOP", c.joy_button_estop);
 
   c.camera_source = getenv_or("CAMERA_SOURCE", c.camera_source);
   c.camera_stream_name = getenv_or("CAMERA_STREAM_NAME", c.camera_stream_name);

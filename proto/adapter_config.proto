@@ -86,4 +86,22 @@ message AdapterConfig {
   google.protobuf.Int32Value front_image_roll_degrees = 71;
   repeated StreamControl stream_controls = 72;
   google.protobuf.BoolValue arm_present = 76;
+  google.protobuf.StringValue teleop_joy_stream = 78;
+  google.protobuf.Int32Value joy_axis_forward = 79;
+  google.protobuf.Int32Value joy_axis_strafe = 80;
+  google.protobuf.Int32Value joy_axis_yaw = 81;
+  google.protobuf.Int32Value joy_axis_body_pitch = 82;
+  google.protobuf.BoolValue joy_axis_forward_inverted = 83;
+  google.protobuf.BoolValue joy_axis_strafe_inverted = 84;
+  google.protobuf.BoolValue joy_axis_yaw_inverted = 85;
+  google.protobuf.BoolValue joy_axis_body_pitch_inverted = 86;
+  google.protobuf.Int32Value joy_button_stand = 87;
+  google.protobuf.Int32Value joy_button_sit = 88;
+  google.protobuf.Int32Value joy_button_reset_arm = 89;
+  google.protobuf.Int32Value joy_button_recover = 90;
+  google.protobuf.Int32Value joy_button_walk = 91;
+  google.protobuf.Int32Value joy_button_stairs = 92;
+  google.protobuf.Int32Value joy_button_crawl = 93;
+  google.protobuf.Int32Value joy_button_dock = 94;
+  google.protobuf.Int32Value joy_button_estop = 95;
 }
