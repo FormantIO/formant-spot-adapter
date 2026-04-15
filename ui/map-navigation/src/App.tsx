@@ -1146,13 +1146,13 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (connectionHealth.transportReady === connectionReadyRef.current) return;
-    connectionReadyRef.current = connectionHealth.transportReady;
+    if (connectionHealth.interfaceReady === connectionReadyRef.current) return;
+    connectionReadyRef.current = connectionHealth.interfaceReady;
     setConnectionAttemptStartedAt(Date.now());
-    if (connectionHealth.transportReady) {
+    if (connectionHealth.interfaceReady) {
       setHasReachedReady(true);
     }
-  }, [connectionHealth.transportReady]);
+  }, [connectionHealth.interfaceReady]);
 
   useEffect(() => {
     const signature = JSON.stringify({
@@ -1160,7 +1160,8 @@ export default function App() {
       title: connectionScreenState.title,
       bootstrapStatus: bootstrapState.status,
       telemetryStatus: telemetryState.status,
-      transportReady: connectionHealth.transportReady,
+      interfaceReady: connectionHealth.interfaceReady,
+      liveSessionReady: connectionHealth.liveSessionReady,
       liveMapHealthy: connectionHealth.liveMapHealthy,
       catalogHealthy: connectionHealth.catalogHealthy
     });

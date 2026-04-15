@@ -30,7 +30,8 @@ export interface ConnectionHealth {
   liveMapHealthy: boolean;
   liveNavigationDataHealthy: boolean;
   catalogHealthy: boolean;
-  transportReady: boolean;
+  liveSessionReady: boolean;
+  interfaceReady: boolean;
 }
 
 export interface ConnectionScreenState {
@@ -193,6 +194,10 @@ export function deriveConnectionHealth(
     telemetryState.lastSuccessAt &&
       now - telemetryState.lastSuccessAt <= FORMANT_BACKEND_MAX_AGE_MS
   );
+  const liveSessionReady =
+    bootstrapState.status === "ready" && realtimeTransportHealthy && liveMapHealthy;
+  const interfaceReady =
+    formantBackendHealthy && (catalogHealthy || liveSessionReady);
 
   return {
     formantBackendHealthy,
@@ -201,7 +206,8 @@ export function deriveConnectionHealth(
     liveMapHealthy,
     liveNavigationDataHealthy,
     catalogHealthy,
-    transportReady: bootstrapState.status === "ready" && realtimeTransportHealthy && liveMapHealthy
+    liveSessionReady,
+    interfaceReady
   };
 }
 
@@ -482,11 +488,13 @@ export function buildConnectionScreenState(
     }
   ];
 
-  if (health.transportReady) {
+  if (health.interfaceReady) {
     return {
       phase: "ready",
       title: "Connected",
-      detail: "Formant and the live robot session are healthy.",
+      detail: health.liveSessionReady
+        ? "Formant and the live robot session are healthy."
+        : "Formant is healthy. Running in telemetry-backed catalog mode while live robot streams catch up.",
       steps
     };
   }

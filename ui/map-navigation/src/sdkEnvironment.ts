@@ -26,6 +26,16 @@ function unique(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
+function stripAuthTokenFromUrl(): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  const url = new URL(window.location.href);
+  const authToken = url.searchParams.get("auth") ?? undefined;
+  if (!authToken) return undefined;
+  url.searchParams.delete("auth");
+  window.history.replaceState(window.history.state, document.title, url.toString());
+  return authToken;
+}
+
 function decodeJwtPayload(token: string): Record<string, unknown> | undefined {
   try {
     const [, payload] = token.split(".");
@@ -163,9 +173,11 @@ function buildSdkConfig(environment: FormantEnvironment): {
 }
 
 export async function initializeFormantSdkEnvironment(): Promise<void> {
+  const authToken = stripAuthTokenFromUrl();
   const searchParams =
-    typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
-  const authToken = searchParams.get("auth") ?? undefined;
+    typeof window !== "undefined"
+      ? new URLSearchParams(window.location.search)
+      : new URLSearchParams();
   const detection = detectFormantEnvironment(searchParams);
   const sdkConfig = buildSdkConfig(detection.environment);
   const sdk = (await import("@formant/data-sdk")) as FormantSdkModule;
