@@ -1,5 +1,5 @@
 import ReactDOM from "react-dom/client";
-import App from "./App";
+import { initializeFormantSdkEnvironment } from "./sdkEnvironment";
 
 type ImmediateCallback = (...args: unknown[]) => void;
 
@@ -34,6 +34,10 @@ if (
   };
 }
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <App />
-);
+async function bootstrap(): Promise<void> {
+  await initializeFormantSdkEnvironment();
+  const { default: App } = await import("./App");
+  ReactDOM.createRoot(document.getElementById("root")!).render(<App />);
+}
+
+void bootstrap();

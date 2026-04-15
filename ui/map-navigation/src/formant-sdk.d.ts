@@ -1,4 +1,13 @@
 declare module "@formant/data-sdk" {
+  export const DataSdk: {
+    init(config: {
+      adminApi: string;
+      queryApi: string;
+      ingestionApi: string;
+      signalingApi: string;
+    }): void;
+  };
+
   export interface RealtimeStreamSource {
     id?: string;
     sourceType: "realtime";
@@ -30,6 +39,7 @@ declare module "@formant/data-sdk" {
   }
 
   export const Authentication: {
+    loginWithToken(token: string): Promise<void>;
     waitTilAuthenticated(): Promise<boolean>;
   };
 
