@@ -2111,8 +2111,15 @@ bool Adapter::Init() {
   if (!LoadAdapterMapState()) {
     std::cerr << "[graphnav] failed to load persisted map state" << std::endl;
   }
+  bool aborted_mapping_session = false;
+  std::string aborted_mapping_map_id;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
+    if (HasActiveMappingSessionLocked()) {
+      aborted_mapping_session = true;
+      aborted_mapping_map_id = mapping_session_.map_id;
+      ClearMappingSessionLocked();
+    }
     if (active_map_id_.empty() && !default_map_id_.empty()) {
       active_map_id_ = default_map_id_;
     }
@@ -2122,6 +2129,11 @@ bool Adapter::Init() {
     loaded_waypoint_id_to_label_.clear();
     loaded_waypoint_label_to_ids_.clear();
     loaded_waypoint_lower_label_to_ids_.clear();
+  }
+  if (aborted_mapping_session) {
+    std::cerr << "[graphnav] aborted persisted mapping session during startup map_id="
+              << aborted_mapping_map_id << std::endl;
+    (void)SaveAdapterMapState();
   }
   force_waypoint_publish_ = true;
   force_maps_publish_ = true;
@@ -3469,8 +3481,36 @@ void Adapter::LeaseRetainLoop() {
                   " fiducials=" + std::to_string(map_status.visible_fiducial_ids.size()) +
                   " recording=" + std::string(map_status.is_recording ? "true" : "false"));
         }
+        bool session_regressed = false;
+        std::string session_regression_reason;
+        {
+          std::lock_guard<std::mutex> lk(map_mu_);
+          if (map_status.is_recording && HasActiveMappingSessionLocked() &&
+              mapping_session_.baseline_stats.waypoint_count > 0 &&
+              MappingSessionAppliesToMapLocked(active_map_id_)) {
+            if (map_status.waypoint_count < mapping_session_.baseline_stats.waypoint_count) {
+              session_regressed = true;
+              session_regression_reason =
+                  "live waypoint count regressed from " +
+                  std::to_string(mapping_session_.baseline_stats.waypoint_count) + " to " +
+                  std::to_string(map_status.waypoint_count);
+            } else if (map_status.edge_count < mapping_session_.baseline_stats.edge_count) {
+              session_regressed = true;
+              session_regression_reason =
+                  "live edge count regressed from " +
+                  std::to_string(mapping_session_.baseline_stats.edge_count) + " to " +
+                  std::to_string(map_status.edge_count);
+            }
+          }
+        }
+        if (session_regressed) {
+          MarkMappingSessionUnsafe(session_regression_reason);
+        }
       } else if (map_recording_active_) {
         EmitLog(std::string("[graphnav] map progress poll failed: ") + spot_.LastError());
+        if (spot_.LastError().find("ClientCancelledOperationError") != std::string::npos) {
+          MarkMappingSessionUnsafe("mapping progress polling cancelled while recording");
+        }
       }
       last_map_progress_pub_ms = now;
     }
@@ -3819,6 +3859,7 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
   std::string restore_map_id;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
+    if (HasActiveMappingSessionLocked()) return;
     restore_map_id = pending_restore_map_id_;
   }
   if (restore_map_id.empty()) return;
@@ -5721,6 +5762,58 @@ std::string Adapter::MapDirectoryFor(const std::string& map_id) const {
   return cfg_.graphnav_store_dir + "/maps/" + sanitize_id_token(map_id);
 }
 
+std::string Adapter::MapMetadataPathFor(const std::string& map_id) const {
+  return MapDirectoryFor(map_id) + "/meta.txt";
+}
+
+std::string Adapter::MapRevisionDirectoryFor(const std::string& map_id,
+                                             const std::string& revision_id) const {
+  return MapDirectoryFor(map_id) + "/revisions/" + sanitize_id_token(revision_id);
+}
+
+std::string Adapter::SanitizeStateField(const std::string& value) const {
+  std::string out = value;
+  for (char& ch : out) {
+    if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+  }
+  return out;
+}
+
+void Adapter::ClearMappingSessionLocked() {
+  mapping_session_ = MappingSessionState{};
+}
+
+bool Adapter::HasActiveMappingSessionLocked() const {
+  return mapping_session_.active && !mapping_session_.map_id.empty();
+}
+
+bool Adapter::MappingSessionAppliesToMapLocked(const std::string& map_id) const {
+  return !map_id.empty() && HasActiveMappingSessionLocked() && mapping_session_.map_id == map_id;
+}
+
+void Adapter::MarkMappingSessionUnsafe(const std::string& reason) {
+  std::string session_id;
+  std::string map_id;
+  std::string safe_reason;
+  bool changed = false;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (!HasActiveMappingSessionLocked()) return;
+    safe_reason = SanitizeStateField(reason);
+    if (!mapping_session_.unsafe || mapping_session_.unsafe_reason != safe_reason) {
+      mapping_session_.unsafe = true;
+      mapping_session_.unsafe_reason = safe_reason;
+      session_id = mapping_session_.session_id;
+      map_id = mapping_session_.map_id;
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  (void)SaveAdapterMapState();
+  EmitLog("[graphnav] mapping session marked unsafe map_id=" + map_id +
+          " session_id=" + session_id + " reason=" + safe_reason);
+}
+
 bool Adapter::SaveCurrentMapToDisk(const std::string& map_id) {
   if (map_id.empty()) return false;
   SpotClient::StoredMap map_data;
@@ -5728,9 +5821,8 @@ bool Adapter::SaveCurrentMapToDisk(const std::string& map_id) {
   return SaveMapToDisk(map_id, map_data);
 }
 
-bool Adapter::SaveMapToDisk(const std::string& map_id, const SpotClient::StoredMap& map_data) {
-  if (map_id.empty()) return false;
-  const std::string map_dir = MapDirectoryFor(map_id);
+bool Adapter::SaveMapDataToDirectory(const std::string& map_dir,
+                                     const SpotClient::StoredMap& map_data) {
   std::string storage_error;
   if (!recover_map_directory_state(map_dir, &storage_error)) {
     EmitLog(std::string("[graphnav] failed preparing map directory: ") + storage_error);
@@ -5839,10 +5931,94 @@ bool Adapter::SaveMapToDisk(const std::string& map_id, const SpotClient::StoredM
   return true;
 }
 
-bool Adapter::LoadMapFromDisk(const std::string& map_id, SpotClient::StoredMap* out_map) {
-  if (!out_map || map_id.empty()) return false;
-  SpotClient::StoredMap map_data;
+bool Adapter::WriteCurrentRevisionMetadata(const std::string& map_id, const std::string& revision_id) {
+  if (map_id.empty() || revision_id.empty()) return false;
+  const std::string meta_path = MapMetadataPathFor(map_id);
+  const std::string temp_path = meta_path + ".tmp";
+  std::error_code ec;
+  std::filesystem::create_directories(MapDirectoryFor(map_id), ec);
+  if (ec) {
+    EmitLog(std::string("[graphnav] failed creating map metadata dir: ") + ec.message());
+    return false;
+  }
+  {
+    std::ofstream out(temp_path, std::ios::trunc);
+    if (!out) return false;
+    out << "current_revision=" << sanitize_id_token(revision_id) << "\n";
+  }
+  std::filesystem::rename(temp_path, meta_path, ec);
+  if (ec) {
+    std::filesystem::remove(temp_path, ec);
+    EmitLog(std::string("[graphnav] failed writing map metadata: ") + ec.message());
+    return false;
+  }
+  return true;
+}
+
+bool Adapter::SaveCommittedMapRevision(const std::string& map_id,
+                                       const SpotClient::StoredMap& map_data,
+                                       std::string* out_revision_id) {
+  if (map_id.empty()) return false;
+  std::string revision_id = "rev-" + std::to_string(now_ms());
+  std::error_code ec;
+  for (int suffix = 0; std::filesystem::exists(MapRevisionDirectoryFor(map_id, revision_id), ec) && !ec;
+       ++suffix) {
+    revision_id = "rev-" + std::to_string(now_ms()) + "-" + std::to_string(suffix + 1);
+  }
+  if (ec) {
+    EmitLog(std::string("[graphnav] failed checking revision dir: ") + ec.message());
+    return false;
+  }
+  const std::string revision_dir = MapRevisionDirectoryFor(map_id, revision_id);
+  if (!SaveMapDataToDirectory(revision_dir, map_data)) return false;
+  if (!WriteCurrentRevisionMetadata(map_id, revision_id)) return false;
+  if (out_revision_id) *out_revision_id = revision_id;
+  return true;
+}
+
+bool Adapter::SaveMapToDisk(const std::string& map_id, const SpotClient::StoredMap& map_data) {
+  return SaveCommittedMapRevision(map_id, map_data, nullptr);
+}
+
+bool Adapter::ResolveCommittedMapDirectory(const std::string& map_id,
+                                           std::string* out_dir,
+                                           std::string* out_revision_id) const {
+  if (map_id.empty()) return false;
   const std::string map_dir = MapDirectoryFor(map_id);
+  const std::string meta_path = MapMetadataPathFor(map_id);
+  std::error_code ec;
+  if (std::filesystem::exists(meta_path, ec) && !ec) {
+    std::ifstream in(meta_path);
+    std::string line;
+    std::string current_revision;
+    while (std::getline(in, line)) {
+      const std::string t = Trim(line);
+      if (t.rfind("current_revision=", 0) == 0) {
+        current_revision = t.substr(std::string("current_revision=").size());
+        break;
+      }
+    }
+    if (!current_revision.empty()) {
+      const std::string revision_dir = MapRevisionDirectoryFor(map_id, current_revision);
+      if (std::filesystem::exists(revision_dir + "/graph.bin", ec) && !ec) {
+        if (out_dir) *out_dir = revision_dir;
+        if (out_revision_id) *out_revision_id = current_revision;
+        return true;
+      }
+    }
+  }
+  if (ec) return false;
+  if (std::filesystem::exists(map_dir + "/graph.bin", ec) && !ec) {
+    if (out_dir) *out_dir = map_dir;
+    if (out_revision_id) out_revision_id->clear();
+    return true;
+  }
+  return false;
+}
+
+bool Adapter::LoadMapFromDirectory(const std::string& map_dir, SpotClient::StoredMap* out_map) {
+  if (!out_map || map_dir.empty()) return false;
+  SpotClient::StoredMap map_data;
   std::string storage_error;
   if (!recover_map_directory_state(map_dir, &storage_error)) {
     EmitLog(std::string("[graphnav] failed recovering saved map dir: ") + storage_error);
@@ -5902,6 +6078,13 @@ bool Adapter::LoadMapFromDisk(const std::string& map_id, SpotClient::StoredMap* 
   return true;
 }
 
+bool Adapter::LoadMapFromDisk(const std::string& map_id, SpotClient::StoredMap* out_map) {
+  if (!out_map || map_id.empty()) return false;
+  std::string map_dir;
+  if (!ResolveCommittedMapDirectory(map_id, &map_dir, nullptr)) return false;
+  return LoadMapFromDirectory(map_dir, out_map);
+}
+
 bool Adapter::DeleteMapFromDisk(const std::string& map_id) {
   if (map_id.empty()) return false;
   std::error_code ec;
@@ -5919,6 +6102,7 @@ bool Adapter::LoadAdapterMapState() {
   waypoint_aliases_by_map_.clear();
   dock_waypoint_by_map_.clear();
   ClearDockWaypointCandidateLocked();
+  ClearMappingSessionLocked();
   active_map_id_.clear();
   default_map_id_.clear();
   std::ifstream in(cfg_.graphnav_store_dir + "/state.txt");
@@ -5953,6 +6137,92 @@ bool Adapter::LoadAdapterMapState() {
       if (parts.size() >= 3) {
         dock_waypoint_by_map_[parts[1]] = parts[2];
       }
+      continue;
+    }
+    if (t.rfind("mapping_session_active=", 0) == 0) {
+      mapping_session_.active = (t.substr(std::string("mapping_session_active=").size()) == "1");
+      continue;
+    }
+    if (t.rfind("mapping_session_id=", 0) == 0) {
+      mapping_session_.session_id = t.substr(std::string("mapping_session_id=").size());
+      continue;
+    }
+    if (t.rfind("mapping_session_map_id=", 0) == 0) {
+      mapping_session_.map_id = t.substr(std::string("mapping_session_map_id=").size());
+      continue;
+    }
+    if (t.rfind("mapping_session_base_revision=", 0) == 0) {
+      mapping_session_.base_revision_id =
+          t.substr(std::string("mapping_session_base_revision=").size());
+      continue;
+    }
+    if (t.rfind("mapping_session_started_at_ms=", 0) == 0) {
+      mapping_session_.started_at_ms =
+          std::stoll(t.substr(std::string("mapping_session_started_at_ms=").size()));
+      continue;
+    }
+    if (t.rfind("mapping_session_baseline_waypoints=", 0) == 0) {
+      mapping_session_.baseline_stats.waypoint_count =
+          std::stoi(t.substr(std::string("mapping_session_baseline_waypoints=").size()));
+      continue;
+    }
+    if (t.rfind("mapping_session_baseline_edges=", 0) == 0) {
+      mapping_session_.baseline_stats.edge_count =
+          std::stoi(t.substr(std::string("mapping_session_baseline_edges=").size()));
+      continue;
+    }
+    if (t.rfind("mapping_session_baseline_waypoint_snapshots=", 0) == 0) {
+      mapping_session_.baseline_stats.waypoint_snapshot_count =
+          std::stoi(t.substr(std::string("mapping_session_baseline_waypoint_snapshots=").size()));
+      continue;
+    }
+    if (t.rfind("mapping_session_baseline_edge_snapshots=", 0) == 0) {
+      mapping_session_.baseline_stats.edge_snapshot_count =
+          std::stoi(t.substr(std::string("mapping_session_baseline_edge_snapshots=").size()));
+      continue;
+    }
+    if (t.rfind("mapping_session_baseline_has_anchoring=", 0) == 0) {
+      mapping_session_.baseline_stats.has_anchoring =
+          (t.substr(std::string("mapping_session_baseline_has_anchoring=").size()) == "1");
+      continue;
+    }
+    if (t.rfind("mapping_session_baseline_renderable=", 0) == 0) {
+      mapping_session_.baseline_stats.renderable_map =
+          (t.substr(std::string("mapping_session_baseline_renderable=").size()) == "1");
+      continue;
+    }
+    if (t.rfind("mapping_session_unsafe=", 0) == 0) {
+      mapping_session_.unsafe = (t.substr(std::string("mapping_session_unsafe=").size()) == "1");
+      continue;
+    }
+    if (t.rfind("mapping_session_unsafe_reason=", 0) == 0) {
+      mapping_session_.unsafe_reason =
+          t.substr(std::string("mapping_session_unsafe_reason=").size());
+      continue;
+    }
+    if (t.rfind("mapping_session_dock_waypoint=", 0) == 0) {
+      mapping_session_.staged_dock_waypoint_id =
+          t.substr(std::string("mapping_session_dock_waypoint=").size());
+      continue;
+    }
+    if (t.rfind("mapping_session_alias_set\t", 0) == 0) {
+      std::vector<std::string> parts;
+      std::stringstream ss(t);
+      std::string part;
+      while (std::getline(ss, part, '\t')) parts.push_back(part);
+      if (parts.size() >= 3) {
+        mapping_session_.staged_alias_upserts[parts[1]] = parts[2];
+      }
+      continue;
+    }
+    if (t.rfind("mapping_session_alias_delete\t", 0) == 0) {
+      std::vector<std::string> parts;
+      std::stringstream ss(t);
+      std::string part;
+      while (std::getline(ss, part, '\t')) parts.push_back(part);
+      if (parts.size() >= 2) {
+        mapping_session_.staged_alias_deletes.insert(parts[1]);
+      }
     }
   }
   return true;
@@ -5977,6 +6247,58 @@ bool Adapter::SaveAdapterMapState() {
     if (entry.first.find('\t') != std::string::npos || entry.first.find('\n') != std::string::npos) continue;
     out << "dock_waypoint\t" << entry.first << "\t" << entry.second << "\n";
   }
+  if (HasActiveMappingSessionLocked()) {
+    out << "mapping_session_active=1\n";
+    out << "mapping_session_id=" << SanitizeStateField(mapping_session_.session_id) << "\n";
+    out << "mapping_session_map_id=" << SanitizeStateField(mapping_session_.map_id) << "\n";
+    out << "mapping_session_base_revision="
+        << SanitizeStateField(mapping_session_.base_revision_id) << "\n";
+    out << "mapping_session_started_at_ms=" << mapping_session_.started_at_ms << "\n";
+    out << "mapping_session_baseline_waypoints=" << mapping_session_.baseline_stats.waypoint_count
+        << "\n";
+    out << "mapping_session_baseline_edges=" << mapping_session_.baseline_stats.edge_count << "\n";
+    out << "mapping_session_baseline_waypoint_snapshots="
+        << mapping_session_.baseline_stats.waypoint_snapshot_count << "\n";
+    out << "mapping_session_baseline_edge_snapshots="
+        << mapping_session_.baseline_stats.edge_snapshot_count << "\n";
+    out << "mapping_session_baseline_has_anchoring="
+        << (mapping_session_.baseline_stats.has_anchoring ? "1" : "0") << "\n";
+    out << "mapping_session_baseline_renderable="
+        << (mapping_session_.baseline_stats.renderable_map ? "1" : "0") << "\n";
+    out << "mapping_session_unsafe=" << (mapping_session_.unsafe ? "1" : "0") << "\n";
+    out << "mapping_session_unsafe_reason="
+        << SanitizeStateField(mapping_session_.unsafe_reason) << "\n";
+    if (!mapping_session_.staged_dock_waypoint_id.empty()) {
+      out << "mapping_session_dock_waypoint="
+          << SanitizeStateField(mapping_session_.staged_dock_waypoint_id) << "\n";
+    }
+    for (const auto& entry : mapping_session_.staged_alias_upserts) {
+      if (entry.first.find('\t') != std::string::npos || entry.first.find('\n') != std::string::npos)
+        continue;
+      out << "mapping_session_alias_set\t" << entry.first << "\t" << entry.second << "\n";
+    }
+    for (const auto& name : mapping_session_.staged_alias_deletes) {
+      if (name.find('\t') != std::string::npos || name.find('\n') != std::string::npos) continue;
+      out << "mapping_session_alias_delete\t" << name << "\n";
+    }
+  }
+  return true;
+}
+
+bool Adapter::BuildMapRevisionStats(const SpotClient::StoredMap& map_data, MapRevisionStats* out_stats) {
+  if (!out_stats) return false;
+  SpotClient::GraphNavMapSnapshot snapshot;
+  if (!spot_.BuildGraphNavMapSnapshot(map_data, &snapshot)) {
+    return false;
+  }
+  out_stats->waypoint_count = map_data.graph.waypoints_size();
+  out_stats->edge_count = map_data.graph.edges_size();
+  out_stats->waypoint_snapshot_count = static_cast<int>(map_data.waypoint_snapshots.size());
+  out_stats->edge_snapshot_count = static_cast<int>(map_data.edge_snapshots.size());
+  out_stats->has_anchoring = snapshot.has_anchoring;
+  out_stats->renderable_map =
+      snapshot.has_map && snapshot.map.width > 0 && snapshot.map.height > 0 &&
+      snapshot.map.resolution_m > 0.0;
   return true;
 }
 
@@ -6058,6 +6380,211 @@ bool Adapter::RefreshGraphNavMapArtifactsFromDisk(const std::string& map_id) {
   return RefreshGraphNavMapArtifacts(map_id, map_data);
 }
 
+std::unordered_map<std::string, std::string> Adapter::EffectiveWaypointAliasesForMapLocked(
+    const std::string& map_id) const {
+  std::unordered_map<std::string, std::string> aliases;
+  if (map_id.empty()) return aliases;
+  const auto alias_it = waypoint_aliases_by_map_.find(map_id);
+  if (alias_it != waypoint_aliases_by_map_.end()) aliases = alias_it->second;
+  if (!MappingSessionAppliesToMapLocked(map_id)) return aliases;
+  for (const auto& name : mapping_session_.staged_alias_deletes) {
+    aliases.erase(name);
+  }
+  for (const auto& entry : mapping_session_.staged_alias_upserts) {
+    aliases[entry.first] = entry.second;
+  }
+  return aliases;
+}
+
+std::string Adapter::EffectiveDockWaypointForMapLocked(const std::string& map_id) const {
+  if (map_id.empty()) return "";
+  std::string dock_waypoint_id;
+  const auto dock_it = dock_waypoint_by_map_.find(map_id);
+  if (dock_it != dock_waypoint_by_map_.end()) dock_waypoint_id = dock_it->second;
+  if (MappingSessionAppliesToMapLocked(map_id) && !mapping_session_.staged_dock_waypoint_id.empty()) {
+    dock_waypoint_id = mapping_session_.staged_dock_waypoint_id;
+  }
+  return dock_waypoint_id;
+}
+
+bool Adapter::EnsureMappingSessionForActiveMap() {
+  std::string map_id;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    map_id = EnsureActiveMapIdLocked();
+    if (MappingSessionAppliesToMapLocked(map_id)) return true;
+  }
+
+  SpotClient::StoredMap base_map;
+  MapRevisionStats baseline_stats;
+  std::string base_revision_id;
+  if (LoadMapFromDisk(map_id, &base_map)) {
+    if (!BuildMapRevisionStats(base_map, &baseline_stats)) {
+      EmitLog("[graphnav] failed building baseline map stats map_id=" + map_id);
+      return false;
+    }
+    (void)ResolveCommittedMapDirectory(map_id, nullptr, &base_revision_id);
+  }
+
+  MappingSessionState session;
+  session.active = true;
+  session.session_id = "session-" + std::to_string(now_ms());
+  session.map_id = map_id;
+  session.base_revision_id = base_revision_id;
+  session.started_at_ms = now_ms();
+  session.baseline_stats = baseline_stats;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (MappingSessionAppliesToMapLocked(map_id)) return true;
+    mapping_session_ = std::move(session);
+  }
+  if (!SaveAdapterMapState()) {
+    EmitLog("[graphnav] mapping session warning: failed to persist session state");
+  }
+  EmitLog("[graphnav] mapping session started map_id=" + map_id +
+          " base_revision=" + (base_revision_id.empty() ? std::string("legacy") : base_revision_id));
+  return true;
+}
+
+bool Adapter::ValidateMappingCandidate(const std::string& map_id,
+                                       const SpotClient::StoredMap& candidate_map,
+                                       std::string* out_error) {
+  MappingSessionState session;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (!MappingSessionAppliesToMapLocked(map_id)) {
+      if (out_error) *out_error = "missing active mapping session";
+      return false;
+    }
+    session = mapping_session_;
+  }
+
+  if (session.unsafe) {
+    if (out_error) *out_error = "mapping session is unsafe: " + session.unsafe_reason;
+    return false;
+  }
+
+  MapRevisionStats candidate_stats;
+  if (!BuildMapRevisionStats(candidate_map, &candidate_stats)) {
+    if (out_error) *out_error = "unable to build stitched map snapshot";
+    return false;
+  }
+  if (!candidate_stats.renderable_map) {
+    if (out_error) *out_error = "candidate saved map is not renderable";
+    return false;
+  }
+  if (candidate_stats.waypoint_count <= 0) {
+    if (out_error) *out_error = "candidate saved map contains no waypoints";
+    return false;
+  }
+  if (candidate_stats.edge_count < 0) {
+    if (out_error) *out_error = "candidate saved map has invalid edge count";
+    return false;
+  }
+  if (session.baseline_stats.waypoint_count > 0 &&
+      candidate_stats.waypoint_count < session.baseline_stats.waypoint_count) {
+    if (out_error) {
+      *out_error = "candidate waypoint count regressed from " +
+                   std::to_string(session.baseline_stats.waypoint_count) + " to " +
+                   std::to_string(candidate_stats.waypoint_count);
+    }
+    return false;
+  }
+  if (session.baseline_stats.edge_count > 0 &&
+      candidate_stats.edge_count < session.baseline_stats.edge_count) {
+    if (out_error) {
+      *out_error = "candidate edge count regressed from " +
+                   std::to_string(session.baseline_stats.edge_count) + " to " +
+                   std::to_string(candidate_stats.edge_count);
+    }
+    return false;
+  }
+
+  std::unordered_set<std::string> waypoint_ids;
+  waypoint_ids.reserve(static_cast<size_t>(candidate_map.graph.waypoints_size()));
+  for (const auto& waypoint : candidate_map.graph.waypoints()) {
+    if (!waypoint.id().empty()) waypoint_ids.insert(waypoint.id());
+  }
+  for (const auto& entry : session.staged_alias_upserts) {
+    if (waypoint_ids.find(entry.second) == waypoint_ids.end()) {
+      if (out_error) *out_error = "staged waypoint alias no longer resolves: " + entry.first;
+      return false;
+    }
+  }
+  if (!session.staged_dock_waypoint_id.empty() &&
+      waypoint_ids.find(session.staged_dock_waypoint_id) == waypoint_ids.end()) {
+    if (out_error) *out_error = "staged dock waypoint no longer resolves";
+    return false;
+  }
+  return true;
+}
+
+bool Adapter::FinalizeActiveMappingSession(const std::string& map_id) {
+  if (map_id.empty()) return false;
+
+  SpotClient::StoredMap candidate_map;
+  if (!spot_.DownloadCurrentMap(&candidate_map)) {
+    MarkMappingSessionUnsafe("failed downloading candidate map: " + spot_.LastError());
+    EmitLog("[graphnav] mapping commit failed downloading candidate map_id=" + map_id);
+    return false;
+  }
+
+  std::string validation_error;
+  if (!ValidateMappingCandidate(map_id, candidate_map, &validation_error)) {
+    EmitLog("[graphnav] mapping commit rejected map_id=" + map_id + " reason=" + validation_error);
+    SpotClient::StoredMap committed_map;
+    if (LoadMapFromDisk(map_id, &committed_map)) {
+      if (!spot_.UploadGraphMap(committed_map)) {
+        EmitLog("[graphnav] mapping commit restore failed map_id=" + map_id +
+                " error=" + spot_.LastError());
+      } else {
+        RefreshGraphWaypointIndex();
+        (void)RefreshGraphNavMapArtifacts(map_id, committed_map);
+      }
+    } else {
+      if (!spot_.ClearGraph()) {
+        EmitLog("[graphnav] mapping commit restore warning: failed clearing live graph: " +
+                spot_.LastError());
+      }
+      ClearGraphNavMapArtifacts();
+    }
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      ClearMappingSessionLocked();
+    }
+    (void)SaveAdapterMapState();
+    PublishWaypointsText(true);
+    PublishMapsText(true);
+    return false;
+  }
+
+  std::string revision_id;
+  if (!SaveCommittedMapRevision(map_id, candidate_map, &revision_id)) {
+    MarkMappingSessionUnsafe("failed writing committed map revision");
+    EmitLog("[graphnav] mapping commit failed writing revision map_id=" + map_id);
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    auto& aliases = waypoint_aliases_by_map_[map_id];
+    for (const auto& name : mapping_session_.staged_alias_deletes) aliases.erase(name);
+    for (const auto& entry : mapping_session_.staged_alias_upserts) aliases[entry.first] = entry.second;
+    if (!mapping_session_.staged_dock_waypoint_id.empty()) {
+      dock_waypoint_by_map_[map_id] = mapping_session_.staged_dock_waypoint_id;
+    }
+    ClearMappingSessionLocked();
+  }
+
+  RefreshGraphWaypointIndex();
+  (void)RefreshGraphNavMapArtifacts(map_id, candidate_map);
+  (void)SaveAdapterMapState();
+  PublishWaypointsText(true);
+  PublishMapsText(true);
+  EmitLog("[graphnav] mapping session committed map_id=" + map_id + " revision=" + revision_id);
+  return true;
+}
+
 void Adapter::RefreshGraphNavMetadataForMap(const std::string& map_id) {
   if (map_id.empty()) return;
 
@@ -6068,17 +6595,10 @@ void Adapter::RefreshGraphNavMetadataForMap(const std::string& map_id) {
     std::lock_guard<std::mutex> lk(map_mu_);
     current_artifacts = graphnav_map_artifacts_;
     if (!current_artifacts || current_artifacts->map_id != map_id) return;
-
-    const auto alias_it = waypoint_aliases_by_map_.find(map_id);
-    if (alias_it != waypoint_aliases_by_map_.end()) {
-      for (const auto& alias : alias_it->second) {
-        aliases_by_waypoint[alias.second].push_back(alias.first);
-      }
+    for (const auto& alias : EffectiveWaypointAliasesForMapLocked(map_id)) {
+      aliases_by_waypoint[alias.second].push_back(alias.first);
     }
-    const auto dock_it = dock_waypoint_by_map_.find(map_id);
-    if (dock_it != dock_waypoint_by_map_.end()) {
-      dock_waypoint_id = dock_it->second;
-    }
+    dock_waypoint_id = EffectiveDockWaypointForMapLocked(map_id);
   }
 
   for (auto& kv : aliases_by_waypoint) {
@@ -6149,19 +6669,17 @@ bool Adapter::ResolveWaypointNameLocked(const std::string& name, std::string* ou
   if (key.empty()) return false;
 
   if (!active_map_id_.empty()) {
-    auto map_it = waypoint_aliases_by_map_.find(active_map_id_);
-    if (map_it != waypoint_aliases_by_map_.end()) {
-      auto it = map_it->second.find(key);
-      if (it != map_it->second.end()) {
-        *out_waypoint_id = it->second;
+    const auto effective_aliases = EffectiveWaypointAliasesForMapLocked(active_map_id_);
+    auto it = effective_aliases.find(key);
+    if (it != effective_aliases.end()) {
+      *out_waypoint_id = it->second;
+      return true;
+    }
+    const std::string lower_key = ToLower(key);
+    for (const auto& alias : effective_aliases) {
+      if (ToLower(alias.first) == lower_key) {
+        *out_waypoint_id = alias.second;
         return true;
-      }
-      const std::string lower_key = ToLower(key);
-      for (const auto& alias : map_it->second) {
-        if (ToLower(alias.first) == lower_key) {
-          *out_waypoint_id = alias.second;
-          return true;
-        }
       }
     }
   }
@@ -6192,10 +6710,10 @@ bool Adapter::ResolveSavedDockHomeLocked(std::string* out_map_id, std::string* o
   std::string map_id = active_map_id_;
   if (map_id.empty()) map_id = default_map_id_;
   if (map_id.empty()) return false;
-  const auto it = dock_waypoint_by_map_.find(map_id);
-  if (it == dock_waypoint_by_map_.end() || it->second.empty()) return false;
+  const std::string dock_waypoint_id = EffectiveDockWaypointForMapLocked(map_id);
+  if (dock_waypoint_id.empty()) return false;
   *out_map_id = map_id;
-  *out_waypoint_id = it->second;
+  *out_waypoint_id = dock_waypoint_id;
   return true;
 }
 
@@ -6234,19 +6752,26 @@ void Adapter::CaptureDockWaypointCandidate() {
 void Adapter::CommitDockWaypointCandidateOnSuccess() {
   std::string map_id;
   std::string waypoint_id;
+  bool stage_only = false;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
     map_id = pending_dock_candidate_map_id_;
     waypoint_id = pending_dock_candidate_waypoint_id_;
     ClearDockWaypointCandidateLocked();
     if (map_id.empty() || waypoint_id.empty()) return;
-    dock_waypoint_by_map_[map_id] = waypoint_id;
+    if (MappingSessionAppliesToMapLocked(map_id)) {
+      mapping_session_.staged_dock_waypoint_id = waypoint_id;
+      stage_only = true;
+    } else {
+      dock_waypoint_by_map_[map_id] = waypoint_id;
+    }
   }
   if (!SaveAdapterMapState()) {
     EmitLog("[dock] warning: failed to persist dock waypoint state");
   }
   RefreshGraphNavMetadataForMap(map_id);
-  EmitLog("[dock] dock waypoint saved map_id=" + map_id + " waypoint_id=" + waypoint_id);
+  EmitLog(std::string("[dock] dock waypoint ") + (stage_only ? "staged" : "saved") +
+          " map_id=" + map_id + " waypoint_id=" + waypoint_id);
 }
 
 std::string Adapter::BuildWaypointTextLocked() const {
@@ -6254,10 +6779,8 @@ std::string Adapter::BuildWaypointTextLocked() const {
   std::string map_id = active_map_id_;
   if (map_id.empty()) map_id = default_map_id_;
   if (!map_id.empty()) {
-    auto it = waypoint_aliases_by_map_.find(map_id);
-    if (it != waypoint_aliases_by_map_.end()) {
-      for (const auto& alias : it->second) names.push_back(alias.first);
-    }
+    const auto aliases = EffectiveWaypointAliasesForMapLocked(map_id);
+    for (const auto& alias : aliases) names.push_back(alias.first);
   }
   std::sort(names.begin(), names.end());
   names.erase(std::unique(names.begin(), names.end()), names.end());
@@ -6406,16 +6929,10 @@ void Adapter::PublishGraphNavOverlayText(bool force) {
     std::lock_guard<std::mutex> lk(map_mu_);
     artifacts = graphnav_map_artifacts_;
     if (artifacts) {
-      const auto alias_it = waypoint_aliases_by_map_.find(artifacts->map_id);
-      if (alias_it != waypoint_aliases_by_map_.end()) {
-        for (const auto& alias : alias_it->second) {
-          aliases_by_waypoint[alias.second].push_back(alias.first);
-        }
+      for (const auto& alias : EffectiveWaypointAliasesForMapLocked(artifacts->map_id)) {
+        aliases_by_waypoint[alias.second].push_back(alias.first);
       }
-      const auto dock_it = dock_waypoint_by_map_.find(artifacts->map_id);
-      if (dock_it != dock_waypoint_by_map_.end()) {
-        dock_waypoint_id = dock_it->second;
-      }
+      dock_waypoint_id = EffectiveDockWaypointForMapLocked(artifacts->map_id);
     }
   }
   for (auto& kv : aliases_by_waypoint) {
@@ -6843,9 +7360,12 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
 
   if (request.command() == "spot.map.create") {
     if (!EnsureLeaseForCommand("spot.map.create")) return false;
-    if (map_recording_active_) {
-      EmitLog("[graphnav] map.create rejected: stop mapping first");
-      return false;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      if (map_recording_active_ || HasActiveMappingSessionLocked()) {
+        EmitLog("[graphnav] map.create rejected: stop mapping first");
+        return false;
+      }
     }
 
     std::string map_id = ExtractParam(text, {"name", "map_id", "map", "id"});
@@ -6904,6 +7424,13 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
 
   if (request.command() == "spot.map.load") {
     if (!EnsureLeaseForCommand("spot.map.load")) return false;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      if (map_recording_active_ || HasActiveMappingSessionLocked()) {
+        EmitLog("[graphnav] map.load rejected: stop mapping first");
+        return false;
+      }
+    }
     std::string map_id = ExtractParam(text, {"map_id", "map", "id"});
     map_id = sanitize_id_token(map_id);
     if (map_id.empty()) {
@@ -6980,9 +7507,12 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       EmitLog("[graphnav] map.delete rejected: missing map_id");
       return false;
     }
-    if (map_recording_active_) {
-      EmitLog("[graphnav] map.delete rejected: stop mapping first");
-      return false;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      if (map_recording_active_ || HasActiveMappingSessionLocked()) {
+        EmitLog("[graphnav] map.delete rejected: stop mapping first");
+        return false;
+      }
     }
     bool clear_loaded_graph = false;
     {
@@ -7041,6 +7571,10 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
     if (spot_.GetMappingStatus(&status)) {
       map_recording_active_ = status.is_recording;
       if (status.is_recording) {
+        if (!EnsureMappingSessionForActiveMap()) {
+          EmitLog("[graphnav] start_mapping failed: active recording has no transactional session");
+          return false;
+        }
         EmitLog("[graphnav] mapping already active");
         return true;
       }
@@ -7053,6 +7587,15 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
     {
       std::lock_guard<std::mutex> lk(map_mu_);
       (void)EnsureActiveMapIdLocked();
+    }
+    if (!EnsureMappingSessionForActiveMap()) {
+      if (!spot_.StopGraphRecording()) {
+        EmitLog("[graphnav] start_mapping cleanup warning: failed stopping recording after session init error: " +
+                spot_.LastError());
+      }
+      map_recording_active_ = false;
+      EmitLog("[graphnav] start_mapping failed: unable to initialize mapping session");
+      return false;
     }
     SaveAdapterMapState();
     PublishMapsText(true);
@@ -7070,6 +7613,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
     }
     if (!already_stopped) {
       if (!spot_.StopGraphRecording()) {
+        MarkMappingSessionUnsafe("stop_mapping failed: " + spot_.LastError());
         EmitLog(std::string("[graphnav] stop_mapping failed: ") + spot_.LastError());
         return false;
       }
@@ -7082,17 +7626,11 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       std::lock_guard<std::mutex> lk(map_mu_);
       active_map = EnsureActiveMapIdLocked();
     }
-    if (!SaveCurrentMapToDisk(active_map)) {
-      EmitLog("[graphnav] stop_mapping failed saving map to disk");
+    if (!EnsureMappingSessionForActiveMap()) {
+      EmitLog("[graphnav] stop_mapping failed: missing mapping session");
       return false;
     }
-    RefreshGraphWaypointIndex();
-    (void)RefreshGraphNavMapArtifactsFromDisk(active_map);
-    SaveAdapterMapState();
-    PublishWaypointsText(true);
-    PublishMapsText(true);
-    EmitLog(std::string("[graphnav] mapping stopped and saved map_id=") + active_map);
-    return true;
+    return FinalizeActiveMappingSession(active_map);
   }
 
   return false;
@@ -7110,25 +7648,36 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
     }
     bool had_active_map = true;
     bool removed = false;
+    bool staged = false;
     {
       std::lock_guard<std::mutex> lk(map_mu_);
       if (active_map_id_.empty()) {
         had_active_map = false;
       } else {
-        auto map_it = waypoint_aliases_by_map_.find(active_map_id_);
-        if (map_it != waypoint_aliases_by_map_.end()) {
-          auto it = map_it->second.find(name);
-          if (it != map_it->second.end()) {
-            map_it->second.erase(it);
-            removed = true;
+        const auto effective_aliases = EffectiveWaypointAliasesForMapLocked(active_map_id_);
+        auto it = effective_aliases.find(name);
+        if (it != effective_aliases.end()) {
+          removed = true;
+          if (MappingSessionAppliesToMapLocked(active_map_id_)) {
+            mapping_session_.staged_alias_upserts.erase(name);
+            mapping_session_.staged_alias_deletes.insert(name);
+            staged = true;
           } else {
-            const std::string lower_name = ToLower(name);
-            for (auto alias_it = map_it->second.begin(); alias_it != map_it->second.end(); ++alias_it) {
-              if (ToLower(alias_it->first) == lower_name) {
-                map_it->second.erase(alias_it);
-                removed = true;
-                break;
+            waypoint_aliases_by_map_[active_map_id_].erase(name);
+          }
+        } else {
+          const std::string lower_name = ToLower(name);
+          for (const auto& alias : effective_aliases) {
+            if (ToLower(alias.first) == lower_name) {
+              removed = true;
+              if (MappingSessionAppliesToMapLocked(active_map_id_)) {
+                mapping_session_.staged_alias_upserts.erase(alias.first);
+                mapping_session_.staged_alias_deletes.insert(alias.first);
+                staged = true;
+              } else {
+                waypoint_aliases_by_map_[active_map_id_].erase(alias.first);
               }
+              break;
             }
           }
         }
@@ -7150,7 +7699,8 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
     }
     RefreshGraphNavMetadataForMap(active_map);
     PublishWaypointsText(true);
-    EmitLog(std::string("[graphnav] waypoint alias deleted: ") + name);
+    EmitLog(std::string("[graphnav] waypoint alias ") + (staged ? "staged for deletion: " : "deleted: ") +
+            name);
     return true;
   }
 
@@ -7167,21 +7717,42 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
       robot_recording = status.is_recording;
       map_recording_active_ = status.is_recording;
     }
-    bool started_temp_recording = false;
-    std::string waypoint_id;
-    if (!robot_recording) {
-      if (!spot_.StartGraphRecording(&waypoint_id)) {
-        EmitLog(std::string("[graphnav] waypoint create failed: unable to start temporary recording: ") +
+    if (robot_recording) {
+      if (!EnsureMappingSessionForActiveMap()) {
+        EmitLog("[graphnav] waypoint.save failed: unable to initialize mapping session");
+        return false;
+      }
+      std::string waypoint_id;
+      if (!spot_.GetLocalizationWaypointId(&waypoint_id) || waypoint_id.empty()) {
+        MarkMappingSessionUnsafe("failed staging waypoint alias during mapping: localization unavailable");
+        EmitLog(std::string("[graphnav] waypoint.save rejected during mapping: localization unavailable: ") +
                 spot_.LastError());
         return false;
       }
-      started_temp_recording = true;
-    } else {
-      if (!spot_.CreateGraphWaypoint("", &waypoint_id)) {
-        EmitLog(std::string("[graphnav] waypoint create failed: ") + spot_.LastError());
-        return false;
+      std::string active_map;
+      {
+        std::lock_guard<std::mutex> lk(map_mu_);
+        active_map = EnsureActiveMapIdLocked();
+        mapping_session_.staged_alias_deletes.erase(name);
+        mapping_session_.staged_alias_upserts[name] = waypoint_id;
       }
+      (void)SaveAdapterMapState();
+      RefreshGraphNavMetadataForMap(active_map);
+      PublishWaypointsText(true);
+      PublishMapsText(true);
+      EmitLog("[graphnav] waypoint alias staged name=" + name + " id=" + waypoint_id +
+              " map_id=" + active_map);
+      return true;
     }
+
+    bool started_temp_recording = false;
+    std::string waypoint_id;
+    if (!spot_.StartGraphRecording(&waypoint_id)) {
+      EmitLog(std::string("[graphnav] waypoint create failed: unable to start temporary recording: ") +
+              spot_.LastError());
+      return false;
+    }
+    started_temp_recording = true;
 
     if (started_temp_recording) {
       bool stopped_temp_recording = false;

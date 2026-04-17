@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "formant_spot_adapter/config.hpp"
@@ -92,11 +93,44 @@ class Adapter {
                            const std::vector<std::string>& keys) const;
   bool LoadAdapterMapState();
   bool SaveAdapterMapState();
+  void ClearMappingSessionLocked();
+  bool HasActiveMappingSessionLocked() const;
+  bool MappingSessionAppliesToMapLocked(const std::string& map_id) const;
+  void MarkMappingSessionUnsafe(const std::string& reason);
+  std::string SanitizeStateField(const std::string& value) const;
   bool SaveCurrentMapToDisk(const std::string& map_id);
+  bool SaveCommittedMapRevision(const std::string& map_id,
+                               const SpotClient::StoredMap& map_data,
+                               std::string* out_revision_id = nullptr);
   bool SaveMapToDisk(const std::string& map_id, const SpotClient::StoredMap& map_data);
   bool LoadMapFromDisk(const std::string& map_id, SpotClient::StoredMap* out_map);
   bool DeleteMapFromDisk(const std::string& map_id);
   std::string MapDirectoryFor(const std::string& map_id) const;
+  std::string MapMetadataPathFor(const std::string& map_id) const;
+  std::string MapRevisionDirectoryFor(const std::string& map_id, const std::string& revision_id) const;
+  bool ResolveCommittedMapDirectory(const std::string& map_id,
+                                    std::string* out_dir,
+                                    std::string* out_revision_id = nullptr) const;
+  bool SaveMapDataToDirectory(const std::string& map_dir, const SpotClient::StoredMap& map_data);
+  bool LoadMapFromDirectory(const std::string& map_dir, SpotClient::StoredMap* out_map);
+  bool WriteCurrentRevisionMetadata(const std::string& map_id, const std::string& revision_id);
+  struct MapRevisionStats {
+    int waypoint_count{0};
+    int edge_count{0};
+    int waypoint_snapshot_count{0};
+    int edge_snapshot_count{0};
+    bool has_anchoring{false};
+    bool renderable_map{false};
+  };
+  bool BuildMapRevisionStats(const SpotClient::StoredMap& map_data, MapRevisionStats* out_stats);
+  bool ValidateMappingCandidate(const std::string& map_id,
+                                const SpotClient::StoredMap& candidate_map,
+                                std::string* out_error);
+  bool FinalizeActiveMappingSession(const std::string& map_id);
+  std::unordered_map<std::string, std::string> EffectiveWaypointAliasesForMapLocked(
+      const std::string& map_id) const;
+  std::string EffectiveDockWaypointForMapLocked(const std::string& map_id) const;
+  bool EnsureMappingSessionForActiveMap();
   void RefreshGraphWaypointIndex();
   void ClearGraphNavMapArtifacts();
   bool RefreshGraphNavMapArtifacts(const std::string& map_id, const SpotClient::StoredMap& map_data);
@@ -272,6 +306,20 @@ class Adapter {
   std::unordered_map<std::string, std::string> loaded_waypoint_id_to_label_;
   std::unordered_map<std::string, std::vector<std::string>> loaded_waypoint_label_to_ids_;
   std::unordered_map<std::string, std::vector<std::string>> loaded_waypoint_lower_label_to_ids_;
+  struct MappingSessionState {
+    bool active{false};
+    std::string session_id;
+    std::string map_id;
+    std::string base_revision_id;
+    long long started_at_ms{0};
+    MapRevisionStats baseline_stats;
+    bool unsafe{false};
+    std::string unsafe_reason;
+    std::unordered_map<std::string, std::string> staged_alias_upserts;
+    std::unordered_set<std::string> staged_alias_deletes;
+    std::string staged_dock_waypoint_id;
+  };
+  MappingSessionState mapping_session_;
   struct GraphNavMapArtifacts {
     std::string map_id;
     std::string map_uuid;
