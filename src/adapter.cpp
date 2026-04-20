@@ -1750,7 +1750,11 @@ bool any_fault_requires_soft_recovery(const std::vector<SpotClient::FaultInfo>& 
 }
 
 std::string fault_event_key(const std::string& fault_type, const SpotClient::FaultInfo& fault) {
-  return fault_type + ":" + fault.id;
+  std::string key = fault_type + ":" + fault.id;
+  if (fault_type == "service" && !fault.message.empty()) {
+    key += ":" + fault.message;
+  }
+  return key;
 }
 
 std::string format_fault_event_prefix(const std::string& action,
@@ -2092,6 +2096,7 @@ bool Adapter::Init() {
   control_seen_ = false;
   last_twist_ms_ = now_ms();
   last_twist_timeout_log_ms_ = 0;
+  last_twist_reject_log_ms_ = 0;
   last_control_ms_ = now_ms();
   moving_ = false;
   desired_twist_valid_ = false;
@@ -3644,12 +3649,11 @@ void Adapter::ApplySoftRecoveryForRobotState(const SpotClient::RobotStateSnapsho
   std::string reason;
   if (!snap.any_estopped) {
     const bool has_critical_system_fault = any_fault_requires_soft_recovery(snap.system_faults);
-    const bool has_critical_service_fault = any_fault_requires_soft_recovery(snap.service_faults);
+    // Auxiliary service liveness faults should stay visible in telemetry and events,
+    // but they should not gate locomotion unless they escalate into system/behavior faults.
     const bool has_unclearable_behavior_fault = any_fault_requires_soft_recovery(snap.behavior_faults);
     if (has_critical_system_fault) {
       reason = "critical_system_fault";
-    } else if (has_critical_service_fault) {
-      reason = "critical_service_fault";
     } else if (has_unclearable_behavior_fault) {
       reason = "unclearable_behavior_fault";
     } else if (snap.motor_power_state == "error") {
@@ -5369,12 +5373,42 @@ void Adapter::HandleTwist(const v1::model::Twist& twist) {
 void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
                                const char* source_name) {
   static constexpr long long kPitchZeroDropoutGraceMs = 80;
-  if (now_ms() < dock_cooldown_until_ms_.load()) return;
-  if (!TeleopSessionActive()) return;
-  if (docking_in_progress_) return;
-  if (!SpotConnected()) return;
-  if (spot_degraded_non_estop_.load()) return;
-  if (!lease_owned_) return;
+  const bool requested_motion = std::abs(twist.linear().x()) >= cfg_.twist_deadband ||
+                                std::abs(twist.linear().y()) >= cfg_.twist_deadband ||
+                                std::abs(twist.angular().z()) >= cfg_.twist_deadband ||
+                                std::abs(twist.angular().y()) >= cfg_.twist_deadband;
+  const auto maybe_log_rejection = [&](const char* reason) {
+    if (!requested_motion) return;
+    const long long now = now_ms();
+    const long long last_log = last_twist_reject_log_ms_.load();
+    if ((now - last_log) < 2000) return;
+    last_twist_reject_log_ms_ = now;
+    EmitLog(std::string("[teleop] motion ignored source=") + source_name + " reason=" + reason);
+  };
+  if (now_ms() < dock_cooldown_until_ms_.load()) {
+    maybe_log_rejection("dock cooldown active");
+    return;
+  }
+  if (!TeleopSessionActive()) {
+    maybe_log_rejection("session inactive");
+    return;
+  }
+  if (docking_in_progress_) {
+    maybe_log_rejection("dock operation in progress");
+    return;
+  }
+  if (!SpotConnected()) {
+    maybe_log_rejection("robot unavailable");
+    return;
+  }
+  if (spot_degraded_non_estop_.load()) {
+    maybe_log_rejection("robot degraded (non-estop)");
+    return;
+  }
+  if (!lease_owned_) {
+    maybe_log_rejection("no body lease");
+    return;
+  }
   const long long now = now_ms();
 
   const double raw_x = twist.linear().x();

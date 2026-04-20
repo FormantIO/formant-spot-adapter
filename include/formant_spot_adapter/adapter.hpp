@@ -181,6 +181,7 @@ class Adapter {
   std::atomic<bool> lease_owned_{false};
   std::atomic<long long> last_twist_ms_{0};
   std::atomic<long long> last_twist_timeout_log_ms_{0};
+  std::atomic<long long> last_twist_reject_log_ms_{0};
   std::atomic<long long> last_nonzero_cmd_ms_{0};
   std::atomic<bool> moving_{false};
   mutable std::mutex twist_cmd_mu_;
