@@ -41,6 +41,8 @@ class Adapter {
   void HandleButtons(const v1::model::Bitset& bitset, const std::string& source_stream);
   void HandleButtonPress(const std::string& button_key, const std::string& source_stream);
   bool EnsureLeaseForCommand(const std::string& action_name);
+  bool ErrorSuggestsLostLease(const std::string& error) const;
+  void ResetLeaseState(bool clear_motion);
   bool ExecuteStandAction(bool require_teleop, bool auto_acquire_lease);
   bool ExecuteSitAction(bool require_teleop, bool auto_acquire_lease);
   bool ExecuteRecoverAction(bool require_teleop, bool auto_acquire_lease);
