@@ -1750,7 +1750,11 @@ bool any_fault_requires_soft_recovery(const std::vector<SpotClient::FaultInfo>& 
 }
 
 std::string fault_event_key(const std::string& fault_type, const SpotClient::FaultInfo& fault) {
-  return fault_type + ":" + fault.id;
+  std::string key = fault_type + ":" + fault.id;
+  if (fault_type == "service" && !fault.message.empty()) {
+    key += ":" + fault.message;
+  }
+  return key;
 }
 
 std::string format_fault_event_prefix(const std::string& action,
@@ -2092,6 +2096,7 @@ bool Adapter::Init() {
   control_seen_ = false;
   last_twist_ms_ = now_ms();
   last_twist_timeout_log_ms_ = 0;
+  last_twist_reject_log_ms_ = 0;
   last_control_ms_ = now_ms();
   moving_ = false;
   desired_twist_valid_ = false;
@@ -2315,7 +2320,7 @@ void Adapter::Run() {
         }
         lease_owned_ = false;
         desired_twist_valid_ = false;
-  active_motion_source_ = kMotionSourceNone;
+        active_motion_source_ = kMotionSourceNone;
         {
           std::lock_guard<std::mutex> lk(twist_cmd_mu_);
           desired_vx_ = 0.0;
@@ -2337,7 +2342,7 @@ void Adapter::Run() {
       const int stale_twist_timeout_ms = std::max(250, cfg_.teleop_idle_timeout_ms);
       if (has_desired && twist_age_ms > stale_twist_timeout_ms) {
         desired_twist_valid_ = false;
-  active_motion_source_ = kMotionSourceNone;
+        active_motion_source_ = kMotionSourceNone;
         has_desired = false;
         {
           std::lock_guard<std::mutex> lk(twist_cmd_mu_);
@@ -2389,8 +2394,22 @@ void Adapter::Run() {
             break;
         }
         const int end_after_ms = std::max(400, cfg_.teleop_idle_timeout_ms + 200);
-        spot_.Velocity(vx, vy, wz, end_after_ms, mode, body_pitch);
-        moving_ = true;
+        if (!spot_.Velocity(vx, vy, wz, end_after_ms, mode, body_pitch)) {
+          const std::string error = spot_.LastError();
+          moving_ = false;
+          if (ErrorSuggestsLostLease(error)) {
+            EmitLog(std::string("[teleop] body lease lost during motion: ") + error);
+            ResetLeaseState(true);
+          } else {
+            const long long last_log = last_twist_reject_log_ms_.load();
+            if ((now - last_log) >= 2000) {
+              EmitLog(std::string("[teleop] motion command failed: ") + error);
+              last_twist_reject_log_ms_ = now;
+            }
+          }
+        } else {
+          moving_ = true;
+        }
       }
     }
   }
@@ -3326,7 +3345,10 @@ void Adapter::LeaseRetainLoop() {
 
     if (lease_owned_ && SpotConnected() &&
         (now - last_retain_ms) >= std::max(100, 1000 / std::max(1, cfg_.lease_retain_hz))) {
-      spot_.RetainLease();
+      if (!spot_.RetainLease()) {
+        EmitLog(std::string("[adapter] body lease retain failed: ") + spot_.LastError());
+        ResetLeaseState(true);
+      }
       last_retain_ms = now;
     }
 
@@ -3619,6 +3641,7 @@ void Adapter::SetSpotDisconnected(const std::string& reason) {
   const bool was_connected = SpotConnected();
   spot_connection_state_ = 0;
   lease_owned_ = false;
+  spot_.InvalidateBodyLease();
   moving_ = false;
   spot_degraded_non_estop_ = false;
   graphnav_navigation_active_ = false;
@@ -3684,12 +3707,11 @@ void Adapter::ApplySoftRecoveryForRobotState(const SpotClient::RobotStateSnapsho
   std::string reason;
   if (!snap.any_estopped) {
     const bool has_critical_system_fault = any_fault_requires_soft_recovery(snap.system_faults);
-    const bool has_critical_service_fault = any_fault_requires_soft_recovery(snap.service_faults);
+    // Auxiliary service liveness faults should stay visible in telemetry and events,
+    // but they should not gate locomotion unless they escalate into system/behavior faults.
     const bool has_unclearable_behavior_fault = any_fault_requires_soft_recovery(snap.behavior_faults);
     if (has_critical_system_fault) {
       reason = "critical_system_fault";
-    } else if (has_critical_service_fault) {
-      reason = "critical_service_fault";
     } else if (has_unclearable_behavior_fault) {
       reason = "unclearable_behavior_fault";
     } else if (snap.motor_power_state == "error") {
@@ -4962,7 +4984,11 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
   const bool ok = spot_.AutoDock(dock_id, cfg_.dock_attempts, dock_poll_ms, cfg_.dock_command_timeout_sec);
   docking_in_progress_ = false;
   if (!ok) {
-    EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " failed: " + spot_.LastError());
+    const std::string error = spot_.LastError();
+    const bool lost_lease = ErrorSuggestsLostLease(error);
+    if (lost_lease) ResetLeaseState(true);
+    EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " failed: " + error +
+            (lost_lease ? " ; clearing cached lease" : ""));
     if (!return_and_dock) {
       std::lock_guard<std::mutex> lk(map_mu_);
       ClearDockWaypointCandidateLocked();
@@ -5017,7 +5043,11 @@ bool Adapter::ExecuteUndockCommand() {
   const bool ok = spot_.Undock(dock_poll_ms, cfg_.dock_command_timeout_sec);
   docking_in_progress_ = false;
   if (!ok) {
-    EmitLog(std::string("[undock] failed: ") + spot_.LastError());
+    const std::string error = spot_.LastError();
+    const bool lost_lease = ErrorSuggestsLostLease(error);
+    if (lost_lease) ResetLeaseState(true);
+    EmitLog(std::string("[undock] failed: ") + error +
+            (lost_lease ? " ; clearing cached lease" : ""));
     return false;
   }
   dock_cooldown_until_ms_ = now_ms() + 5000;
@@ -5194,7 +5224,12 @@ void Adapter::HandleButtonPress(const std::string& button_key, const std::string
 }
 
 bool Adapter::EnsureLeaseForCommand(const std::string& action_name) {
-  if (lease_owned_.load()) return true;
+  if (lease_owned_.load()) {
+    if (spot_.RetainLease()) return true;
+    EmitLog(std::string("[command] ") + action_name +
+            " cached body lease invalid: " + spot_.LastError());
+    ResetLeaseState(true);
+  }
   lease_owned_ = spot_.AcquireBodyLease();
   if (!lease_owned_.load()) {
     EmitLog(std::string("[command] ") + action_name + " rejected: no body lease (" + spot_.LastError() + ")");
@@ -5202,6 +5237,39 @@ bool Adapter::EnsureLeaseForCommand(const std::string& action_name) {
   }
   EmitLog(std::string("[command] ") + action_name + " acquired body lease");
   return true;
+}
+
+bool Adapter::ErrorSuggestsLostLease(const std::string& error) const {
+  const std::string lower = ToLower(error);
+  static constexpr std::array<const char*, 8> kLeaseLossMarkers = {
+      "resourcenotownederror",
+      "self-owned lease",
+      "not the active lease",
+      "lease use result",
+      "lease_error",
+      "lease error",
+      "leasewallet",
+      "does not own",
+  };
+  for (const char* marker : kLeaseLossMarkers) {
+    if (lower.find(marker) != std::string::npos) return true;
+  }
+  return false;
+}
+
+void Adapter::ResetLeaseState(bool clear_motion) {
+  lease_owned_ = false;
+  last_lease_attempt_ms_ = 0;
+  spot_.InvalidateBodyLease();
+  if (!clear_motion) return;
+  moving_ = false;
+  desired_twist_valid_ = false;
+  active_motion_source_ = kMotionSourceNone;
+  std::lock_guard<std::mutex> lk(twist_cmd_mu_);
+  desired_vx_ = 0.0;
+  desired_vy_ = 0.0;
+  desired_wz_ = 0.0;
+  desired_body_pitch_ = 0.0;
 }
 
 bool Adapter::ExecuteStandAction(bool require_teleop, bool auto_acquire_lease) {
@@ -5214,8 +5282,12 @@ bool Adapter::ExecuteStandAction(bool require_teleop, bool auto_acquire_lease) {
     return false;
   }
   if (!spot_.Stand()) {
-    EmitLog(std::string(require_teleop ? "[teleop] action stand failed: " : "[command] spot.stand failed: ") +
-            spot_.LastError());
+    const std::string error = spot_.LastError();
+    const bool lost_lease = ErrorSuggestsLostLease(error);
+    if (lost_lease) ResetLeaseState(true);
+    EmitLog(std::string(require_teleop ? "[teleop] action stand failed: "
+                                       : "[command] spot.stand failed: ") +
+            error + (lost_lease ? " ; clearing cached lease" : ""));
     return false;
   }
   EmitLog(require_teleop ? "[teleop] action stand sent" : "[command] spot.stand sent");
@@ -5232,8 +5304,12 @@ bool Adapter::ExecuteSitAction(bool require_teleop, bool auto_acquire_lease) {
     return false;
   }
   if (!spot_.Sit()) {
-    EmitLog(std::string(require_teleop ? "[teleop] action sit failed: " : "[command] spot.sit failed: ") +
-            spot_.LastError());
+    const std::string error = spot_.LastError();
+    const bool lost_lease = ErrorSuggestsLostLease(error);
+    if (lost_lease) ResetLeaseState(true);
+    EmitLog(std::string(require_teleop ? "[teleop] action sit failed: "
+                                       : "[command] spot.sit failed: ") +
+            error + (lost_lease ? " ; clearing cached lease" : ""));
     return false;
   }
   EmitLog(require_teleop ? "[teleop] action sit sent" : "[command] spot.sit sent");
@@ -5250,8 +5326,12 @@ bool Adapter::ExecuteRecoverAction(bool require_teleop, bool auto_acquire_lease)
     return false;
   }
   if (!spot_.RecoverSelfRight()) {
+    const std::string error = spot_.LastError();
+    const bool lost_lease = ErrorSuggestsLostLease(error);
+    if (lost_lease) ResetLeaseState(true);
     EmitLog(std::string(require_teleop ? "[teleop] action recover failed: "
-                                       : "[command] spot.recover failed: ") + spot_.LastError());
+                                       : "[command] spot.recover failed: ") +
+            error + (lost_lease ? " ; clearing cached lease" : ""));
     return false;
   }
   EmitLog(require_teleop ? "[teleop] action recover sent" : "[command] spot.recover sent");
@@ -5339,7 +5419,11 @@ bool Adapter::ExecuteRotateCommand(const v1::model::CommandRequest& request, boo
   EmitLog("[command] " + command_name + " requested degrees=" + std::to_string(degrees) +
           " rate=" + std::to_string(wz) + " duration_ms=" + std::to_string(duration_ms));
   if (!spot_.Velocity(0.0, 0.0, wz, duration_ms + 300, MotionMode::kWalk, 0.0)) {
-    EmitLog(std::string("[command] " + command_name + " failed: ") + spot_.LastError());
+    const std::string error = spot_.LastError();
+    const bool lost_lease = ErrorSuggestsLostLease(error);
+    if (lost_lease) ResetLeaseState(true);
+    EmitLog(std::string("[command] " + command_name + " failed: ") + error +
+            (lost_lease ? " ; clearing cached lease" : ""));
     return false;
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms + 120));
@@ -5364,8 +5448,12 @@ void Adapter::ApplyDesiredArmMode(bool force) {
   } else {
     const long long last_err = last_arm_error_log_ms_.load();
     if (force || (now - last_err) >= 2000) {
-      EmitLog(std::string("[arm] stow command failed: ") + spot_.LastError());
+      const std::string error = spot_.LastError();
+      const bool lost_lease = ErrorSuggestsLostLease(error);
+      EmitLog(std::string("[arm] stow command failed: ") + error +
+              (lost_lease ? " ; clearing cached lease" : ""));
       last_arm_error_log_ms_ = now;
+      if (lost_lease) ResetLeaseState(true);
     }
   }
   if (ok) last_arm_hold_cmd_ms_ = now;
@@ -5410,12 +5498,42 @@ void Adapter::HandleTwist(const v1::model::Twist& twist) {
 void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
                                const char* source_name) {
   static constexpr long long kPitchZeroDropoutGraceMs = 80;
-  if (now_ms() < dock_cooldown_until_ms_.load()) return;
-  if (!TeleopSessionActive()) return;
-  if (docking_in_progress_) return;
-  if (!SpotConnected()) return;
-  if (spot_degraded_non_estop_.load()) return;
-  if (!lease_owned_) return;
+  const bool requested_motion = std::abs(twist.linear().x()) >= cfg_.twist_deadband ||
+                                std::abs(twist.linear().y()) >= cfg_.twist_deadband ||
+                                std::abs(twist.angular().z()) >= cfg_.twist_deadband ||
+                                std::abs(twist.angular().y()) >= cfg_.twist_deadband;
+  const auto maybe_log_rejection = [&](const char* reason) {
+    if (!requested_motion) return;
+    const long long now = now_ms();
+    const long long last_log = last_twist_reject_log_ms_.load();
+    if ((now - last_log) < 2000) return;
+    last_twist_reject_log_ms_ = now;
+    EmitLog(std::string("[teleop] motion ignored source=") + source_name + " reason=" + reason);
+  };
+  if (now_ms() < dock_cooldown_until_ms_.load()) {
+    maybe_log_rejection("dock cooldown active");
+    return;
+  }
+  if (!TeleopSessionActive()) {
+    maybe_log_rejection("session inactive");
+    return;
+  }
+  if (docking_in_progress_) {
+    maybe_log_rejection("dock operation in progress");
+    return;
+  }
+  if (!SpotConnected()) {
+    maybe_log_rejection("robot unavailable");
+    return;
+  }
+  if (spot_degraded_non_estop_.load()) {
+    maybe_log_rejection("robot degraded (non-estop)");
+    return;
+  }
+  if (!lease_owned_) {
+    maybe_log_rejection("no body lease");
+    return;
+  }
   const long long now = now_ms();
 
   const double raw_x = twist.linear().x();

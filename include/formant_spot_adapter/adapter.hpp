@@ -42,6 +42,8 @@ class Adapter {
   void HandleButtons(const v1::model::Bitset& bitset, const std::string& source_stream);
   void HandleButtonPress(const std::string& button_key, const std::string& source_stream);
   bool EnsureLeaseForCommand(const std::string& action_name);
+  bool ErrorSuggestsLostLease(const std::string& error) const;
+  void ResetLeaseState(bool clear_motion);
   bool ExecuteStandAction(bool require_teleop, bool auto_acquire_lease);
   bool ExecuteSitAction(bool require_teleop, bool auto_acquire_lease);
   bool ExecuteRecoverAction(bool require_teleop, bool auto_acquire_lease);
@@ -215,6 +217,7 @@ class Adapter {
   std::atomic<bool> lease_owned_{false};
   std::atomic<long long> last_twist_ms_{0};
   std::atomic<long long> last_twist_timeout_log_ms_{0};
+  std::atomic<long long> last_twist_reject_log_ms_{0};
   std::atomic<long long> last_nonzero_cmd_ms_{0};
   std::atomic<bool> moving_{false};
   mutable std::mutex twist_cmd_mu_;

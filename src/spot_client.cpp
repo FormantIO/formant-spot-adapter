@@ -595,11 +595,18 @@ bool SpotClient::TryAcquireBodyLeaseNoTakeover() {
 
 bool SpotClient::RetainLease() {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
-  if (!lease_client_) return false;
-  if (body_lease_.resource().empty()) return false;
+  if (!lease_client_) {
+    SetLastError("Lease client unavailable");
+    return false;
+  }
+  if (body_lease_.resource().empty()) {
+    SetLastError("RetainLease requires cached body lease");
+    return false;
+  }
   ::bosdyn::api::RetainLeaseRequest req;
   req.mutable_lease()->CopyFrom(body_lease_);
   auto r = lease_client_->RetainLease(req);
+  if (!r.status) SetLastError(r.status.DebugString());
   return r.status;
 }
 
@@ -613,6 +620,11 @@ bool SpotClient::ReturnBodyLease() {
   if (!r.status) SetLastError(r.status.DebugString());
   body_lease_.Clear();
   return r.status;
+}
+
+void SpotClient::InvalidateBodyLease() {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  body_lease_.Clear();
 }
 
 bool SpotClient::DetectArmPresenceLocked(bool* out_has_arm) {

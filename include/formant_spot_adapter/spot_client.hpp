@@ -210,6 +210,7 @@ class SpotClient {
   bool TryAcquireBodyLeaseNoTakeover();
   bool RetainLease();
   bool ReturnBodyLease();
+  void InvalidateBodyLease();
 
   bool Stand();
   bool Sit();
