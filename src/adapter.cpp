@@ -2550,8 +2550,6 @@ bool Adapter::Init() {
   }
   ResetTeleopSlewState();
   desired_motion_mode_ = kMotionModeWalk;
-  last_arm_hold_cmd_ms_ = 0;
-  last_arm_error_log_ms_ = 0;
   last_lease_attempt_ms_ = 0;
   last_logged_control_stream_.clear();
   if (!LoadAdapterMapState()) {
@@ -2752,7 +2750,6 @@ void Adapter::Run() {
         lease_owned_ = spot_.AcquireBodyLease();
         if (lease_owned_) {
           EmitLog("[adapter] body lease acquired");
-          ApplyDesiredArmMode(true);
         } else {
           EmitLog(std::string("[adapter] failed to acquire body lease: ") + spot_.LastError());
         }
@@ -2771,9 +2768,6 @@ void Adapter::Run() {
         spot_.ZeroVelocity(cfg_.zero_velocity_repeats);
         moving_ = false;
         ResetTeleopSlewState();
-        if (!WaitForArmStow(3000)) {
-          EmitLog("[adapter] arm did not reach stow before lease return (timeout)");
-        }
         if (!spot_.ReturnBodyLease()) {
           EmitLog(std::string("[adapter] failed returning body lease: ") + spot_.LastError());
         }
@@ -2905,7 +2899,6 @@ void Adapter::Run() {
   spot_.ZeroVelocity(cfg_.zero_velocity_repeats);
   ResetTeleopSlewState();
   if (lease_owned_) {
-    (void)WaitForArmStow(3000);
     spot_.ReturnBodyLease();
     lease_owned_ = false;
   }
@@ -4076,10 +4069,6 @@ void Adapter::LeaseRetainLoop() {
 
     PollCurrentWaypointAtStatus(now);
     PublishGraphNavNavState(now);
-
-    if (lease_owned_ && TeleopSessionActive() && !docking_in_progress_) {
-      ApplyDesiredArmMode(false);
-    }
 
     PublishCurrentWaypointText(now);
     std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
@@ -5553,7 +5542,7 @@ bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
   if (command == "spot.rotate_right") return ExecuteRotateCommand(request, false);
   if (command == "spot.reset_arm") {
     if (!ExecuteResetArmAction(false, true)) return false;
-    return WaitForArmStow(15000);
+    return WaitForArmStowPassive(15000);
   }
   if (command.rfind("spot.map.", 0) == 0) return HandleMapCommand(request);
   if (command == "spot.waypoint.goto") return ExecuteWaypointGotoCommand(request);
@@ -5833,8 +5822,7 @@ bool Adapter::ExecuteResetArmAction(bool require_teleop, bool auto_acquire_lease
     return false;
   }
   EmitLog(require_teleop ? "[arm] reset requested" : "[command] spot.reset_arm requested");
-  ApplyDesiredArmMode(true);
-  return true;
+  return CommandArmStow();
 }
 
 bool Adapter::ExecuteRotateCommand(const v1::model::CommandRequest& request, bool left) {
@@ -5898,30 +5886,21 @@ bool Adapter::ExecuteRotateCommand(const v1::model::CommandRequest& request, boo
   return true;
 }
 
-void Adapter::ApplyDesiredArmMode(bool force) {
-  const long long now = now_ms();
-  const int min_interval_ms = std::max(250, cfg_.arm_hold_interval_ms);
-  if (!force && (now - last_arm_hold_cmd_ms_.load()) < min_interval_ms) return;
-  if (!lease_owned_) return;
-  if (!spot_.HasArm()) return;
+bool Adapter::CommandArmStow() {
+  if (!lease_owned_) return false;
+  if (!spot_.HasArm()) return false;
 
   const bool ok = spot_.ResetArmToStow();
   if (ok) {
-    if (force && (now - last_arm_hold_cmd_ms_.load()) >= min_interval_ms) {
-      EmitLog("[arm] stow command sent");
-    }
+    EmitLog("[arm] stow command sent");
   } else {
-    const long long last_err = last_arm_error_log_ms_.load();
-    if (force || (now - last_err) >= 2000) {
-      const std::string error = spot_.LastError();
-      const bool lost_lease = ErrorSuggestsLostLease(error);
-      EmitLog(std::string("[arm] stow command failed: ") + error +
-              (lost_lease ? " ; clearing cached lease" : ""));
-      last_arm_error_log_ms_ = now;
-      if (lost_lease) ResetLeaseState(true);
-    }
+    const std::string error = spot_.LastError();
+    const bool lost_lease = ErrorSuggestsLostLease(error);
+    EmitLog(std::string("[arm] stow command failed: ") + error +
+            (lost_lease ? " ; clearing cached lease" : ""));
+    if (lost_lease) ResetLeaseState(true);
   }
-  if (ok) last_arm_hold_cmd_ms_ = now;
+  return ok;
 }
 
 bool Adapter::IsArmLikelyStowed() {
@@ -5943,13 +5922,12 @@ bool Adapter::IsArmLikelyStowed() {
   return true;
 }
 
-bool Adapter::WaitForArmStow(int timeout_ms) {
+bool Adapter::WaitForArmStowPassive(int timeout_ms) {
   if (!spot_.HasArm()) return true;
   const auto start = std::chrono::steady_clock::now();
   const auto timeout = std::chrono::milliseconds(std::max(500, timeout_ms));
   while (lease_owned_) {
     if (IsArmLikelyStowed()) return true;
-    ApplyDesiredArmMode(true);
     std::this_thread::sleep_for(std::chrono::seconds(1));
     if ((std::chrono::steady_clock::now() - start) >= timeout) break;
   }

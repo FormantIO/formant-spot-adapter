@@ -15,8 +15,7 @@ Boston Dynamics.
 ## What It Does
 
 - Teleop motion from Formant twist control, with optional adapter-side gamepad (`Joy`) mapping.
-- Stand/Sit, E-Stop, Recover, Dock, locomotion mode, and arm mode controls.
-- Arm stow hold while lease is active.
+- Stand/Sit, E-Stop, Recover, Dock, locomotion mode, and explicit arm reset controls.
 - Image publishing from hand, left, right, and back cameras.
 - Dock readiness status publishing.
 - Stateful mode publishing (walk/stairs/crawl).
@@ -39,7 +38,7 @@ Boston Dynamics.
 | `Walk` | `Bitset`/boolean-to-device | Set locomotion mode | Does not stand robot |
 | `Stairs` | `Bitset`/boolean-to-device | Set locomotion mode | Does not stand robot |
 | `Crawl` | `Bitset`/boolean-to-device | Set locomotion mode | Does not stand robot |
-| `Reset Arm` | `Bitset`/boolean-to-device | Set arm mode to stow | Requires lease to execute immediately |
+| `Reset Arm` | `Bitset`/boolean-to-device | Send an explicit arm stow command | Requires lease to execute immediately |
 | `Dock` | `Bitset`/boolean-to-device | Start autodock | Uses configured dock id or discovery |
 
 Additional control channels (not streams):
@@ -130,9 +129,9 @@ value in `streamControls`.
 - `spot.front.image` is rotated 90 degrees clockwise by default. Set
   `frontImageRollDegrees` only to override that default for a specific robot.
 - If lease is already held, adapter attempts takeover (`TakeLease`) to recover from stale owners.
-- On teleop inactivity: sends zero velocity, stows arm, then returns lease unless GraphNav nav is active.
+- On teleop inactivity: sends zero velocity, then returns lease unless GraphNav nav is active.
 - Heartbeat timeout behavior is zero-velocity only (no auto-sit).
-- Arm hold loop continuously reissues stow at interval.
+- The adapter does not automatically command the arm on lease acquire, teleop activity, lease return, or shutdown.
 - Dock command runs in background loop with status/error logging.
 - GraphNav maps are persisted under `graphnavStoreDir` and can be loaded/deleted via commands.
 - Waypoint aliases are map-scoped (`name -> waypoint_id`) and published on `spot.waypoints`.
@@ -157,7 +156,7 @@ Additional non-GraphNav command-channel actions:
   - Successful manual `spot.dock` learns/saves current localized waypoint as dock waypoint.
 - `spot.rotate_left`: rotate left in place by a requested angle. Parameter: `degrees`.
 - `spot.rotate_right`: rotate right in place by a requested angle. Parameter: `degrees`.
-- `spot.reset_arm`: arm reset/stow; command path does not require active teleop heartbeat.
+- `spot.reset_arm`: explicit arm reset/stow; command path does not require active teleop heartbeat.
 
 - `spot.map.create`: create a new empty map context and make it active.
   - Parameter examples: `name=warehouse_a`

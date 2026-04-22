@@ -454,15 +454,13 @@ Command response behavior:
   critical/unclearable faults or motor power error.
 - GraphNav command navigation prechecks localization and attempts fiducial relocalization once
   before failing a command.
-- If teleop heartbeat stops, adapter sends zero velocity, stows arm, then releases lease.
+- If teleop heartbeat stops, adapter sends zero velocity, then releases lease.
 - Heartbeat timeout behavior is zero-velocity command only.
 - No auto-sit on heartbeat timeout.
 - Adapter enforces twist deadband and uses held-command resend for smoother teleop control.
 - Very short pitch-only zero pulses are filtered to reduce oscillation from pulsed joystick transport.
 - Surround-camera JPEG frames are republished from cached images, and the right camera is rotated
   180 degrees by default.
-- Arm hold mode is always active while lease is owned:
-  - adapter continuously keeps the arm stowed/retracted
-  - pressing `Reset Arm` immediately requests stow
-  - adapter re-issues stow every `armHoldIntervalMs` (default 2500 ms)
+- The adapter does not automatically command the arm on lease acquire, teleop activity, lease return,
+  or shutdown. Pressing `Reset Arm` or sending `spot.reset_arm` is the explicit arm stow path.
 - Locomotion mode is stateful and defaults to `Walk`. `Walk`/`Stairs`/`Crawl` buttons only change mode.

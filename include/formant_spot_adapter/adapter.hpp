@@ -121,9 +121,9 @@ class Adapter {
   void ApplyTeleopSlewLimit(double* vx, double* vy, double* wz, double* body_pitch,
                             const TeleopTuning& tuning, long long now_ms);
   void DockLoop();
-  void ApplyDesiredArmMode(bool force = false);
+  bool CommandArmStow();
   bool IsArmLikelyStowed();
-  bool WaitForArmStow(int timeout_ms);
+  bool WaitForArmStowPassive(int timeout_ms);
   void MarkHeartbeat();
   bool HeartbeatExpired() const;
   bool TeleopSessionActive() const;
@@ -283,8 +283,6 @@ class Adapter {
   std::atomic<bool> reboot_requested_{false};
   std::atomic<bool> command_action_in_progress_{false};
   std::atomic<int> desired_motion_mode_{0};
-  std::atomic<long long> last_arm_hold_cmd_ms_{0};
-  std::atomic<long long> last_arm_error_log_ms_{0};
   std::atomic<long long> last_lease_attempt_ms_{0};
   std::atomic<long long> dock_cooldown_until_ms_{0};
   std::atomic<int> resolved_dock_id_{-1};
