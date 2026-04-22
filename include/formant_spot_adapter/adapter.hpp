@@ -28,6 +28,38 @@ class Adapter {
   void Stop();
 
  private:
+  struct TeleopTuning {
+    int joy_axis_forward{1};
+    int joy_axis_strafe{0};
+    int joy_axis_yaw{2};
+    int joy_axis_body_pitch{3};
+    bool joy_axis_forward_inverted{true};
+    bool joy_axis_strafe_inverted{true};
+    bool joy_axis_yaw_inverted{true};
+    bool joy_axis_body_pitch_inverted{true};
+    int joy_button_stand{0};
+    int joy_button_sit{1};
+    int joy_button_reset_arm{-1};
+    int joy_button_recover{-1};
+    int joy_button_walk{2};
+    int joy_button_stairs{-1};
+    int joy_button_crawl{-1};
+    int joy_button_dock{3};
+    int joy_button_estop{-1};
+    double twist_deadband{0.08};
+    int teleop_idle_timeout_ms{1000};
+    double max_vx_mps{0.8};
+    double max_vy_mps{0.5};
+    double max_wz_rps{1.2};
+    double max_body_pitch_rad{0.25};
+    double translation_response_curve{1.4};
+    double rotation_response_curve{1.2};
+    double linear_accel_limit_mps2{0.8};
+    double strafe_accel_limit_mps2{0.6};
+    double angular_accel_limit_rps2{1.5};
+    double body_pitch_rate_limit_radps{0.5};
+  };
+
   void CameraLoop(const std::string& source, const std::string& stream, int output_fps,
                   int poll_hz, bool rotate_180, bool normalize_jpeg, int post_timeout_ms);
   void SurroundImageLoop(int output_fps, int poll_hz);
@@ -73,6 +105,21 @@ class Adapter {
                                               uint32_t* out_command_id);
   void HandleTwist(const v1::model::Twist& twist);
   void ApplyTeleopTwist(const v1::model::Twist& twist, int source_id, const char* source_name);
+  static TeleopTuning TeleopTuningFromConfig(const Config& config);
+  static void SanitizeTeleopTuning(TeleopTuning* tuning,
+                                   std::vector<std::string>* warnings = nullptr);
+  static int ApplyTeleopAppConfigOverrides(
+      const std::unordered_map<std::string, std::string>& values, TeleopTuning* tuning,
+      std::vector<std::string>* warnings = nullptr);
+  static std::string TeleopTuningSignature(const TeleopTuning& tuning);
+  TeleopTuning CurrentTeleopTuning() const;
+  void RequestTeleopAppConfigRefresh(const std::string& reason);
+  void TeleopAppConfigRefreshLoop();
+  void RefreshTeleopAppConfig(const std::string& reason);
+  void ResetTeleopSlewState();
+  void ClampTeleopSlewStateToTuning(const TeleopTuning& tuning);
+  void ApplyTeleopSlewLimit(double* vx, double* vy, double* wz, double* body_pitch,
+                            const TeleopTuning& tuning, long long now_ms);
   void DockLoop();
   void ApplyDesiredArmMode(bool force = false);
   bool IsArmLikelyStowed();
@@ -156,7 +203,7 @@ class Adapter {
   void SetSpotConnected();
   void SetSpotDisconnected(const std::string& reason);
   std::string BuildSpotConnectionJson() const;
-  void ApplySoftRecoveryForRobotState(const SpotClient::RobotStateSnapshot& snap);
+  void UpdateDegradedStateFromRobotState(const SpotClient::RobotStateSnapshot& snap);
   void PublishFaultEvents(const SpotClient::RobotStateSnapshot& snap);
   void ResetFaultEventsState();
   bool ResolveWaypointNameLocked(const std::string& name, std::string* out_waypoint_id) const;
@@ -244,6 +291,15 @@ class Adapter {
   std::atomic<int> active_motion_source_{0};
   std::string last_logged_control_stream_;
   std::vector<int> last_joy_buttons_;
+  mutable std::mutex teleop_tuning_mu_;
+  TeleopTuning teleop_tuning_;
+  std::atomic<long long> last_teleop_app_config_error_log_ms_{0};
+  mutable std::mutex teleop_slew_mu_;
+  double last_sent_vx_{0.0};
+  double last_sent_vy_{0.0};
+  double last_sent_wz_{0.0};
+  double last_sent_body_pitch_{0.0};
+  long long last_sent_velocity_ms_{0};
 
   std::vector<std::thread> camera_threads_;
   std::thread surround_image_thread_;
@@ -254,6 +310,12 @@ class Adapter {
   std::thread dock_thread_;
   std::thread connection_thread_;
   std::thread command_exec_thread_;
+  std::thread app_config_thread_;
+  std::mutex app_config_mu_;
+  std::condition_variable app_config_cv_;
+  bool app_config_refresh_requested_{false};
+  bool app_config_thread_stop_{false};
+  std::string app_config_refresh_reason_;
 
   std::mutex command_queue_mu_;
   std::condition_variable command_queue_cv_;
@@ -294,7 +356,7 @@ class Adapter {
   std::atomic<int> spot_reconnect_attempt_{0};
   std::atomic<int> spot_health_failures_{0};
   std::atomic<bool> spot_degraded_non_estop_{false};
-  std::atomic<long long> last_soft_recovery_log_ms_{0};
+  std::atomic<long long> last_degraded_state_log_ms_{0};
   mutable std::mutex spot_connection_mu_;
   std::string last_spot_error_;
   std::string spot_degraded_reason_;

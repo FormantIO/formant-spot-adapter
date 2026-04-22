@@ -104,4 +104,10 @@ message AdapterConfig {
   google.protobuf.Int32Value joy_button_crawl = 93;
   google.protobuf.Int32Value joy_button_dock = 94;
   google.protobuf.Int32Value joy_button_estop = 95;
+  google.protobuf.DoubleValue translation_response_curve = 96;
+  google.protobuf.DoubleValue rotation_response_curve = 97;
+  google.protobuf.DoubleValue linear_accel_limit_mps2 = 98;
+  google.protobuf.DoubleValue strafe_accel_limit_mps2 = 99;
+  google.protobuf.DoubleValue angular_accel_limit_rps2 = 100;
+  google.protobuf.DoubleValue body_pitch_rate_limit_radps = 101;
 }

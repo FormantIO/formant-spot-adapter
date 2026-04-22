@@ -34,6 +34,38 @@ If you rename a stream from its default, use the renamed stream name in `streamC
 - `Recover`, `E-Stop`, `Reset Arm`, `Stairs`, and `Crawl` are intentionally unmapped by default.
 - `teleopJoyStream` defaults to `Gamepad`.
 
+## Teleop Motion Tuning
+
+Formant joystick modules publish normalized `Twist` values, normally in `[-1, 1]`. The adapter maps
+those unitless values to Spot velocity commands with clamp, deadband rescaling, response curves,
+speed caps, and slew limits. Normal joystick release still sends zero immediately; the stale input
+timeout is for lost/repeated input transport cases.
+
+Baseline values live in `config/formant-spot-adapter.json`. Formant application configuration can
+override runtime tuning without an adapter restart. Missing keys use the baseline values, and invalid
+values are ignored. The adapter reads application configuration at startup and on Formant agent
+stream reconnects after agent configuration changes; it does not poll application configuration in
+the control loop.
+
+| Application config key | Default |
+|---|---:|
+| `spot.teleop.max_vx_mps` | `0.8` |
+| `spot.teleop.max_vy_mps` | `0.5` |
+| `spot.teleop.max_wz_rps` | `1.2` |
+| `spot.teleop.max_body_pitch_rad` | `0.25` |
+| `spot.teleop.deadband` | `0.08` |
+| `spot.teleop.idle_timeout_ms` | `1000` |
+| `spot.teleop.translation_response_curve` | `1.4` |
+| `spot.teleop.rotation_response_curve` | `1.2` |
+| `spot.teleop.linear_accel_limit_mps2` | `0.8` |
+| `spot.teleop.strafe_accel_limit_mps2` | `0.6` |
+| `spot.teleop.angular_accel_limit_rps2` | `1.5` |
+| `spot.teleop.body_pitch_rate_limit_radps` | `0.5` |
+
+For the optional `Gamepad`/`Joy` bridge, the same application configuration map can override
+`spot.teleop.joy_axis_*`, `spot.teleop.joy_axis_*_inverted`, and `spot.teleop.joy_button_*`
+parameters documented in the repository `README.md`.
+
 - `Buttons` (type: Bitset)
 - Include at least two buttons:
 - `Stand`

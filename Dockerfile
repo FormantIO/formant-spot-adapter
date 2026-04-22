@@ -23,6 +23,9 @@ RUN apt-get update && apt-get install -y \
 
 COPY . .
 
+ARG BUILD_JOBS=
+ENV BUILD_JOBS=${BUILD_JOBS}
+
 RUN ./scripts/build.sh
 
 ENV CONFIG_PATH=/opt/formant-spot-adapter/config/formant-spot-adapter.json

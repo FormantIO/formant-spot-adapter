@@ -42,12 +42,17 @@ class FormantAgentClient {
   bool SendCommandResponse(const std::string& request_id, bool success);
 
   void StartTeleopLoop(const std::vector<std::string>& stream_filter,
-                      std::function<void(const v1::model::ControlDatapoint&)> cb);
+                      std::function<void(const v1::model::ControlDatapoint&)> cb,
+                      std::function<void()> on_stream_connected = {});
   void StartCommandLoop(const std::vector<std::string>& command_filter,
-                        std::function<void(const v1::model::CommandRequest&)> cb);
-  void StartHeartbeatLoop(std::function<void(const v1::agent::GetTeleopHeartbeatStreamResponse&)> cb);
+                        std::function<void(const v1::model::CommandRequest&)> cb,
+                        std::function<void()> on_stream_connected = {});
+  void StartHeartbeatLoop(
+      std::function<void(const v1::agent::GetTeleopHeartbeatStreamResponse&)> cb,
+      std::function<void()> on_stream_connected = {});
   void StopLoops();
 
+  bool GetAppConfigMap(std::unordered_map<std::string, std::string>* out);
   std::string GetAppConfig(const std::string& key, const std::string& default_value);
 
  private:

@@ -83,12 +83,18 @@ struct Config {
   int graphnav_map_image_poll_hz{2};
   int arm_present_override{-1};  // -1 => auto-detect, 0 => no arm, 1 => arm present
   double twist_deadband{0.08};
-  int teleop_idle_timeout_ms{300};
+  int teleop_idle_timeout_ms{1000};
 
   double max_vx_mps{0.8};
   double max_vy_mps{0.5};
   double max_wz_rps{1.2};
   double max_body_pitch_rad{0.25};
+  double translation_response_curve{1.4};
+  double rotation_response_curve{1.2};
+  double linear_accel_limit_mps2{0.8};
+  double strafe_accel_limit_mps2{0.6};
+  double angular_accel_limit_rps2{1.5};
+  double body_pitch_rate_limit_radps{0.5};
 
   int lease_retain_hz{2};
   int heartbeat_timeout_ms{5000};

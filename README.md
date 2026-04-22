@@ -136,7 +136,8 @@ value in `streamControls`.
 - Dock command runs in background loop with status/error logging.
 - GraphNav maps are persisted under `graphnavStoreDir` and can be loaded/deleted via commands.
 - Waypoint aliases are map-scoped (`name -> waypoint_id`) and published on `spot.waypoints`.
-- Teleop motion uses held-command resend (smoother than packet-by-packet pulse behavior).
+- Teleop motion uses held-command resend (smoother than packet-by-packet pulse behavior), deadband
+  rescaling, response curves, and adapter-side slew limiting.
 
 ## GraphNav Commands
 
@@ -204,6 +205,67 @@ Important:
 - `config/formant-spot-adapter.json.example` is the canonical baseline configuration for this repository.
 - Current runtime `load_config()` takes secrets plus `FORMANT_AGENT_TARGET` from env and all other runtime params from JSON.
 - If you want to change stream names, arm pose, docking config, or camera config, update JSON.
+
+### Teleop Tuning
+
+Formant joystick UI modules publish normalized `Twist` values, normally in `[-1, 1]`, with the
+teleop view owning which UI axis maps to each twist field. The adapter treats those values as
+unitless operator intent and maps them to Spot body velocity using:
+
+```text
+clamp [-1, 1] -> deadband with rescale -> response curve -> max velocity -> slew limit
+```
+
+The deadband is rescaled rather than simply zeroed, so motion ramps continuously from zero instead
+of jumping to the deadband percentage. Slew limits are applied in the adapter's resend loop before
+each Spot velocity command. A `teleopIdleTimeoutMs` default of `1000` ms is used because the
+Formant teleop joystick can debounce repeated identical values; normal joystick release still sends
+a zero command immediately.
+
+The JSON config values are the baseline. Formant application configuration may override the runtime
+teleop tuning without restarting the adapter. Missing application config keys leave the JSON/default
+values in effect. The adapter reads application configuration at startup and again when the Formant
+agent gRPC streams reconnect, which is how agent configuration changes propagate after the agent
+restarts. Values are parsed into typed tuning fields, validated against conservative bounds, and
+invalid values are ignored.
+
+| Application config key | Default | Meaning |
+|---|---:|---|
+| `spot.teleop.max_vx_mps` | `0.8` | Max forward/back velocity sent to Spot |
+| `spot.teleop.max_vy_mps` | `0.5` | Max strafe velocity sent to Spot |
+| `spot.teleop.max_wz_rps` | `1.2` | Max yaw rate sent to Spot |
+| `spot.teleop.max_body_pitch_rad` | `0.25` | Max body pitch offset |
+| `spot.teleop.deadband` | `0.08` | Normalized input deadband before rescaling |
+| `spot.teleop.idle_timeout_ms` | `1000` | Stale input timeout before zeroing held motion |
+| `spot.teleop.translation_response_curve` | `1.4` | Curve exponent for forward/strafe axes |
+| `spot.teleop.rotation_response_curve` | `1.2` | Curve exponent for yaw/body-pitch axes |
+| `spot.teleop.linear_accel_limit_mps2` | `0.8` | Forward/back acceleration limit, `0` disables |
+| `spot.teleop.strafe_accel_limit_mps2` | `0.6` | Strafe acceleration limit, `0` disables |
+| `spot.teleop.angular_accel_limit_rps2` | `1.5` | Yaw acceleration limit, `0` disables |
+| `spot.teleop.body_pitch_rate_limit_radps` | `0.5` | Body-pitch rate limit, `0` disables |
+
+For the optional `Gamepad`/`Joy` bridge, these application config keys override the adapter-side
+browser gamepad mapping:
+
+| Application config key | Default |
+|---|---:|
+| `spot.teleop.joy_axis_forward` | `1` |
+| `spot.teleop.joy_axis_strafe` | `0` |
+| `spot.teleop.joy_axis_yaw` | `2` |
+| `spot.teleop.joy_axis_body_pitch` | `3` |
+| `spot.teleop.joy_axis_forward_inverted` | `true` |
+| `spot.teleop.joy_axis_strafe_inverted` | `true` |
+| `spot.teleop.joy_axis_yaw_inverted` | `true` |
+| `spot.teleop.joy_axis_body_pitch_inverted` | `true` |
+| `spot.teleop.joy_button_stand` | `0` |
+| `spot.teleop.joy_button_sit` | `1` |
+| `spot.teleop.joy_button_walk` | `2` |
+| `spot.teleop.joy_button_dock` | `3` |
+| `spot.teleop.joy_button_reset_arm` | `-1` |
+| `spot.teleop.joy_button_recover` | `-1` |
+| `spot.teleop.joy_button_stairs` | `-1` |
+| `spot.teleop.joy_button_crawl` | `-1` |
+| `spot.teleop.joy_button_estop` | `-1` |
 
 ## Deployment Modes
 

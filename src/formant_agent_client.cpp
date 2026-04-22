@@ -274,9 +274,10 @@ bool FormantAgentClient::SendCommandResponse(const std::string& request_id, bool
 }
 
 void FormantAgentClient::StartTeleopLoop(const std::vector<std::string>& stream_filter,
-                                         std::function<void(const v1::model::ControlDatapoint&)> cb) {
+                                         std::function<void(const v1::model::ControlDatapoint&)> cb,
+                                         std::function<void()> on_stream_connected) {
   stop_ = false;
-  teleop_thread_ = std::thread([this, stream_filter, cb]() {
+  teleop_thread_ = std::thread([this, stream_filter, cb, on_stream_connected]() {
     int reconnect_attempt = 0;
     while (!stop_) {
       std::cerr << "[formant] opening teleop stream target=" << target_;
@@ -292,6 +293,7 @@ void FormantAgentClient::StartTeleopLoop(const std::vector<std::string>& stream_
       v1::agent::GetTeleopControlDataStreamRequest req;
       for (const auto& f : stream_filter) req.add_stream_filter(f);
       auto stream = stub_->GetTeleopControlDataStream(ctx.get(), req);
+      if (on_stream_connected) on_stream_connected();
 
       v1::agent::GetTeleopControlDataStreamResponse msg;
       while (!stop_ && stream->Read(&msg)) {
@@ -316,9 +318,10 @@ void FormantAgentClient::StartTeleopLoop(const std::vector<std::string>& stream_
 }
 
 void FormantAgentClient::StartCommandLoop(const std::vector<std::string>& command_filter,
-                                          std::function<void(const v1::model::CommandRequest&)> cb) {
+                                          std::function<void(const v1::model::CommandRequest&)> cb,
+                                          std::function<void()> on_stream_connected) {
   stop_ = false;
-  command_thread_ = std::thread([this, command_filter, cb]() {
+  command_thread_ = std::thread([this, command_filter, cb, on_stream_connected]() {
     int reconnect_attempt = 0;
     while (!stop_) {
       std::cerr << "[formant] opening command stream target=" << target_;
@@ -334,6 +337,7 @@ void FormantAgentClient::StartCommandLoop(const std::vector<std::string>& comman
       v1::agent::GetCommandRequestStreamRequest req;
       for (const auto& f : command_filter) req.add_command_filter(f);
       auto stream = stub_->GetCommandRequestStream(ctx.get(), req);
+      if (on_stream_connected) on_stream_connected();
 
       v1::agent::GetCommandRequestStreamResponse msg;
       while (!stop_ && stream->Read(&msg)) {
@@ -357,9 +361,11 @@ void FormantAgentClient::StartCommandLoop(const std::vector<std::string>& comman
   });
 }
 
-void FormantAgentClient::StartHeartbeatLoop(std::function<void(const v1::agent::GetTeleopHeartbeatStreamResponse&)> cb) {
+void FormantAgentClient::StartHeartbeatLoop(
+    std::function<void(const v1::agent::GetTeleopHeartbeatStreamResponse&)> cb,
+    std::function<void()> on_stream_connected) {
   stop_ = false;
-  heartbeat_thread_ = std::thread([this, cb]() {
+  heartbeat_thread_ = std::thread([this, cb, on_stream_connected]() {
     int reconnect_attempt = 0;
     while (!stop_) {
       std::cerr << "[formant] opening heartbeat stream target=" << target_;
@@ -374,6 +380,7 @@ void FormantAgentClient::StartHeartbeatLoop(std::function<void(const v1::agent::
       }
       v1::agent::GetTeleopHeartbeatStreamRequest req;
       auto stream = stub_->GetTeleopHeartbeatStream(ctx.get(), req);
+      if (on_stream_connected) on_stream_connected();
 
       v1::agent::GetTeleopHeartbeatStreamResponse msg;
       while (!stop_ && stream->Read(&msg)) {
@@ -410,15 +417,28 @@ void FormantAgentClient::StopLoops() {
   if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
 }
 
-std::string FormantAgentClient::GetAppConfig(const std::string& key, const std::string& default_value) {
+bool FormantAgentClient::GetAppConfigMap(std::unordered_map<std::string, std::string>* out) {
+  if (!out) return false;
   std::lock_guard<std::mutex> lk(post_mu_);
   grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(200));
   v1::agent::GetApplicationConfigurationRequest req;
   v1::agent::GetApplicationConfigurationResponse resp;
   auto s = stub_->GetApplicationConfiguration(&ctx, req, &resp);
-  if (!s.ok()) return default_value;
+  if (!s.ok()) return false;
 
   const auto& m = resp.configuration().configuration_map();
+  out->clear();
+  for (const auto& entry : m) {
+    (*out)[entry.first] = entry.second;
+  }
+  return true;
+}
+
+std::string FormantAgentClient::GetAppConfig(const std::string& key, const std::string& default_value) {
+  std::unordered_map<std::string, std::string> values;
+  if (!GetAppConfigMap(&values)) return default_value;
+  const auto& m = values;
   auto it = m.find(key);
   return it == m.end() ? default_value : it->second;
 }

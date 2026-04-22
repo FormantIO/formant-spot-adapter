@@ -153,6 +153,119 @@ bool joy_button_pressed(const v1::model::Joy& joy, int index) {
   return index >= 0 && index < joy.buttons_size() && joy.buttons(index) > 0;
 }
 
+double clamp_double(double value, double min_value, double max_value) {
+  return std::max(min_value, std::min(max_value, value));
+}
+
+double shape_normalized_axis(double raw, double deadband, double response_curve) {
+  const double clamped = clamp_double(raw, -1.0, 1.0);
+  const double abs_value = std::abs(clamped);
+  const double bounded_deadband = clamp_double(deadband, 0.0, 0.95);
+  if (abs_value <= bounded_deadband) return 0.0;
+  const double normalized = (abs_value - bounded_deadband) / (1.0 - bounded_deadband);
+  const double curve = std::max(0.05, response_curve);
+  const double shaped = std::pow(clamp_double(normalized, 0.0, 1.0), curve);
+  return std::copysign(shaped, clamped);
+}
+
+double slew_toward(double current, double target, double rate_limit_per_sec, double dt_sec) {
+  if (rate_limit_per_sec <= 0.0 || dt_sec <= 0.0) return target;
+  const double max_delta = rate_limit_per_sec * dt_sec;
+  const double delta = target - current;
+  if (std::abs(delta) <= max_delta) return target;
+  return current + std::copysign(max_delta, delta);
+}
+
+std::string trim_copy(const std::string& in) {
+  std::size_t begin = 0;
+  while (begin < in.size() && std::isspace(static_cast<unsigned char>(in[begin]))) ++begin;
+  std::size_t end = in.size();
+  while (end > begin && std::isspace(static_cast<unsigned char>(in[end - 1]))) --end;
+  return in.substr(begin, end - begin);
+}
+
+bool parse_double_value(const std::string& value, double* out) {
+  if (!out) return false;
+  const std::string trimmed = trim_copy(value);
+  if (trimmed.empty()) return false;
+  try {
+    std::size_t idx = 0;
+    const double parsed = std::stod(trimmed, &idx);
+    if (idx != trimmed.size() || !std::isfinite(parsed)) return false;
+    *out = parsed;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool parse_int_value(const std::string& value, int* out) {
+  if (!out) return false;
+  const std::string trimmed = trim_copy(value);
+  if (trimmed.empty()) return false;
+  try {
+    std::size_t idx = 0;
+    const int parsed = std::stoi(trimmed, &idx);
+    if (idx != trimmed.size()) return false;
+    *out = parsed;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool parse_bool_value(const std::string& value, bool* out) {
+  if (!out) return false;
+  std::string trimmed = trim_copy(value);
+  for (char& ch : trimmed) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  if (trimmed == "1" || trimmed == "true" || trimmed == "yes" || trimmed == "on") {
+    *out = true;
+    return true;
+  }
+  if (trimmed == "0" || trimmed == "false" || trimmed == "no" || trimmed == "off") {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+void add_tuning_warning(std::vector<std::string>* warnings, const std::string& warning) {
+  if (warnings) warnings->push_back(warning);
+}
+
+double bounded_tuning_double(const char* key, double value, double fallback,
+                             double min_value, double max_value,
+                             std::vector<std::string>* warnings) {
+  if (!std::isfinite(value)) {
+    add_tuning_warning(warnings, std::string(key) + " is not finite; using default");
+    return fallback;
+  }
+  if (value < min_value) {
+    add_tuning_warning(warnings, std::string(key) + " below minimum; clamping");
+    return min_value;
+  }
+  if (value > max_value) {
+    add_tuning_warning(warnings, std::string(key) + " above maximum; clamping");
+    return max_value;
+  }
+  return value;
+}
+
+int bounded_tuning_int(const char* key, int value, int min_value, int max_value,
+                       std::vector<std::string>* warnings) {
+  if (value < min_value) {
+    add_tuning_warning(warnings, std::string(key) + " below minimum; clamping");
+    return min_value;
+  }
+  if (value > max_value) {
+    add_tuning_warning(warnings, std::string(key) + " above maximum; clamping");
+    return max_value;
+  }
+  return value;
+}
+
 const char* docking_state_name(int status) {
   switch (status) {
     case ::bosdyn::api::docking::DockState_DockedStatus_DOCK_STATUS_DOCKED:
@@ -1920,7 +2033,334 @@ std::string nav_feedback_to_json(uint32_t command_id, const SpotClient::Navigati
 }  // namespace
 
 Adapter::Adapter(const Config& config)
-    : cfg_(config), agent_(config.formant_agent_target) {}
+    : cfg_(config),
+      agent_(config.formant_agent_target),
+      teleop_tuning_(TeleopTuningFromConfig(config)) {}
+
+Adapter::TeleopTuning Adapter::TeleopTuningFromConfig(const Config& config) {
+  TeleopTuning tuning;
+  tuning.joy_axis_forward = config.joy_axis_forward;
+  tuning.joy_axis_strafe = config.joy_axis_strafe;
+  tuning.joy_axis_yaw = config.joy_axis_yaw;
+  tuning.joy_axis_body_pitch = config.joy_axis_body_pitch;
+  tuning.joy_axis_forward_inverted = config.joy_axis_forward_inverted;
+  tuning.joy_axis_strafe_inverted = config.joy_axis_strafe_inverted;
+  tuning.joy_axis_yaw_inverted = config.joy_axis_yaw_inverted;
+  tuning.joy_axis_body_pitch_inverted = config.joy_axis_body_pitch_inverted;
+  tuning.joy_button_stand = config.joy_button_stand;
+  tuning.joy_button_sit = config.joy_button_sit;
+  tuning.joy_button_reset_arm = config.joy_button_reset_arm;
+  tuning.joy_button_recover = config.joy_button_recover;
+  tuning.joy_button_walk = config.joy_button_walk;
+  tuning.joy_button_stairs = config.joy_button_stairs;
+  tuning.joy_button_crawl = config.joy_button_crawl;
+  tuning.joy_button_dock = config.joy_button_dock;
+  tuning.joy_button_estop = config.joy_button_estop;
+  tuning.twist_deadband = config.twist_deadband;
+  tuning.teleop_idle_timeout_ms = config.teleop_idle_timeout_ms;
+  tuning.max_vx_mps = config.max_vx_mps;
+  tuning.max_vy_mps = config.max_vy_mps;
+  tuning.max_wz_rps = config.max_wz_rps;
+  tuning.max_body_pitch_rad = config.max_body_pitch_rad;
+  tuning.translation_response_curve = config.translation_response_curve;
+  tuning.rotation_response_curve = config.rotation_response_curve;
+  tuning.linear_accel_limit_mps2 = config.linear_accel_limit_mps2;
+  tuning.strafe_accel_limit_mps2 = config.strafe_accel_limit_mps2;
+  tuning.angular_accel_limit_rps2 = config.angular_accel_limit_rps2;
+  tuning.body_pitch_rate_limit_radps = config.body_pitch_rate_limit_radps;
+  SanitizeTeleopTuning(&tuning);
+  return tuning;
+}
+
+void Adapter::SanitizeTeleopTuning(TeleopTuning* tuning, std::vector<std::string>* warnings) {
+  if (!tuning) return;
+  const TeleopTuning defaults;
+  tuning->joy_axis_forward =
+      bounded_tuning_int("joy_axis_forward", tuning->joy_axis_forward, -1, 16, warnings);
+  tuning->joy_axis_strafe =
+      bounded_tuning_int("joy_axis_strafe", tuning->joy_axis_strafe, -1, 16, warnings);
+  tuning->joy_axis_yaw = bounded_tuning_int("joy_axis_yaw", tuning->joy_axis_yaw, -1, 16, warnings);
+  tuning->joy_axis_body_pitch =
+      bounded_tuning_int("joy_axis_body_pitch", tuning->joy_axis_body_pitch, -1, 16, warnings);
+
+  tuning->joy_button_stand = bounded_tuning_int("joy_button_stand", tuning->joy_button_stand, -1, 32, warnings);
+  tuning->joy_button_sit = bounded_tuning_int("joy_button_sit", tuning->joy_button_sit, -1, 32, warnings);
+  tuning->joy_button_reset_arm =
+      bounded_tuning_int("joy_button_reset_arm", tuning->joy_button_reset_arm, -1, 32, warnings);
+  tuning->joy_button_recover =
+      bounded_tuning_int("joy_button_recover", tuning->joy_button_recover, -1, 32, warnings);
+  tuning->joy_button_walk = bounded_tuning_int("joy_button_walk", tuning->joy_button_walk, -1, 32, warnings);
+  tuning->joy_button_stairs = bounded_tuning_int("joy_button_stairs", tuning->joy_button_stairs, -1, 32, warnings);
+  tuning->joy_button_crawl = bounded_tuning_int("joy_button_crawl", tuning->joy_button_crawl, -1, 32, warnings);
+  tuning->joy_button_dock = bounded_tuning_int("joy_button_dock", tuning->joy_button_dock, -1, 32, warnings);
+  tuning->joy_button_estop = bounded_tuning_int("joy_button_estop", tuning->joy_button_estop, -1, 32, warnings);
+
+  tuning->twist_deadband = bounded_tuning_double(
+      "twist_deadband", tuning->twist_deadband, defaults.twist_deadband, 0.0, 0.5, warnings);
+  tuning->teleop_idle_timeout_ms =
+      bounded_tuning_int("teleop_idle_timeout_ms", tuning->teleop_idle_timeout_ms, 250, 5000, warnings);
+  tuning->max_vx_mps = bounded_tuning_double(
+      "max_vx_mps", tuning->max_vx_mps, defaults.max_vx_mps, 0.0, 1.6, warnings);
+  tuning->max_vy_mps = bounded_tuning_double(
+      "max_vy_mps", tuning->max_vy_mps, defaults.max_vy_mps, 0.0, 1.0, warnings);
+  tuning->max_wz_rps = bounded_tuning_double(
+      "max_wz_rps", tuning->max_wz_rps, defaults.max_wz_rps, 0.0, 2.0, warnings);
+  tuning->max_body_pitch_rad =
+      bounded_tuning_double("max_body_pitch_rad", tuning->max_body_pitch_rad,
+                            defaults.max_body_pitch_rad, 0.0, 0.5, warnings);
+  tuning->translation_response_curve =
+      bounded_tuning_double("translation_response_curve", tuning->translation_response_curve,
+                            defaults.translation_response_curve, 0.5, 3.0, warnings);
+  tuning->rotation_response_curve =
+      bounded_tuning_double("rotation_response_curve", tuning->rotation_response_curve,
+                            defaults.rotation_response_curve, 0.5, 3.0, warnings);
+  tuning->linear_accel_limit_mps2 =
+      bounded_tuning_double("linear_accel_limit_mps2", tuning->linear_accel_limit_mps2,
+                            defaults.linear_accel_limit_mps2, 0.0, 5.0, warnings);
+  tuning->strafe_accel_limit_mps2 =
+      bounded_tuning_double("strafe_accel_limit_mps2", tuning->strafe_accel_limit_mps2,
+                            defaults.strafe_accel_limit_mps2, 0.0, 5.0, warnings);
+  tuning->angular_accel_limit_rps2 =
+      bounded_tuning_double("angular_accel_limit_rps2", tuning->angular_accel_limit_rps2,
+                            defaults.angular_accel_limit_rps2, 0.0, 5.0, warnings);
+  tuning->body_pitch_rate_limit_radps =
+      bounded_tuning_double("body_pitch_rate_limit_radps", tuning->body_pitch_rate_limit_radps,
+                            defaults.body_pitch_rate_limit_radps, 0.0, 2.0, warnings);
+}
+
+int Adapter::ApplyTeleopAppConfigOverrides(
+    const std::unordered_map<std::string, std::string>& values, TeleopTuning* tuning,
+    std::vector<std::string>* warnings) {
+  if (!tuning) return 0;
+  int overrides = 0;
+  const auto apply_double = [&](const char* key, double min_value, double max_value, double* target) {
+    const auto it = values.find(key);
+    if (it == values.end()) return;
+    double parsed = 0.0;
+    if (!parse_double_value(it->second, &parsed) || parsed < min_value || parsed > max_value) {
+      add_tuning_warning(warnings, std::string(key) + " invalid or out of range; ignoring");
+      return;
+    }
+    *target = parsed;
+    ++overrides;
+  };
+  const auto apply_int = [&](const char* key, int min_value, int max_value, int* target) {
+    const auto it = values.find(key);
+    if (it == values.end()) return;
+    int parsed = 0;
+    if (!parse_int_value(it->second, &parsed) || parsed < min_value || parsed > max_value) {
+      add_tuning_warning(warnings, std::string(key) + " invalid or out of range; ignoring");
+      return;
+    }
+    *target = parsed;
+    ++overrides;
+  };
+  const auto apply_bool = [&](const char* key, bool* target) {
+    const auto it = values.find(key);
+    if (it == values.end()) return;
+    bool parsed = false;
+    if (!parse_bool_value(it->second, &parsed)) {
+      add_tuning_warning(warnings, std::string(key) + " invalid boolean; ignoring");
+      return;
+    }
+    *target = parsed;
+    ++overrides;
+  };
+
+  apply_double("spot.teleop.max_vx_mps", 0.0, 1.6, &tuning->max_vx_mps);
+  apply_double("spot.teleop.max_vy_mps", 0.0, 1.0, &tuning->max_vy_mps);
+  apply_double("spot.teleop.max_wz_rps", 0.0, 2.0, &tuning->max_wz_rps);
+  apply_double("spot.teleop.max_body_pitch_rad", 0.0, 0.5, &tuning->max_body_pitch_rad);
+  apply_double("spot.teleop.deadband", 0.0, 0.5, &tuning->twist_deadband);
+  apply_int("spot.teleop.idle_timeout_ms", 250, 5000, &tuning->teleop_idle_timeout_ms);
+  apply_double("spot.teleop.translation_response_curve", 0.5, 3.0,
+               &tuning->translation_response_curve);
+  apply_double("spot.teleop.rotation_response_curve", 0.5, 3.0,
+               &tuning->rotation_response_curve);
+  apply_double("spot.teleop.linear_accel_limit_mps2", 0.0, 5.0,
+               &tuning->linear_accel_limit_mps2);
+  apply_double("spot.teleop.strafe_accel_limit_mps2", 0.0, 5.0,
+               &tuning->strafe_accel_limit_mps2);
+  apply_double("spot.teleop.angular_accel_limit_rps2", 0.0, 5.0,
+               &tuning->angular_accel_limit_rps2);
+  apply_double("spot.teleop.body_pitch_rate_limit_radps", 0.0, 2.0,
+               &tuning->body_pitch_rate_limit_radps);
+
+  apply_int("spot.teleop.joy_axis_forward", -1, 16, &tuning->joy_axis_forward);
+  apply_int("spot.teleop.joy_axis_strafe", -1, 16, &tuning->joy_axis_strafe);
+  apply_int("spot.teleop.joy_axis_yaw", -1, 16, &tuning->joy_axis_yaw);
+  apply_int("spot.teleop.joy_axis_body_pitch", -1, 16, &tuning->joy_axis_body_pitch);
+  apply_bool("spot.teleop.joy_axis_forward_inverted", &tuning->joy_axis_forward_inverted);
+  apply_bool("spot.teleop.joy_axis_strafe_inverted", &tuning->joy_axis_strafe_inverted);
+  apply_bool("spot.teleop.joy_axis_yaw_inverted", &tuning->joy_axis_yaw_inverted);
+  apply_bool("spot.teleop.joy_axis_body_pitch_inverted", &tuning->joy_axis_body_pitch_inverted);
+  apply_int("spot.teleop.joy_button_stand", -1, 32, &tuning->joy_button_stand);
+  apply_int("spot.teleop.joy_button_sit", -1, 32, &tuning->joy_button_sit);
+  apply_int("spot.teleop.joy_button_reset_arm", -1, 32, &tuning->joy_button_reset_arm);
+  apply_int("spot.teleop.joy_button_recover", -1, 32, &tuning->joy_button_recover);
+  apply_int("spot.teleop.joy_button_walk", -1, 32, &tuning->joy_button_walk);
+  apply_int("spot.teleop.joy_button_stairs", -1, 32, &tuning->joy_button_stairs);
+  apply_int("spot.teleop.joy_button_crawl", -1, 32, &tuning->joy_button_crawl);
+  apply_int("spot.teleop.joy_button_dock", -1, 32, &tuning->joy_button_dock);
+  apply_int("spot.teleop.joy_button_estop", -1, 32, &tuning->joy_button_estop);
+
+  SanitizeTeleopTuning(tuning, warnings);
+  return overrides;
+}
+
+std::string Adapter::TeleopTuningSignature(const TeleopTuning& t) {
+  std::ostringstream oss;
+  oss << t.joy_axis_forward << ',' << t.joy_axis_strafe << ',' << t.joy_axis_yaw << ','
+      << t.joy_axis_body_pitch << ',' << t.joy_axis_forward_inverted << ','
+      << t.joy_axis_strafe_inverted << ',' << t.joy_axis_yaw_inverted << ','
+      << t.joy_axis_body_pitch_inverted << ',' << t.joy_button_stand << ','
+      << t.joy_button_sit << ',' << t.joy_button_reset_arm << ',' << t.joy_button_recover
+      << ',' << t.joy_button_walk << ',' << t.joy_button_stairs << ','
+      << t.joy_button_crawl << ',' << t.joy_button_dock << ',' << t.joy_button_estop
+      << ',' << t.twist_deadband << ',' << t.teleop_idle_timeout_ms << ','
+      << t.max_vx_mps << ',' << t.max_vy_mps << ',' << t.max_wz_rps << ','
+      << t.max_body_pitch_rad << ',' << t.translation_response_curve << ','
+      << t.rotation_response_curve << ',' << t.linear_accel_limit_mps2 << ','
+      << t.strafe_accel_limit_mps2 << ',' << t.angular_accel_limit_rps2 << ','
+      << t.body_pitch_rate_limit_radps;
+  return oss.str();
+}
+
+Adapter::TeleopTuning Adapter::CurrentTeleopTuning() const {
+  std::lock_guard<std::mutex> lk(teleop_tuning_mu_);
+  return teleop_tuning_;
+}
+
+void Adapter::RequestTeleopAppConfigRefresh(const std::string& reason) {
+  {
+    std::lock_guard<std::mutex> lk(app_config_mu_);
+    if (app_config_thread_stop_) return;
+    app_config_refresh_requested_ = true;
+    app_config_refresh_reason_ = reason;
+  }
+  app_config_cv_.notify_one();
+}
+
+void Adapter::TeleopAppConfigRefreshLoop() {
+  while (running_) {
+    std::string reason;
+    {
+      std::unique_lock<std::mutex> lk(app_config_mu_);
+      app_config_cv_.wait(lk, [this]() {
+        return app_config_thread_stop_ || app_config_refresh_requested_;
+      });
+      if (app_config_thread_stop_) break;
+      reason = app_config_refresh_reason_;
+      app_config_refresh_requested_ = false;
+      app_config_refresh_reason_.clear();
+    }
+    RefreshTeleopAppConfig(reason.empty() ? "agent event" : reason);
+  }
+}
+
+void Adapter::RefreshTeleopAppConfig(const std::string& reason) {
+  std::unordered_map<std::string, std::string> values;
+  if (!agent_.GetAppConfigMap(&values)) {
+    const long long now = now_ms();
+    const long long last_log = last_teleop_app_config_error_log_ms_.load();
+    if ((now - last_log) >= 30000) {
+      EmitLog("[teleop] application configuration unavailable after " + reason +
+              "; keeping current teleop tuning");
+      last_teleop_app_config_error_log_ms_ = now;
+    }
+    return;
+  }
+
+  TeleopTuning next = TeleopTuningFromConfig(cfg_);
+  std::vector<std::string> warnings;
+  const int overrides = ApplyTeleopAppConfigOverrides(values, &next, &warnings);
+
+  bool changed = false;
+  {
+    std::lock_guard<std::mutex> lk(teleop_tuning_mu_);
+    changed = TeleopTuningSignature(teleop_tuning_) != TeleopTuningSignature(next);
+    if (changed) teleop_tuning_ = next;
+  }
+
+  if (!warnings.empty()) {
+    const long long now = now_ms();
+    const long long last_log = last_teleop_app_config_error_log_ms_.load();
+    if ((now - last_log) >= 30000) {
+      std::ostringstream oss;
+      oss << "[teleop] application config warnings count=" << warnings.size();
+      const std::size_t limit = std::min<std::size_t>(warnings.size(), 4);
+      for (std::size_t i = 0; i < limit; ++i) oss << " ; " << warnings[i];
+      EmitLog(oss.str());
+      last_teleop_app_config_error_log_ms_ = now;
+    }
+  }
+
+  if (changed) {
+    ClampTeleopSlewStateToTuning(next);
+    EmitLog("[teleop] tuning updated reason=" + reason +
+            " overrides=" + std::to_string(overrides) +
+            " max_vx=" + std::to_string(next.max_vx_mps) +
+            " max_vy=" + std::to_string(next.max_vy_mps) +
+            " max_wz=" + std::to_string(next.max_wz_rps) +
+            " deadband=" + std::to_string(next.twist_deadband) +
+            " idle_timeout_ms=" + std::to_string(next.teleop_idle_timeout_ms));
+  }
+}
+
+void Adapter::ResetTeleopSlewState() {
+  std::lock_guard<std::mutex> lk(teleop_slew_mu_);
+  last_sent_vx_ = 0.0;
+  last_sent_vy_ = 0.0;
+  last_sent_wz_ = 0.0;
+  last_sent_body_pitch_ = 0.0;
+  last_sent_velocity_ms_ = 0;
+}
+
+void Adapter::ClampTeleopSlewStateToTuning(const TeleopTuning& tuning) {
+  std::lock_guard<std::mutex> lk(teleop_slew_mu_);
+  last_sent_vx_ = clamp_double(last_sent_vx_, -tuning.max_vx_mps, tuning.max_vx_mps);
+  last_sent_vy_ = clamp_double(last_sent_vy_, -tuning.max_vy_mps, tuning.max_vy_mps);
+  last_sent_wz_ = clamp_double(last_sent_wz_, -tuning.max_wz_rps, tuning.max_wz_rps);
+  last_sent_body_pitch_ =
+      clamp_double(last_sent_body_pitch_, -tuning.max_body_pitch_rad, tuning.max_body_pitch_rad);
+}
+
+void Adapter::ApplyTeleopSlewLimit(double* vx, double* vy, double* wz, double* body_pitch,
+                                   const TeleopTuning& tuning, long long now) {
+  if (!vx || !vy || !wz || !body_pitch) return;
+  std::lock_guard<std::mutex> lk(teleop_slew_mu_);
+  double dt_sec = 0.05;
+  if (last_sent_velocity_ms_ > 0) {
+    dt_sec = static_cast<double>(std::max(1LL, now - last_sent_velocity_ms_)) / 1000.0;
+    dt_sec = clamp_double(dt_sec, 0.001, 0.25);
+  }
+
+  const double target_vx = clamp_double(*vx, -tuning.max_vx_mps, tuning.max_vx_mps);
+  const double target_vy = clamp_double(*vy, -tuning.max_vy_mps, tuning.max_vy_mps);
+  const double target_wz = clamp_double(*wz, -tuning.max_wz_rps, tuning.max_wz_rps);
+  const double target_pitch =
+      clamp_double(*body_pitch, -tuning.max_body_pitch_rad, tuning.max_body_pitch_rad);
+
+  last_sent_vx_ = clamp_double(
+      slew_toward(last_sent_vx_, target_vx, tuning.linear_accel_limit_mps2, dt_sec),
+      -tuning.max_vx_mps, tuning.max_vx_mps);
+  last_sent_vy_ = clamp_double(
+      slew_toward(last_sent_vy_, target_vy, tuning.strafe_accel_limit_mps2, dt_sec),
+      -tuning.max_vy_mps, tuning.max_vy_mps);
+  last_sent_wz_ = clamp_double(
+      slew_toward(last_sent_wz_, target_wz, tuning.angular_accel_limit_rps2, dt_sec),
+      -tuning.max_wz_rps, tuning.max_wz_rps);
+  last_sent_body_pitch_ =
+      clamp_double(slew_toward(last_sent_body_pitch_, target_pitch,
+                               tuning.body_pitch_rate_limit_radps, dt_sec),
+                   -tuning.max_body_pitch_rad, tuning.max_body_pitch_rad);
+  last_sent_velocity_ms_ = now;
+
+  *vx = last_sent_vx_;
+  *vy = last_sent_vy_;
+  *wz = last_sent_wz_;
+  *body_pitch = last_sent_body_pitch_;
+}
 
 bool Adapter::Init() {
   if (cfg_.spot_host.empty() || cfg_.spot_username.empty() || cfg_.spot_password.empty()) {
@@ -1936,7 +2376,7 @@ bool Adapter::Init() {
   spot_reconnect_attempt_ = 0;
   spot_health_failures_ = 0;
   spot_degraded_non_estop_ = false;
-  last_soft_recovery_log_ms_ = 0;
+  last_degraded_state_log_ms_ = 0;
   ResetFaultEventsState();
   spot_.SetArmPresentOverride(cfg_.arm_present_override);
 
@@ -2108,6 +2548,7 @@ bool Adapter::Init() {
     desired_wz_ = 0.0;
     desired_body_pitch_ = 0.0;
   }
+  ResetTeleopSlewState();
   desired_motion_mode_ = kMotionModeWalk;
   last_arm_hold_cmd_ms_ = 0;
   last_arm_error_log_ms_ = 0;
@@ -2197,8 +2638,21 @@ void Adapter::Run() {
   std::sort(stream_filter.begin(), stream_filter.end());
   stream_filter.erase(std::unique(stream_filter.begin(), stream_filter.end()), stream_filter.end());
 
+  {
+    std::lock_guard<std::mutex> lk(app_config_mu_);
+    app_config_thread_stop_ = false;
+    app_config_refresh_requested_ = false;
+    app_config_refresh_reason_.clear();
+  }
+  app_config_thread_ = std::thread(&Adapter::TeleopAppConfigRefreshLoop, this);
+  RequestTeleopAppConfigRefresh("adapter startup");
+  const auto request_app_config_refresh = [this]() {
+    RequestTeleopAppConfigRefresh("agent stream reconnect");
+  };
+
   agent_.StartTeleopLoop(stream_filter,
-                         [this](const v1::model::ControlDatapoint& dp) { HandleTeleop(dp); });
+                         [this](const v1::model::ControlDatapoint& dp) { HandleTeleop(dp); },
+                         request_app_config_refresh);
   agent_.StartCommandLoop({"spot.jetson.reboot", "spot.robot.reboot", "spot.camera.calibrate",
                            "spot.stand", "spot.sit", "spot.recover", "spot.dock",
                            "spot.undock",
@@ -2211,9 +2665,11 @@ void Adapter::Run() {
                            "spot.waypoint.goto_straight",
                            "spot.graphnav.goto_pose", "spot.graphnav.goto_pose_straight",
                            "spot.graphnav.cancel"},
-                          [this](const v1::model::CommandRequest& request) { HandleCommand(request); });
+                          [this](const v1::model::CommandRequest& request) { HandleCommand(request); },
+                          request_app_config_refresh);
   agent_.StartHeartbeatLoop(
-      [this](const v1::agent::GetTeleopHeartbeatStreamResponse& hb) { HandleHeartbeat(hb); });
+      [this](const v1::agent::GetTeleopHeartbeatStreamResponse& hb) { HandleHeartbeat(hb); },
+      request_app_config_refresh);
 
   camera_threads_.clear();
   auto start_camera = [this](const std::string& source, const std::string& stream, int output_fps,
@@ -2264,6 +2720,7 @@ void Adapter::Run() {
   while (running_) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     const long long now = now_ms();
+    const TeleopTuning tuning = CurrentTeleopTuning();
     FlushQueuedStatus(now);
     FlushAdapterLogStream(now);
     PublishWaypointsText(false);
@@ -2277,6 +2734,7 @@ void Adapter::Run() {
     if (HeartbeatExpired() && lease_owned_.load() && moving_.load()) {
       spot_.ZeroVelocity(cfg_.zero_velocity_repeats);
       moving_ = false;
+      ResetTeleopSlewState();
     }
 
     const bool teleop_active = TeleopSessionActive();
@@ -2312,6 +2770,7 @@ void Adapter::Run() {
         EmitLog("[adapter] teleop inactive, stopping motion and returning body lease");
         spot_.ZeroVelocity(cfg_.zero_velocity_repeats);
         moving_ = false;
+        ResetTeleopSlewState();
         if (!WaitForArmStow(3000)) {
           EmitLog("[adapter] arm did not reach stow before lease return (timeout)");
         }
@@ -2331,15 +2790,14 @@ void Adapter::Run() {
       }
     }
 
-    if (lease_owned_ && teleop_active && !docking_in_progress_ &&
-        SpotConnected() && !spot_degraded_non_estop_.load()) {
+    if (lease_owned_ && teleop_active && !docking_in_progress_ && SpotConnected()) {
       double vx = 0.0;
       double vy = 0.0;
       double wz = 0.0;
       double body_pitch = 0.0;
       bool has_desired = desired_twist_valid_.load();
       const long long twist_age_ms = now - last_twist_ms_.load();
-      const int stale_twist_timeout_ms = std::max(250, cfg_.teleop_idle_timeout_ms);
+      const int stale_twist_timeout_ms = std::max(250, tuning.teleop_idle_timeout_ms);
       if (has_desired && twist_age_ms > stale_twist_timeout_ms) {
         desired_twist_valid_ = false;
         active_motion_source_ = kMotionSourceNone;
@@ -2354,6 +2812,7 @@ void Adapter::Run() {
         if (moving_.load()) {
           spot_.ZeroVelocity(1);
           moving_ = false;
+          ResetTeleopSlewState();
         }
         const long long last_timeout_log = last_twist_timeout_log_ms_.load();
         if ((now - last_timeout_log) >= 2000) {
@@ -2368,16 +2827,22 @@ void Adapter::Run() {
         wz = desired_wz_;
         body_pitch = desired_body_pitch_;
       }
+      vx = clamp_double(vx, -tuning.max_vx_mps, tuning.max_vx_mps);
+      vy = clamp_double(vy, -tuning.max_vy_mps, tuning.max_vy_mps);
+      wz = clamp_double(wz, -tuning.max_wz_rps, tuning.max_wz_rps);
+      body_pitch = clamp_double(body_pitch, -tuning.max_body_pitch_rad, tuning.max_body_pitch_rad);
 
       if (!has_desired) {
         if (moving_.load()) {
           spot_.ZeroVelocity(1);
           moving_ = false;
+          ResetTeleopSlewState();
         }
       } else if (vx == 0.0 && vy == 0.0 && wz == 0.0 && body_pitch == 0.0) {
         if (moving_.load()) {
           spot_.ZeroVelocity(1);
           moving_ = false;
+          ResetTeleopSlewState();
         }
       } else if (!IsGraphNavNavigationActive()) {
         MotionMode mode = MotionMode::kWalk;
@@ -2393,10 +2858,12 @@ void Adapter::Run() {
             mode = MotionMode::kWalk;
             break;
         }
-        const int end_after_ms = std::max(400, cfg_.teleop_idle_timeout_ms + 200);
+        ApplyTeleopSlewLimit(&vx, &vy, &wz, &body_pitch, tuning, now);
+        const int end_after_ms = std::max(400, tuning.teleop_idle_timeout_ms + 200);
         if (!spot_.Velocity(vx, vy, wz, end_after_ms, mode, body_pitch)) {
           const std::string error = spot_.LastError();
           moving_ = false;
+          ResetTeleopSlewState();
           if (ErrorSuggestsLostLease(error)) {
             EmitLog(std::string("[teleop] body lease lost during motion: ") + error);
             ResetLeaseState(true);
@@ -2415,7 +2882,14 @@ void Adapter::Run() {
   }
 
   spot_.RequestDockCancel();
+  {
+    std::lock_guard<std::mutex> lk(app_config_mu_);
+    app_config_thread_stop_ = true;
+    app_config_refresh_requested_ = true;
+  }
+  app_config_cv_.notify_all();
   agent_.StopLoops();
+  if (app_config_thread_.joinable()) app_config_thread_.join();
   for (auto& t : camera_threads_) {
     if (t.joinable()) t.join();
   }
@@ -2429,6 +2903,7 @@ void Adapter::Run() {
   if (connection_thread_.joinable()) connection_thread_.join();
   if (command_exec_thread_.joinable()) command_exec_thread_.join();
   spot_.ZeroVelocity(cfg_.zero_velocity_repeats);
+  ResetTeleopSlewState();
   if (lease_owned_) {
     (void)WaitForArmStow(3000);
     spot_.ReturnBodyLease();
@@ -2439,6 +2914,12 @@ void Adapter::Run() {
 void Adapter::Stop() {
   running_ = false;
   spot_.RequestDockCancel();
+  {
+    std::lock_guard<std::mutex> lk(app_config_mu_);
+    app_config_thread_stop_ = true;
+    app_config_refresh_requested_ = true;
+  }
+  app_config_cv_.notify_all();
   command_queue_cv_.notify_all();
   agent_.StopLoops();
 }
@@ -3430,7 +3911,7 @@ void Adapter::LeaseRetainLoop() {
       if (SpotConnected()) {
         SpotClient::RobotStateSnapshot snap;
         if (spot_.GetRobotStateSnapshot(&snap)) {
-          ApplySoftRecoveryForRobotState(snap);
+          UpdateDegradedStateFromRobotState(snap);
           if (IsStreamEnabled(kBehaviorStateStream)) {
             QueueStatusText(kBehaviorStateStream, snap.behavior_state);
           }
@@ -3643,6 +4124,7 @@ void Adapter::SetSpotDisconnected(const std::string& reason) {
   lease_owned_ = false;
   spot_.InvalidateBodyLease();
   moving_ = false;
+  ResetTeleopSlewState();
   spot_degraded_non_estop_ = false;
   graphnav_navigation_active_ = false;
   last_graph_nav_command_id_ = 0;
@@ -3703,7 +4185,7 @@ std::string Adapter::BuildSpotConnectionJson() const {
   return oss.str();
 }
 
-void Adapter::ApplySoftRecoveryForRobotState(const SpotClient::RobotStateSnapshot& snap) {
+void Adapter::UpdateDegradedStateFromRobotState(const SpotClient::RobotStateSnapshot& snap) {
   std::string reason;
   if (!snap.any_estopped) {
     const bool has_critical_system_fault = any_fault_requires_soft_recovery(snap.system_faults);
@@ -3720,33 +4202,22 @@ void Adapter::ApplySoftRecoveryForRobotState(const SpotClient::RobotStateSnapsho
   }
 
   const bool degraded = !reason.empty();
-  spot_degraded_non_estop_ = degraded;
+  const bool was_degraded = spot_degraded_non_estop_.exchange(degraded);
   {
     std::lock_guard<std::mutex> lk(spot_connection_mu_);
     spot_degraded_reason_ = reason;
   }
-  if (!degraded) return;
-
-  desired_twist_valid_ = false;
-  active_motion_source_ = kMotionSourceNone;
-  {
-    std::lock_guard<std::mutex> lk(twist_cmd_mu_);
-    desired_vx_ = 0.0;
-    desired_vy_ = 0.0;
-    desired_wz_ = 0.0;
-    desired_body_pitch_ = 0.0;
-  }
-  if (moving_.load()) {
-    spot_.ZeroVelocity(1);
-    moving_ = false;
-  }
 
   const long long now = now_ms();
-  const long long last_log = last_soft_recovery_log_ms_.load();
-  if ((now - last_log) >= 3000) {
-    EmitLog("[safety] soft recovery active (non-estop): " + reason +
-            " ; motion commands are gated");
-    last_soft_recovery_log_ms_ = now;
+  if (degraded) {
+    const long long last_log = last_degraded_state_log_ms_.load();
+    if (!was_degraded || (now - last_log) >= 30000) {
+      EmitLog("[spot] degraded state observed: " + reason +
+              " ; command execution is delegated to Spot");
+      last_degraded_state_log_ms_ = now;
+    }
+  } else if (was_degraded) {
+    EmitLog("[spot] degraded state cleared");
   }
 }
 
@@ -4922,11 +5393,6 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
     EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " failed: robot unavailable");
     return false;
   }
-  if (spot_degraded_non_estop_.load()) {
-    EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
-            " failed: robot degraded (non-estop)");
-    return false;
-  }
   if (!EnsureLeaseForCommand(return_and_dock ? "spot.return_and_dock" : "spot.dock")) return false;
 
   if (return_and_dock) {
@@ -4980,6 +5446,7 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
   docking_in_progress_ = true;
   moving_ = false;
   spot_.ZeroVelocity(1);
+  ResetTeleopSlewState();
   const int dock_poll_ms = std::max(1000, cfg_.dock_poll_ms);
   const bool ok = spot_.AutoDock(dock_id, cfg_.dock_attempts, dock_poll_ms, cfg_.dock_command_timeout_sec);
   docking_in_progress_ = false;
@@ -5010,10 +5477,6 @@ bool Adapter::ExecuteUndockCommand() {
     EmitLog("[undock] failed: robot unavailable");
     return false;
   }
-  if (spot_degraded_non_estop_.load()) {
-    EmitLog("[undock] failed: robot degraded (non-estop)");
-    return false;
-  }
   if (!EnsureLeaseForCommand("spot.undock")) return false;
 
   int dock_status = 0;
@@ -5038,6 +5501,7 @@ bool Adapter::ExecuteUndockCommand() {
   docking_in_progress_ = true;
   moving_ = false;
   spot_.ZeroVelocity(1);
+  ResetTeleopSlewState();
   const int dock_poll_ms = std::max(250, cfg_.dock_poll_ms);
   EmitLog("[undock] starting");
   const bool ok = spot_.Undock(dock_poll_ms, cfg_.dock_command_timeout_sec);
@@ -5104,6 +5568,7 @@ bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
 }
 
 void Adapter::HandleJoy(const v1::model::Joy& joy) {
+  const TeleopTuning tuning = CurrentTeleopTuning();
   const std::vector<int> previous_buttons = last_joy_buttons_;
   last_joy_buttons_.assign(joy.buttons().begin(), joy.buttons().end());
 
@@ -5116,25 +5581,25 @@ void Adapter::HandleJoy(const v1::model::Joy& joy) {
     }
   };
 
-  handle_mapped_button(cfg_.joy_button_stand, cfg_.stand_button_stream);
-  handle_mapped_button(cfg_.joy_button_sit, cfg_.sit_button_stream);
-  handle_mapped_button(cfg_.joy_button_estop, cfg_.estop_button_stream);
-  handle_mapped_button(cfg_.joy_button_recover, cfg_.recover_button_stream);
-  handle_mapped_button(cfg_.joy_button_walk, cfg_.walk_button_stream);
-  handle_mapped_button(cfg_.joy_button_stairs, cfg_.stairs_button_stream);
-  handle_mapped_button(cfg_.joy_button_crawl, cfg_.crawl_button_stream);
-  handle_mapped_button(cfg_.joy_button_reset_arm, cfg_.reset_arm_button_stream);
-  handle_mapped_button(cfg_.joy_button_dock, cfg_.dock_button_stream);
+  handle_mapped_button(tuning.joy_button_stand, cfg_.stand_button_stream);
+  handle_mapped_button(tuning.joy_button_sit, cfg_.sit_button_stream);
+  handle_mapped_button(tuning.joy_button_estop, cfg_.estop_button_stream);
+  handle_mapped_button(tuning.joy_button_recover, cfg_.recover_button_stream);
+  handle_mapped_button(tuning.joy_button_walk, cfg_.walk_button_stream);
+  handle_mapped_button(tuning.joy_button_stairs, cfg_.stairs_button_stream);
+  handle_mapped_button(tuning.joy_button_crawl, cfg_.crawl_button_stream);
+  handle_mapped_button(tuning.joy_button_reset_arm, cfg_.reset_arm_button_stream);
+  handle_mapped_button(tuning.joy_button_dock, cfg_.dock_button_stream);
 
   v1::model::Twist twist;
   twist.mutable_linear()->set_x(
-      joy_axis_value(joy, cfg_.joy_axis_forward, cfg_.joy_axis_forward_inverted));
+      joy_axis_value(joy, tuning.joy_axis_forward, tuning.joy_axis_forward_inverted));
   twist.mutable_linear()->set_y(
-      joy_axis_value(joy, cfg_.joy_axis_strafe, cfg_.joy_axis_strafe_inverted));
+      joy_axis_value(joy, tuning.joy_axis_strafe, tuning.joy_axis_strafe_inverted));
   twist.mutable_angular()->set_z(
-      joy_axis_value(joy, cfg_.joy_axis_yaw, cfg_.joy_axis_yaw_inverted));
+      joy_axis_value(joy, tuning.joy_axis_yaw, tuning.joy_axis_yaw_inverted));
   twist.mutable_angular()->set_y(
-      joy_axis_value(joy, cfg_.joy_axis_body_pitch, cfg_.joy_axis_body_pitch_inverted));
+      joy_axis_value(joy, tuning.joy_axis_body_pitch, tuning.joy_axis_body_pitch_inverted));
   ApplyTeleopTwist(twist, kMotionSourceJoy, "joy");
 }
 
@@ -5182,6 +5647,7 @@ void Adapter::HandleButtonPress(const std::string& button_key, const std::string
     } else {
       EmitLog("[teleop] action estop sent");
       moving_ = false;
+      ResetTeleopSlewState();
     }
     return;
   }
@@ -5263,6 +5729,7 @@ void Adapter::ResetLeaseState(bool clear_motion) {
   spot_.InvalidateBodyLease();
   if (!clear_motion) return;
   moving_ = false;
+  ResetTeleopSlewState();
   desired_twist_valid_ = false;
   active_motion_source_ = kMotionSourceNone;
   std::lock_guard<std::mutex> lk(twist_cmd_mu_);
@@ -5336,6 +5803,7 @@ bool Adapter::ExecuteRecoverAction(bool require_teleop, bool auto_acquire_lease)
   }
   EmitLog(require_teleop ? "[teleop] action recover sent" : "[command] spot.recover sent");
   moving_ = false;
+  ResetTeleopSlewState();
   return true;
 }
 
@@ -5377,10 +5845,6 @@ bool Adapter::ExecuteRotateCommand(const v1::model::CommandRequest& request, boo
   }
   if (IsGraphNavNavigationActive()) {
     EmitLog("[command] " + command_name + " rejected: graphnav navigation active");
-    return false;
-  }
-  if (spot_degraded_non_estop_.load()) {
-    EmitLog("[command] " + command_name + " rejected: robot degraded (non-estop)");
     return false;
   }
   if (!EnsureLeaseForCommand(command_name)) return false;
@@ -5429,6 +5893,7 @@ bool Adapter::ExecuteRotateCommand(const v1::model::CommandRequest& request, boo
   std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms + 120));
   (void)spot_.ZeroVelocity(1);
   moving_ = false;
+  ResetTeleopSlewState();
   EmitLog("[command] " + command_name + " complete");
   return true;
 }
@@ -5498,10 +5963,11 @@ void Adapter::HandleTwist(const v1::model::Twist& twist) {
 void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
                                const char* source_name) {
   static constexpr long long kPitchZeroDropoutGraceMs = 80;
-  const bool requested_motion = std::abs(twist.linear().x()) >= cfg_.twist_deadband ||
-                                std::abs(twist.linear().y()) >= cfg_.twist_deadband ||
-                                std::abs(twist.angular().z()) >= cfg_.twist_deadband ||
-                                std::abs(twist.angular().y()) >= cfg_.twist_deadband;
+  const TeleopTuning tuning = CurrentTeleopTuning();
+  const bool requested_motion = std::abs(twist.linear().x()) >= tuning.twist_deadband ||
+                                std::abs(twist.linear().y()) >= tuning.twist_deadband ||
+                                std::abs(twist.angular().z()) >= tuning.twist_deadband ||
+                                std::abs(twist.angular().y()) >= tuning.twist_deadband;
   const auto maybe_log_rejection = [&](const char* reason) {
     if (!requested_motion) return;
     const long long now = now_ms();
@@ -5526,10 +5992,6 @@ void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
     maybe_log_rejection("robot unavailable");
     return;
   }
-  if (spot_degraded_non_estop_.load()) {
-    maybe_log_rejection("robot degraded (non-estop)");
-    return;
-  }
   if (!lease_owned_) {
     maybe_log_rejection("no body lease");
     return;
@@ -5541,20 +6003,21 @@ void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
   const double raw_z = twist.angular().z();
   const double raw_pitch = twist.angular().y();
 
-  double nx = raw_x;
-  double ny = raw_y;
-  double nz = raw_z;
-  double np = raw_pitch;
-  if (std::abs(nx) < cfg_.twist_deadband) nx = 0.0;
-  if (std::abs(ny) < cfg_.twist_deadband) ny = 0.0;
-  if (std::abs(nz) < cfg_.twist_deadband) nz = 0.0;
-  if (std::abs(np) < cfg_.twist_deadband) np = 0.0;
+  const double nx = shape_normalized_axis(raw_x, tuning.twist_deadband,
+                                          tuning.translation_response_curve);
+  const double ny = shape_normalized_axis(raw_y, tuning.twist_deadband,
+                                          tuning.translation_response_curve);
+  const double nz = shape_normalized_axis(raw_z, tuning.twist_deadband,
+                                          tuning.rotation_response_curve);
+  const double np = shape_normalized_axis(raw_pitch, tuning.twist_deadband,
+                                          tuning.rotation_response_curve);
 
-  const double vx = std::max(-cfg_.max_vx_mps, std::min(cfg_.max_vx_mps, nx * cfg_.max_vx_mps));
-  const double vy = std::max(-cfg_.max_vy_mps, std::min(cfg_.max_vy_mps, ny * cfg_.max_vy_mps));
-  const double wz = std::max(-cfg_.max_wz_rps, std::min(cfg_.max_wz_rps, nz * cfg_.max_wz_rps));
+  const double vx = clamp_double(nx * tuning.max_vx_mps, -tuning.max_vx_mps, tuning.max_vx_mps);
+  const double vy = clamp_double(ny * tuning.max_vy_mps, -tuning.max_vy_mps, tuning.max_vy_mps);
+  const double wz = clamp_double(nz * tuning.max_wz_rps, -tuning.max_wz_rps, tuning.max_wz_rps);
   const double body_pitch =
-      std::max(-cfg_.max_body_pitch_rad, std::min(cfg_.max_body_pitch_rad, np * cfg_.max_body_pitch_rad));
+      clamp_double(np * tuning.max_body_pitch_rad, -tuning.max_body_pitch_rad,
+                   tuning.max_body_pitch_rad);
 
   const bool translational_cmd_nonzero = (vx != 0.0 || vy != 0.0 || wz != 0.0);
   const bool pitch_cmd_nonzero = (body_pitch != 0.0);
@@ -5700,12 +6163,6 @@ void Adapter::DockLoop() {
               " request ignored: robot unavailable");
       continue;
     }
-    if (spot_degraded_non_estop_.load()) {
-      EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
-              " request ignored: robot degraded (non-estop)");
-      continue;
-    }
-
     if (return_and_dock) {
       std::string dock_waypoint_id;
       std::string map_id;
@@ -5727,7 +6184,8 @@ void Adapter::DockLoop() {
       graphnav_navigation_active_ = true;
       nav_auto_recovered_ = false;
       desired_twist_valid_ = false;
-  active_motion_source_ = kMotionSourceNone;
+      active_motion_source_ = kMotionSourceNone;
+      ResetTeleopSlewState();
       {
         std::lock_guard<std::mutex> lk(twist_cmd_mu_);
         desired_vx_ = 0.0;
@@ -5789,6 +6247,7 @@ void Adapter::DockLoop() {
     docking_in_progress_ = true;
     moving_ = false;
     spot_.ZeroVelocity(1);
+    ResetTeleopSlewState();
     EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
             " starting dock id=" + std::to_string(dock_id));
     const int dock_poll_ms = std::max(1000, cfg_.dock_poll_ms);

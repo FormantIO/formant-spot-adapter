@@ -204,6 +204,16 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_max_vy_mps()) c->max_vy_mps = j.max_vy_mps().value();
   if (j.has_max_wz_rps()) c->max_wz_rps = j.max_wz_rps().value();
   if (j.has_max_body_pitch_rad()) c->max_body_pitch_rad = j.max_body_pitch_rad().value();
+  if (j.has_translation_response_curve()) {
+    c->translation_response_curve = j.translation_response_curve().value();
+  }
+  if (j.has_rotation_response_curve()) c->rotation_response_curve = j.rotation_response_curve().value();
+  if (j.has_linear_accel_limit_mps2()) c->linear_accel_limit_mps2 = j.linear_accel_limit_mps2().value();
+  if (j.has_strafe_accel_limit_mps2()) c->strafe_accel_limit_mps2 = j.strafe_accel_limit_mps2().value();
+  if (j.has_angular_accel_limit_rps2()) c->angular_accel_limit_rps2 = j.angular_accel_limit_rps2().value();
+  if (j.has_body_pitch_rate_limit_radps()) {
+    c->body_pitch_rate_limit_radps = j.body_pitch_rate_limit_radps().value();
+  }
   if (j.has_lease_retain_hz()) c->lease_retain_hz = j.lease_retain_hz().value();
   if (j.has_heartbeat_timeout_ms()) c->heartbeat_timeout_ms = j.heartbeat_timeout_ms().value();
   if (j.has_zero_velocity_repeats()) c->zero_velocity_repeats = j.zero_velocity_repeats().value();
@@ -331,7 +341,6 @@ Config load_config_from_env() {
   if (getenv_bool_if_set("ARM_PRESENT", &arm_present)) {
     c.arm_present_override = arm_present ? 1 : 0;
   }
-  c.max_body_pitch_rad = getenv_double_or("MAX_BODY_PITCH_RAD", c.max_body_pitch_rad);
   c.twist_deadband = getenv_double_or("TWIST_DEADBAND", c.twist_deadband);
   c.teleop_idle_timeout_ms = getenv_int_or("TELEOP_IDLE_TIMEOUT_MS", c.teleop_idle_timeout_ms);
 
@@ -339,6 +348,18 @@ Config load_config_from_env() {
   c.max_vy_mps = getenv_double_or("MAX_VY_MPS", c.max_vy_mps);
   c.max_wz_rps = getenv_double_or("MAX_WZ_RPS", c.max_wz_rps);
   c.max_body_pitch_rad = getenv_double_or("MAX_BODY_PITCH_RAD", c.max_body_pitch_rad);
+  c.translation_response_curve =
+      getenv_double_or("TRANSLATION_RESPONSE_CURVE", c.translation_response_curve);
+  c.rotation_response_curve =
+      getenv_double_or("ROTATION_RESPONSE_CURVE", c.rotation_response_curve);
+  c.linear_accel_limit_mps2 =
+      getenv_double_or("LINEAR_ACCEL_LIMIT_MPS2", c.linear_accel_limit_mps2);
+  c.strafe_accel_limit_mps2 =
+      getenv_double_or("STRAFE_ACCEL_LIMIT_MPS2", c.strafe_accel_limit_mps2);
+  c.angular_accel_limit_rps2 =
+      getenv_double_or("ANGULAR_ACCEL_LIMIT_RPS2", c.angular_accel_limit_rps2);
+  c.body_pitch_rate_limit_radps =
+      getenv_double_or("BODY_PITCH_RATE_LIMIT_RADPS", c.body_pitch_rate_limit_radps);
 
   c.lease_retain_hz = getenv_int_or("LEASE_RETAIN_HZ", c.lease_retain_hz);
   c.heartbeat_timeout_ms = getenv_int_or("HEARTBEAT_TIMEOUT_MS", c.heartbeat_timeout_ms);
