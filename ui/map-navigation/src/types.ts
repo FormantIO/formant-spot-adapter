@@ -84,6 +84,11 @@ export interface GraphNavOverlayWaypoint {
   is_dock: boolean;
 }
 
+export interface GraphNavOverlayEdge {
+  from_waypoint_id: string;
+  to_waypoint_id: string;
+}
+
 export interface GraphNavOverlay {
   map_id: string;
   map_uuid: string;
@@ -92,7 +97,9 @@ export interface GraphNavOverlay {
   dock_waypoint_id?: string;
   dock_waypoint_name: string;
   waypoints: GraphNavOverlayWaypoint[];
+  edges: GraphNavOverlayEdge[];
   waypoint_count?: number;
+  edge_count?: number;
 }
 
 export interface NavState {
@@ -113,6 +120,8 @@ export interface NavState {
   target_name: string;
   map_id: string;
   map_uuid: string;
+  request_id: string;
+  command_request_id: string;
   localized: boolean;
   current_waypoint_id: string;
   has_current_seed_pose: boolean;

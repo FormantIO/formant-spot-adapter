@@ -114,7 +114,6 @@ struct Config {
   double arm_raise_qy{0.0};
   double arm_raise_qz{0.0};
   double arm_raise_move_sec{1.5};
-  int arm_hold_interval_ms{2500};
 
   std::string graphnav_store_dir{"data/graphnav"};
   std::string waypoint_text_stream{"spot.waypoints"};

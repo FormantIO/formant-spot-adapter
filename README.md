@@ -66,8 +66,8 @@ Additional control channels (not streams):
 | `spot.localization.graphnav.global.image.meta` | Text (JSON) | Companion metadata for the rendered global GraphNav image including draw rect, render scale, resolution, and `seed_tform_grid` for click-to-go UIs |
 | `spot.map.graphnav` | Localization payload carrying map-only data | Dedicated stitched GraphNav map payload for future top-level map transport |
 | `spot.graphnav.metadata` | Text (JSON) | Full waypoint/edge/object metadata for GraphNav maps. Useful for diagnostics, but may be too large for some iframe text-query paths; prefer a smaller UI-specific overlay stream if needed |
-| `spot.graphnav.overlay` | Text (JSON) | Small UI-safe waypoint overlay stream for the active GraphNav map. Publishes saved/operator waypoint names only (`map_uuid`, `current_waypoint_id`, `dock_waypoint_id`, `waypoints`). |
-| `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus lifecycle/terminal result and current seed-frame robot pose for external map UIs |
+| `spot.graphnav.overlay` | Text (JSON) | Small UI-safe waypoint overlay stream for the active GraphNav map. Publishes saved/operator waypoints with stable IDs (`map_uuid`, `current_waypoint_id`, `dock_waypoint_id`, `waypoints`, `edges`). |
+| `spot.nav.state` | Text (JSON) | Active GraphNav target/mode/map context plus request correlation, lifecycle/terminal result, and current seed-frame robot pose for external map UIs |
 | `spot.can_dock` | Bitset | `Can dock` (published at 0.2 Hz / every 5s) |
 | `spot.mode_state` | Bitset | `Walk`, `Stairs`, `Crawl` |
 | `spot.commanded_motion_mode` | Text | One-word commanded locomotion mode: `walk`, `stairs`, `crawl` |
@@ -174,16 +174,21 @@ Additional non-GraphNav command-channel actions:
   - Parameter examples: `name=dock_entry`
 - `spot.waypoint.delete`: delete alias mapping (does not mutate GraphNav graph topology).
   - Parameter examples: `name=dock_entry`
-- `spot.waypoint.goto`: resolve alias/label or accept `waypoint_id=<id>` directly; optional `map_uuid=<uuid>` validation is supported for UI-issued commands.
+- `spot.waypoint.goto`: resolve alias/label or accept `waypoint_id` directly; optional `map_uuid`
+  validation is supported for UI-issued commands. Prefer JSON payloads like
+  `{"map_uuid":"<uuid>","waypoint_id":"<id>","request_id":"<request>"}`; legacy
+  `key=value` text is still accepted.
 - `spot.waypoint.goto_straight`: same as above, but uses straight-line-biased travel params.
-- `spot.graphnav.goto_pose`: accept `map_uuid=<uuid>, x=<seed_x>, y=<seed_y>` and optional
-  `yaw_rad=<rad>` / `yaw_deg=<deg>` to navigate to a seed-frame target on the active map.
+- `spot.graphnav.goto_pose`: accepts JSON payloads like
+  `{"map_uuid":"<uuid>","x":1.23,"y":4.56,"yaw_deg":90,"request_id":"<request>"}` and legacy
+  `key=value` text. Uses optional `yaw_rad` / `yaw_deg` to navigate to a seed-frame target on the active map.
 - `spot.graphnav.goto_pose_straight`: same as `spot.graphnav.goto_pose`, with straight-line-biased travel params.
-  - Parameter examples: `name=dock_entry`
 - `spot.graphnav.cancel`: override any active GraphNav route with a new goal at the robot's
   current localized pose, effectively acting as a hold-position override rather than a hard stop.
-  - No parameters.
+  - Optional JSON `request_id` is echoed in `spot.nav.state` for UI correlation.
   - Requires a valid current localization and active lease.
+  - Processed on a high-priority command path so it can interrupt a long-running GraphNav command
+    instead of waiting behind that command's terminal response.
 
 Note: `spot.waypoint.save`/`spot.waypoint.update` can be called while not actively mapping; the
 adapter runs a temporary start/create/stop recording sequence.
@@ -202,8 +207,9 @@ Command responses:
 
 Important:
 - `config/formant-spot-adapter.json.example` is the canonical baseline configuration for this repository.
-- Current runtime `load_config()` takes secrets plus `FORMANT_AGENT_TARGET` from env and all other runtime params from JSON.
-- If you want to change stream names, arm pose, docking config, or camera config, update JSON.
+- Runtime config precedence is defaults, then JSON, then valid environment overrides.
+- Invalid numeric/boolean environment overrides are ignored and logged at startup.
+- If you want persistent stream names, arm pose, docking config, or camera config, update JSON.
 
 ### Teleop Tuning
 

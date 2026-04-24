@@ -7,6 +7,9 @@ Runtime stream enablement is controlled in `config/formant-spot-adapter.json` wi
 streams also stop their source polling/render loops so they no longer consume runtime resources.
 If you rename a stream from its default, use the renamed stream name in `streamControls`.
 
+Runtime config precedence is adapter defaults, then JSON, then valid environment overrides.
+Invalid numeric/boolean environment overrides are ignored and logged at adapter startup.
+
 ## Control Streams (Formant -> Adapter)
 
 - `Joystick` (type: `geometry_msgs/Twist` equivalent RTC twist stream)
@@ -210,16 +213,19 @@ parameters documented in the repository `README.md`.
   - `map_uuid`
   - `current_waypoint_id`
   - `dock_waypoint_id`
-  - `waypoints: [{name, x, y, is_dock}]`
+  - `waypoints: [{id, name, label, x, y, is_dock}]`
+  - `edges: [{from_waypoint_id, to_waypoint_id}]` between emitted waypoint IDs
 - Intended as the primary waypoint stream for iframe-based navigation UIs.
+- UI command dispatch should prefer `waypoint_id` from this stream over display names.
 
 - `spot.nav.state` (type: text/json, 1 Hz + on change)
 - High-level GraphNav navigation state for external map UIs.
-- Includes `active`, `command_id`, `status`, `status_name`, `phase`, `terminal_result`,
-  `terminal_reason`, `mode`, `map_id`, `map_uuid`,
+- Includes `active`, `command_id`, `request_id`, `command_request_id`, `status`,
+  `status_name`, `phase`, `terminal_result`, `terminal_reason`, `mode`, `map_id`, `map_uuid`,
   `target_waypoint_id`, `target_name`, target pose fields when available, plus current
   localization fields: `localized`, `current_waypoint_id`, `has_current_seed_pose`,
   `current_seed_x`, `current_seed_y`, `current_seed_z`, and `current_seed_yaw_rad`.
+- `phase` may be `starting` before the Boston Dynamics GraphNav command id is available.
 
 - `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
 - Key: `Can dock` (boolean)
@@ -407,18 +413,21 @@ parameters documented in the repository `README.md`.
 
 - `spot.waypoint.goto` (command)
 - Resolves alias/label or accepts `waypoint_id=<id>` directly and sends NavigateTo command.
-- Parameter text: `name=<alias_or_label>` or `waypoint_id=<id>`.
-- Optional `map_uuid=<uuid>` rejects stale UI commands against the wrong loaded map.
+- Preferred payload: `{"map_uuid":"<uuid>","waypoint_id":"<id>","request_id":"<request>"}`.
+- Legacy parameter text is still accepted: `name=<alias_or_label>` or `waypoint_id=<id>`.
+- Optional `map_uuid` rejects stale UI commands against the wrong loaded map.
+- `request_id` is echoed in `spot.nav.state` while that request is starting, active, or terminal.
 
 - `spot.waypoint.goto_straight` (command)
 - Same target resolution as `spot.waypoint.goto`, but with straight-line-biased travel params.
-- Parameter text: `name=<alias_or_label>` or `waypoint_id=<id>`.
-- Optional `map_uuid=<uuid>`.
+- Same JSON and legacy parameter contract as `spot.waypoint.goto`.
 
 - `spot.graphnav.goto_pose` (command)
 - Navigates to a seed-frame pose on the active GraphNav map.
-- Parameter text: `map_uuid=<uuid>, x=<seed_x>, y=<seed_y>`.
-- Optional heading parameters: `yaw_rad=<rad>` or `yaw_deg=<deg>`.
+- Preferred payload:
+  `{"map_uuid":"<uuid>","x":1.23,"y":4.56,"yaw_deg":90,"request_id":"<request>"}`.
+- Legacy parameter text is still accepted: `map_uuid=<uuid>, x=<seed_x>, y=<seed_y>`.
+- Optional heading parameters: `yaw_rad` or `yaw_deg`.
 - Adapter resolves the nearest anchored waypoint, converts the seed-frame goal into that waypoint's
   flattened SE2 frame, and issues GraphNav navigation with the offset goal.
 
@@ -426,9 +435,12 @@ parameters documented in the repository `README.md`.
 - Same seed-frame goal contract as `spot.graphnav.goto_pose`, but with straight-line-biased travel params.
 
 - `spot.graphnav.cancel` (command)
+- Optional payload: `{"request_id":"<request>"}`.
+- The adapter starts a hold-position GraphNav request at the robot's current localized pose. If cancel arrives
+  while another navigation command is still starting, the cancel request latches until the original command id is known.
 - Overrides active GraphNav navigation with a new goal at the robot's current localized pose.
 - Intended as the operator-facing hold-position override for map UIs.
-- No parameters.
+- Processed on a high-priority path so it can interrupt an active long-running GraphNav command.
 
 Command response behavior:
 - Formant command responses are terminal; success/failure is returned when the action reaches completion.

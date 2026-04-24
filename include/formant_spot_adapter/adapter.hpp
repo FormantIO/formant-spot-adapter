@@ -84,12 +84,14 @@ class Adapter {
   bool ExecuteRotateCommand(const v1::model::CommandRequest& request, bool left);
   bool ExecuteQueuedCommand(const v1::model::CommandRequest& request);
   void CommandExecutionLoop();
+  void GraphNavCancelExecutionLoop();
   bool ExecuteCameraCalibrateCommand();
   bool ExecuteWaypointGotoCommand(const v1::model::CommandRequest& request);
   bool ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest& request);
   bool ExecuteGraphNavGotoPoseCommand(const v1::model::CommandRequest& request, bool straight);
-  bool ExecuteGraphNavCancelCommand();
-  bool ExecuteDockSequence(bool return_and_dock);
+  bool ExecuteGraphNavCancelCommand(const v1::model::CommandRequest* request = nullptr);
+  bool ExecuteDockSequence(bool return_and_dock,
+                           const v1::model::CommandRequest* request = nullptr);
   bool ExecuteUndockCommand();
   bool WaitForGraphNavCommandResult(uint32_t command_id, long long timeout_ms);
   bool EnsureLocalizedForNavigation(const std::string& action_name);
@@ -138,6 +140,8 @@ class Adapter {
   bool HandleMapCommand(const v1::model::CommandRequest& request);
   bool HandleWaypointCommand(const v1::model::CommandRequest& request);
   bool ExtractCommandText(const v1::model::CommandRequest& request, std::string* out) const;
+  std::string ExtractCommandRequestId(const v1::model::CommandRequest& request,
+                                      const std::string& command_text) const;
   std::string ExtractParam(const std::string& input,
                            const std::vector<std::string>& keys) const;
   bool LoadAdapterMapState();
@@ -198,6 +202,9 @@ class Adapter {
   void MaybeRestoreActiveMap(long long now);
   void PollGraphNavNavigation(long long now);
   bool IsGraphNavNavigationActive() const;
+  void MarkGraphNavCommandActive(uint32_t command_id, bool reset_cancel_state = true);
+  void ClearGraphNavCommandIfCurrent(uint32_t command_id);
+  void ClearGraphNavCommandState();
   bool SpotConnected() const;
   void ConnectionLoop();
   void SetSpotConnected();
@@ -235,7 +242,10 @@ class Adapter {
                             bool has_waypoint_goal = false,
                             double waypoint_goal_x = 0.0,
                             double waypoint_goal_y = 0.0,
-                            double waypoint_goal_yaw_rad = 0.0);
+                            double waypoint_goal_yaw_rad = 0.0,
+                            const std::string& request_id = std::string(),
+                            const std::string& phase = "active",
+                            bool reset_cancel_state = true);
   bool ValidateGraphNavCommandMapUuid(const std::string& command_name,
                                       const std::string& requested_map_uuid,
                                       bool require_map_uuid,
@@ -281,7 +291,7 @@ class Adapter {
   std::atomic<bool> return_and_dock_requested_{false};
   std::atomic<bool> can_dock_{false};
   std::atomic<bool> reboot_requested_{false};
-  std::atomic<bool> command_action_in_progress_{false};
+  std::atomic<int> command_action_depth_{0};
   std::atomic<int> desired_motion_mode_{0};
   std::atomic<long long> last_lease_attempt_ms_{0};
   std::atomic<long long> dock_cooldown_until_ms_{0};
@@ -308,6 +318,7 @@ class Adapter {
   std::thread dock_thread_;
   std::thread connection_thread_;
   std::thread command_exec_thread_;
+  std::thread graphnav_cancel_thread_;
   std::thread app_config_thread_;
   std::mutex app_config_mu_;
   std::condition_variable app_config_cv_;
@@ -318,6 +329,9 @@ class Adapter {
   std::mutex command_queue_mu_;
   std::condition_variable command_queue_cv_;
   std::deque<v1::model::CommandRequest> command_queue_;
+  std::mutex graphnav_cancel_queue_mu_;
+  std::condition_variable graphnav_cancel_queue_cv_;
+  std::deque<v1::model::CommandRequest> graphnav_cancel_queue_;
 
   mutable std::mutex hb_mu_;
   long long last_heartbeat_ms_{0};
@@ -416,6 +430,7 @@ class Adapter {
   std::string nav_target_waypoint_name_;
   std::string nav_target_map_id_;
   std::string nav_target_map_uuid_;
+  std::string nav_target_request_id_;
   bool nav_target_has_seed_goal_{false};
   double nav_target_seed_x_{0.0};
   double nav_target_seed_y_{0.0};
@@ -446,7 +461,9 @@ class Adapter {
   std::atomic<bool> map_recording_active_{false};
   std::atomic<bool> graphnav_navigation_active_{false};
   std::atomic<bool> nav_auto_recovered_{false};
+  std::atomic<bool> graphnav_cancel_requested_{false};
   std::atomic<uint32_t> last_graph_nav_command_id_{0};
+  std::atomic<uint32_t> cancelled_graph_nav_command_id_{0};
   int graphnav_map_post_backoff_ms_{1000};
   uint64_t last_graphnav_map_posted_version_{0};
   mutable std::mutex nav_state_mu_;

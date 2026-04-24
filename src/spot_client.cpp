@@ -931,6 +931,11 @@ bool SpotClient::Velocity(double vx, double vy, double wz, int end_after_ms, Mot
                           double body_pitch_rad) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!robot_command_client_) return false;
+  if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(wz) ||
+      !std::isfinite(body_pitch_rad)) {
+    SetLastError("Velocity requires finite command values");
+    return false;
+  }
   if (!EnsureTimeSync()) return false;
   if (!EnsurePowered()) return false;
   ::bosdyn::api::spot::MobilityParams params;
@@ -973,9 +978,31 @@ bool SpotClient::Velocity(double vx, double vy, double wz, int end_after_ms, Mot
 
 bool SpotClient::ZeroVelocity(int repeats) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!robot_) {
+    SetLastError("Robot unavailable");
+    return false;
+  }
+  if (!robot_command_client_) {
+    SetLastError("Robot command client unavailable");
+    return false;
+  }
+  auto state = robot_->IsPoweredOn();
+  if (!state.status) {
+    SetLastError(state.status.DebugString());
+    return false;
+  }
+  if (!state.response) return true;
+  if (!EnsureTimeSync()) return false;
+
   bool ok = true;
   for (int i = 0; i < repeats; ++i) {
-    ok = Velocity(0.0, 0.0, 0.0) && ok;
+    ::bosdyn::api::spot::MobilityParams params;
+    auto cmd = ::bosdyn::client::VelocityCommand(0.0, 0.0, 0.0, "body", params);
+    auto r = robot_command_client_->RobotCommand(
+        cmd, nullptr, nullptr,
+        std::chrono::system_clock::now() + std::chrono::milliseconds(600));
+    if (!r.status) SetLastError(r.status.DebugString());
+    ok = r.status && ok;
   }
   return ok;
 }

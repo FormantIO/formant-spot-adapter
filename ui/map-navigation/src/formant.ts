@@ -61,8 +61,23 @@ function asNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function asBoolean(value: unknown, fallback = false): boolean {
   return typeof value === "boolean" ? value : fallback;
+}
+
+function asBooleanLike(value: unknown, fallback = false): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "y"].includes(normalized)) return true;
+    if (["false", "0", "no", "n"].includes(normalized)) return false;
+  }
+  return fallback;
 }
 
 function asConfiguredName(value: unknown, fallback: string): string {
@@ -160,26 +175,56 @@ function parseGraphNavOverlayValue(value: unknown): GraphNavOverlay | undefined 
     ? value.waypoints.flatMap((waypoint) => {
         if (Array.isArray(waypoint)) {
           const name = typeof waypoint[0] === "string" ? waypoint[0] : "";
-          if (!name) return [];
+          const x = asFiniteNumber(waypoint[1]);
+          const y = asFiniteNumber(waypoint[2]);
+          if (!name || typeof x !== "number" || typeof y !== "number") return [];
           return [{
             name,
-            x: asNumber(waypoint[1]),
-            y: asNumber(waypoint[2]),
-            is_dock: Boolean(waypoint[3])
+            x,
+            y,
+            is_dock: asBooleanLike(waypoint[3])
           }];
         }
         if (!isRecord(waypoint)) return [];
+        const id = asString(waypoint.id) || undefined;
+        const label = asString(waypoint.label) || undefined;
+        const name =
+          asString(waypoint.name) ||
+          asString(waypoint.display_name) ||
+          label ||
+          id ||
+          "";
+        const x = asFiniteNumber(waypoint.x);
+        const y = asFiniteNumber(waypoint.y);
+        if (!name || typeof x !== "number" || typeof y !== "number") return [];
         return [{
-          id: asString(waypoint.id) || undefined,
-          name: asString(waypoint.name),
-          label: asString(waypoint.label) || undefined,
-          x: asNumber(waypoint.x),
-          y: asNumber(waypoint.y),
-          is_dock: asBoolean(
-            typeof waypoint.is_dock === "boolean" ? waypoint.is_dock : waypoint.d,
+          id,
+          name,
+          label,
+          x,
+          y,
+          is_dock: asBooleanLike(
+            typeof waypoint.is_dock !== "undefined" ? waypoint.is_dock : waypoint.d,
             false
           )
         }];
+      })
+    : [];
+  const edges = Array.isArray(value.edges)
+    ? value.edges.flatMap((edge) => {
+        if (Array.isArray(edge)) {
+          const fromWaypointId = typeof edge[0] === "string" ? edge[0] : "";
+          const toWaypointId = typeof edge[1] === "string" ? edge[1] : "";
+          return fromWaypointId && toWaypointId
+            ? [{ from_waypoint_id: fromWaypointId, to_waypoint_id: toWaypointId }]
+            : [];
+        }
+        if (!isRecord(edge)) return [];
+        const fromWaypointId = asString(edge.from_waypoint_id) || asString(edge.from);
+        const toWaypointId = asString(edge.to_waypoint_id) || asString(edge.to);
+        return fromWaypointId && toWaypointId
+          ? [{ from_waypoint_id: fromWaypointId, to_waypoint_id: toWaypointId }]
+          : [];
       })
     : [];
   return {
@@ -193,7 +238,10 @@ function parseGraphNavOverlayValue(value: unknown): GraphNavOverlay | undefined 
       asString(value.dock_waypoint_name) || asString(value.dock_waypoint_id),
     waypoint_count:
       typeof value.waypoint_count === "number" ? value.waypoint_count : undefined,
-    waypoints
+    edge_count:
+      typeof value.edge_count === "number" ? value.edge_count : undefined,
+    waypoints,
+    edges
   };
 }
 
@@ -217,6 +265,8 @@ function parseNavStateValue(value: unknown): NavState {
       target_name: "",
       map_id: "",
       map_uuid: "",
+      request_id: "",
+      command_request_id: "",
       localized: false,
       current_waypoint_id: "",
       has_current_seed_pose: false,
@@ -242,6 +292,8 @@ function parseNavStateValue(value: unknown): NavState {
     target_name: asString(value.target_name),
     map_id: asString(value.map_id),
     map_uuid: asString(value.map_uuid),
+    request_id: asString(value.request_id),
+    command_request_id: asString(value.command_request_id || value.request_id),
     localized: asBoolean(value.localized),
     current_waypoint_id: asString(value.current_waypoint_id),
     has_current_seed_pose: asBoolean(value.has_current_seed_pose),
@@ -1171,28 +1223,70 @@ export function formatGotoPosePayload(
   mapUuid: string,
   x: number,
   y: number,
-  yawDeg: number
+  yawDeg: number,
+  requestId?: string
 ): string {
-  return `map_uuid=${mapUuid}, x=${x.toFixed(3)}, y=${y.toFixed(3)}, yaw_deg=${yawDeg.toFixed(1)}`;
+  return formatCommandPayload({
+    map_uuid: mapUuid,
+    x: Number(x.toFixed(3)),
+    y: Number(y.toFixed(3)),
+    yaw_deg: Number(yawDeg.toFixed(1)),
+    request_id: requestId
+  });
 }
 
-export function formatWaypointGotoPayload(mapUuid: string, waypointId: string): string {
-  return `map_uuid=${mapUuid}, waypoint_id=${waypointId}`;
+export function formatWaypointGotoPayload(
+  mapUuid: string,
+  waypointId: string,
+  requestId?: string
+): string {
+  return formatCommandPayload({
+    map_uuid: mapUuid,
+    waypoint_id: waypointId,
+    request_id: requestId
+  });
 }
 
-export function formatWaypointGotoByNamePayload(mapUuid: string, waypointName: string): string {
-  return `map_uuid=${mapUuid}, name=${waypointName}`;
+export function formatWaypointGotoByNamePayload(
+  mapUuid: string,
+  waypointName: string,
+  requestId?: string
+): string {
+  return formatCommandPayload({
+    map_uuid: mapUuid,
+    name: waypointName,
+    request_id: requestId
+  });
 }
 
 export function formatWaypointSavePayload(name: string): string | undefined {
   const trimmed = name.trim();
-  return trimmed ? `name=${trimmed}` : undefined;
+  return trimmed ? formatCommandPayload({ name: trimmed }) : undefined;
 }
 
 export function formatWaypointDeletePayload(name: string): string {
-  return `name=${name.trim()}`;
+  return formatCommandPayload({ name: name.trim() });
 }
 
 export function formatMapIdPayload(mapId: string): string {
-  return `map_id=${mapId}`;
+  return formatCommandPayload({ map_id: mapId });
+}
+
+export function formatRequestIdPayload(requestId: string): string {
+  return formatCommandPayload({ request_id: requestId });
+}
+
+export function createCommandRequestId(prefix = "nav"): string {
+  if (globalThis.crypto && "randomUUID" in globalThis.crypto) {
+    return `${prefix}-${globalThis.crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function formatCommandPayload(values: Record<string, string | number | undefined>): string {
+  const payload: Record<string, string | number> = {};
+  Object.entries(values).forEach(([key, value]) => {
+    if (value !== undefined && value !== "") payload[key] = value;
+  });
+  return JSON.stringify(payload);
 }

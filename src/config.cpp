@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <cctype>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -19,43 +20,38 @@ std::string getenv_or(const char* k, const std::string& d) {
   return (v && *v) ? std::string(v) : d;
 }
 
-int getenv_int_or(const char* k, int d) {
-  const char* v = std::getenv(k);
-  if (!v || !*v) return d;
-  try {
-    return std::stoi(v);
-  } catch (...) {
-    return d;
-  }
+std::string trim_env_value(const char* v) {
+  if (!v) return "";
+  std::string value(v);
+  const auto begin = value.find_first_not_of(" \t\r\n");
+  if (begin == std::string::npos) return "";
+  const auto end = value.find_last_not_of(" \t\r\n");
+  return value.substr(begin, end - begin + 1);
+}
+
+bool env_value_present(const char* k) {
+  return !trim_env_value(std::getenv(k)).empty();
 }
 
 bool getenv_int_if_set(const char* k, int* out) {
   if (!out) return false;
-  const char* v = std::getenv(k);
-  if (!v || !*v) return false;
+  const std::string value = trim_env_value(std::getenv(k));
+  if (value.empty()) return false;
   try {
-    *out = std::stoi(v);
+    std::size_t idx = 0;
+    const int parsed = std::stoi(value, &idx);
+    if (idx != value.size()) return false;
+    *out = parsed;
     return true;
   } catch (...) {
     return false;
   }
 }
 
-bool getenv_bool_or(const char* k, bool d) {
-  const char* v = std::getenv(k);
-  if (!v || !*v) return d;
-  std::string value(v);
-  for (char& ch : value) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-  if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
-  if (value == "0" || value == "false" || value == "no" || value == "off") return false;
-  return d;
-}
-
 bool getenv_bool_if_set(const char* k, bool* out) {
   if (!out) return false;
-  const char* v = std::getenv(k);
-  if (!v || !*v) return false;
-  std::string value(v);
+  std::string value = trim_env_value(std::getenv(k));
+  if (value.empty()) return false;
   for (char& ch : value) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
   if (value == "1" || value == "true" || value == "yes" || value == "on") {
     *out = true;
@@ -68,13 +64,18 @@ bool getenv_bool_if_set(const char* k, bool* out) {
   return false;
 }
 
-double getenv_double_or(const char* k, double d) {
-  const char* v = std::getenv(k);
-  if (!v || !*v) return d;
+bool getenv_double_if_set(const char* k, double* out) {
+  if (!out) return false;
+  const std::string value = trim_env_value(std::getenv(k));
+  if (value.empty()) return false;
   try {
-    return std::stod(v);
+    std::size_t idx = 0;
+    const double parsed = std::stod(value, &idx);
+    if (idx != value.size() || !std::isfinite(parsed)) return false;
+    *out = parsed;
+    return true;
   } catch (...) {
-    return d;
+    return false;
   }
 }
 
@@ -229,7 +230,6 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_arm_raise_qy()) c->arm_raise_qy = j.arm_raise_qy().value();
   if (j.has_arm_raise_qz()) c->arm_raise_qz = j.arm_raise_qz().value();
   if (j.has_arm_raise_move_sec()) c->arm_raise_move_sec = j.arm_raise_move_sec().value();
-  if (j.has_arm_hold_interval_ms()) c->arm_hold_interval_ms = j.arm_hold_interval_ms().value();
   if (j.has_graphnav_store_dir()) c->graphnav_store_dir = j.graphnav_store_dir().value();
   if (j.has_waypoint_text_stream()) c->waypoint_text_stream = j.waypoint_text_stream().value();
   if (j.has_maps_text_stream()) c->maps_text_stream = j.maps_text_stream().value();
@@ -242,146 +242,183 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   }
 }
 
+void log_env_override(const char* key, bool secret, bool valid) {
+  if (!valid) {
+    std::cerr << "[config] ignoring invalid env override " << key << std::endl;
+    return;
+  }
+  if (!secret) {
+    std::cerr << "[config] env override applied " << key << std::endl;
+  }
+}
+
+void apply_env_overrides(Config* c, bool log_overrides) {
+  if (!c) return;
+
+  const auto apply_string = [&](const char* key, std::string* field, bool secret = false) {
+    const char* v = std::getenv(key);
+    if (!v || !*v) return;
+    *field = std::string(v);
+    if (log_overrides) log_env_override(key, secret, true);
+  };
+  const auto apply_int = [&](const char* key, int* field) {
+    if (!env_value_present(key)) return;
+    int parsed = 0;
+    if (!getenv_int_if_set(key, &parsed)) {
+      if (log_overrides) log_env_override(key, false, false);
+      return;
+    }
+    *field = parsed;
+    if (log_overrides) log_env_override(key, false, true);
+  };
+  const auto apply_double = [&](const char* key, double* field) {
+    if (!env_value_present(key)) return;
+    double parsed = 0.0;
+    if (!getenv_double_if_set(key, &parsed)) {
+      if (log_overrides) log_env_override(key, false, false);
+      return;
+    }
+    *field = parsed;
+    if (log_overrides) log_env_override(key, false, true);
+  };
+  const auto apply_bool = [&](const char* key, bool* field) {
+    if (!env_value_present(key)) return;
+    bool parsed = false;
+    if (!getenv_bool_if_set(key, &parsed)) {
+      if (log_overrides) log_env_override(key, false, false);
+      return;
+    }
+    *field = parsed;
+    if (log_overrides) log_env_override(key, false, true);
+  };
+
+  apply_string("SPOT_HOST", &c->spot_host);
+  apply_string("SPOT_USERNAME", &c->spot_username, true);
+  apply_string("SPOT_PASSWORD", &c->spot_password, true);
+  apply_string("FORMANT_AGENT_TARGET", &c->formant_agent_target);
+
+  apply_string("TELEOP_TWIST_STREAM", &c->teleop_twist_stream);
+  apply_string("TELEOP_JOY_STREAM", &c->teleop_joy_stream);
+  apply_string("TELEOP_BUTTONS_STREAM", &c->teleop_buttons_stream);
+  apply_string("STAND_BUTTON_STREAM", &c->stand_button_stream);
+  apply_string("SIT_BUTTON_STREAM", &c->sit_button_stream);
+  apply_string("ESTOP_BUTTON_STREAM", &c->estop_button_stream);
+  apply_string("RECOVER_BUTTON_STREAM", &c->recover_button_stream);
+  apply_string("WALK_BUTTON_STREAM", &c->walk_button_stream);
+  apply_string("STAIRS_BUTTON_STREAM", &c->stairs_button_stream);
+  apply_string("CRAWL_BUTTON_STREAM", &c->crawl_button_stream);
+  apply_string("RESET_ARM_BUTTON_STREAM", &c->reset_arm_button_stream);
+  apply_string("ARM_RAISE_BUTTON_STREAM", &c->arm_raise_button_stream);
+  apply_string("DOCK_BUTTON_STREAM", &c->dock_button_stream);
+  apply_string("CAN_DOCK_STREAM", &c->can_dock_stream);
+  apply_string("STATEFUL_MODE_STREAM", &c->stateful_mode_stream);
+  apply_int("JOY_AXIS_FORWARD", &c->joy_axis_forward);
+  apply_int("JOY_AXIS_STRAFE", &c->joy_axis_strafe);
+  apply_int("JOY_AXIS_YAW", &c->joy_axis_yaw);
+  apply_int("JOY_AXIS_BODY_PITCH", &c->joy_axis_body_pitch);
+  apply_bool("JOY_AXIS_FORWARD_INVERTED", &c->joy_axis_forward_inverted);
+  apply_bool("JOY_AXIS_STRAFE_INVERTED", &c->joy_axis_strafe_inverted);
+  apply_bool("JOY_AXIS_YAW_INVERTED", &c->joy_axis_yaw_inverted);
+  apply_bool("JOY_AXIS_BODY_PITCH_INVERTED", &c->joy_axis_body_pitch_inverted);
+  apply_int("JOY_BUTTON_STAND", &c->joy_button_stand);
+  apply_int("JOY_BUTTON_SIT", &c->joy_button_sit);
+  apply_int("JOY_BUTTON_RESET_ARM", &c->joy_button_reset_arm);
+  apply_int("JOY_BUTTON_RECOVER", &c->joy_button_recover);
+  apply_int("JOY_BUTTON_WALK", &c->joy_button_walk);
+  apply_int("JOY_BUTTON_STAIRS", &c->joy_button_stairs);
+  apply_int("JOY_BUTTON_CRAWL", &c->joy_button_crawl);
+  apply_int("JOY_BUTTON_DOCK", &c->joy_button_dock);
+  apply_int("JOY_BUTTON_ESTOP", &c->joy_button_estop);
+
+  apply_string("CAMERA_SOURCE", &c->camera_source);
+  apply_string("CAMERA_STREAM_NAME", &c->camera_stream_name);
+  apply_string("LEFT_CAMERA_SOURCE", &c->left_camera_source);
+  apply_string("LEFT_CAMERA_STREAM_NAME", &c->left_camera_stream_name);
+  apply_string("RIGHT_CAMERA_SOURCE", &c->right_camera_source);
+  apply_string("RIGHT_CAMERA_STREAM_NAME", &c->right_camera_stream_name);
+  apply_string("BACK_CAMERA_SOURCE", &c->back_camera_source);
+  apply_string("BACK_CAMERA_STREAM_NAME", &c->back_camera_stream_name);
+  apply_string("FRONT_LEFT_CAMERA_SOURCE", &c->front_left_camera_source);
+  apply_string("FRONT_RIGHT_CAMERA_SOURCE", &c->front_right_camera_source);
+  apply_string("FRONT_IMAGE_STREAM_NAME", &c->front_image_stream_name);
+  apply_int("CAMERA_FPS", &c->camera_fps);
+  apply_int("SURROUND_CAMERA_FPS", &c->surround_camera_fps);
+  apply_int("SURROUND_CAMERA_POLL_HZ", &c->surround_camera_poll_hz);
+  apply_int("FRONT_IMAGE_FPS", &c->front_image_fps);
+  apply_int("FRONT_IMAGE_POLL_HZ", &c->front_image_poll_hz);
+  if (env_value_present("FRONT_IMAGE_ROLL_DEGREES")) {
+    int parsed = 0;
+    if (getenv_int_if_set("FRONT_IMAGE_ROLL_DEGREES", &parsed)) {
+      c->front_image_roll_degrees = parsed;
+      c->front_image_roll_degrees_configured = true;
+      if (log_overrides) log_env_override("FRONT_IMAGE_ROLL_DEGREES", false, true);
+    } else if (log_overrides) {
+      log_env_override("FRONT_IMAGE_ROLL_DEGREES", false, false);
+    }
+  }
+  apply_bool("RIGHT_CAMERA_ROTATE_180", &c->right_camera_rotate_180);
+  apply_string("LOCALIZATION_IMAGE_STREAM_NAME", &c->localization_image_stream_name);
+  apply_int("LOCALIZATION_IMAGE_FPS", &c->localization_image_fps);
+  apply_int("LOCALIZATION_IMAGE_POLL_HZ", &c->localization_image_poll_hz);
+  apply_string("GRAPHNAV_GLOBAL_LOCALIZATION_STREAM", &c->graphnav_global_localization_stream);
+  apply_int("GRAPHNAV_GLOBAL_LOCALIZATION_HZ", &c->graphnav_global_localization_hz);
+  apply_string("GRAPHNAV_MAP_STREAM", &c->graphnav_map_stream);
+  apply_string("GRAPHNAV_METADATA_STREAM", &c->graphnav_metadata_stream);
+  apply_string("GRAPHNAV_OVERLAY_STREAM", &c->graphnav_overlay_stream);
+  apply_string("GRAPHNAV_NAV_STATE_STREAM", &c->graphnav_nav_state_stream);
+  apply_string("GRAPHNAV_MAP_IMAGE_STREAM_NAME", &c->graphnav_map_image_stream_name);
+  apply_string("GRAPHNAV_MAP_IMAGE_METADATA_STREAM_NAME", &c->graphnav_map_image_metadata_stream_name);
+  apply_int("GRAPHNAV_MAP_IMAGE_FPS", &c->graphnav_map_image_fps);
+  apply_int("GRAPHNAV_MAP_IMAGE_POLL_HZ", &c->graphnav_map_image_poll_hz);
+  if (env_value_present("ARM_PRESENT")) {
+    bool arm_present = false;
+    if (getenv_bool_if_set("ARM_PRESENT", &arm_present)) {
+      c->arm_present_override = arm_present ? 1 : 0;
+      if (log_overrides) log_env_override("ARM_PRESENT", false, true);
+    } else if (log_overrides) {
+      log_env_override("ARM_PRESENT", false, false);
+    }
+  }
+  apply_double("TWIST_DEADBAND", &c->twist_deadband);
+  apply_int("TELEOP_IDLE_TIMEOUT_MS", &c->teleop_idle_timeout_ms);
+
+  apply_double("MAX_VX_MPS", &c->max_vx_mps);
+  apply_double("MAX_VY_MPS", &c->max_vy_mps);
+  apply_double("MAX_WZ_RPS", &c->max_wz_rps);
+  apply_double("MAX_BODY_PITCH_RAD", &c->max_body_pitch_rad);
+  apply_double("TRANSLATION_RESPONSE_CURVE", &c->translation_response_curve);
+  apply_double("ROTATION_RESPONSE_CURVE", &c->rotation_response_curve);
+  apply_double("LINEAR_ACCEL_LIMIT_MPS2", &c->linear_accel_limit_mps2);
+  apply_double("STRAFE_ACCEL_LIMIT_MPS2", &c->strafe_accel_limit_mps2);
+  apply_double("ANGULAR_ACCEL_LIMIT_RPS2", &c->angular_accel_limit_rps2);
+  apply_double("BODY_PITCH_RATE_LIMIT_RADPS", &c->body_pitch_rate_limit_radps);
+
+  apply_int("LEASE_RETAIN_HZ", &c->lease_retain_hz);
+  apply_int("HEARTBEAT_TIMEOUT_MS", &c->heartbeat_timeout_ms);
+  apply_int("ZERO_VELOCITY_REPEATS", &c->zero_velocity_repeats);
+  apply_int("DOCK_STATION_ID", &c->dock_station_id);
+  apply_int("DOCK_ATTEMPTS", &c->dock_attempts);
+  apply_int("DOCK_POLL_MS", &c->dock_poll_ms);
+  apply_int("DOCK_COMMAND_TIMEOUT_SEC", &c->dock_command_timeout_sec);
+  apply_double("ARM_RAISE_X", &c->arm_raise_x);
+  apply_double("ARM_RAISE_Y", &c->arm_raise_y);
+  apply_double("ARM_RAISE_Z", &c->arm_raise_z);
+  apply_double("ARM_RAISE_QW", &c->arm_raise_qw);
+  apply_double("ARM_RAISE_QX", &c->arm_raise_qx);
+  apply_double("ARM_RAISE_QY", &c->arm_raise_qy);
+  apply_double("ARM_RAISE_QZ", &c->arm_raise_qz);
+  apply_double("ARM_RAISE_MOVE_SEC", &c->arm_raise_move_sec);
+  apply_string("GRAPHNAV_STORE_DIR", &c->graphnav_store_dir);
+  apply_string("WAYPOINT_TEXT_STREAM", &c->waypoint_text_stream);
+  apply_string("MAPS_TEXT_STREAM", &c->maps_text_stream);
+  apply_int("GRAPHNAV_COMMAND_TIMEOUT_SEC", &c->graphnav_command_timeout_sec);
+}
+
 }  // namespace
 
 Config load_config_from_env() {
   Config c;
-  c.spot_host = getenv_or("SPOT_HOST", c.spot_host);
-  c.spot_username = getenv_or("SPOT_USERNAME", c.spot_username);
-  c.spot_password = getenv_or("SPOT_PASSWORD", c.spot_password);
-  c.formant_agent_target = getenv_or("FORMANT_AGENT_TARGET", c.formant_agent_target);
-
-  c.teleop_twist_stream = getenv_or("TELEOP_TWIST_STREAM", c.teleop_twist_stream);
-  c.teleop_joy_stream = getenv_or("TELEOP_JOY_STREAM", c.teleop_joy_stream);
-  c.teleop_buttons_stream = getenv_or("TELEOP_BUTTONS_STREAM", c.teleop_buttons_stream);
-  c.stand_button_stream = getenv_or("STAND_BUTTON_STREAM", c.stand_button_stream);
-  c.sit_button_stream = getenv_or("SIT_BUTTON_STREAM", c.sit_button_stream);
-  c.estop_button_stream = getenv_or("ESTOP_BUTTON_STREAM", c.estop_button_stream);
-  c.recover_button_stream = getenv_or("RECOVER_BUTTON_STREAM", c.recover_button_stream);
-  c.walk_button_stream = getenv_or("WALK_BUTTON_STREAM", c.walk_button_stream);
-  c.stairs_button_stream = getenv_or("STAIRS_BUTTON_STREAM", c.stairs_button_stream);
-  c.crawl_button_stream = getenv_or("CRAWL_BUTTON_STREAM", c.crawl_button_stream);
-  c.reset_arm_button_stream = getenv_or("RESET_ARM_BUTTON_STREAM", c.reset_arm_button_stream);
-  c.arm_raise_button_stream = getenv_or("ARM_RAISE_BUTTON_STREAM", c.arm_raise_button_stream);
-  c.dock_button_stream = getenv_or("DOCK_BUTTON_STREAM", c.dock_button_stream);
-  c.can_dock_stream = getenv_or("CAN_DOCK_STREAM", c.can_dock_stream);
-  c.stateful_mode_stream = getenv_or("STATEFUL_MODE_STREAM", c.stateful_mode_stream);
-  c.joy_axis_forward = getenv_int_or("JOY_AXIS_FORWARD", c.joy_axis_forward);
-  c.joy_axis_strafe = getenv_int_or("JOY_AXIS_STRAFE", c.joy_axis_strafe);
-  c.joy_axis_yaw = getenv_int_or("JOY_AXIS_YAW", c.joy_axis_yaw);
-  c.joy_axis_body_pitch = getenv_int_or("JOY_AXIS_BODY_PITCH", c.joy_axis_body_pitch);
-  c.joy_axis_forward_inverted =
-      getenv_bool_or("JOY_AXIS_FORWARD_INVERTED", c.joy_axis_forward_inverted);
-  c.joy_axis_strafe_inverted =
-      getenv_bool_or("JOY_AXIS_STRAFE_INVERTED", c.joy_axis_strafe_inverted);
-  c.joy_axis_yaw_inverted =
-      getenv_bool_or("JOY_AXIS_YAW_INVERTED", c.joy_axis_yaw_inverted);
-  c.joy_axis_body_pitch_inverted =
-      getenv_bool_or("JOY_AXIS_BODY_PITCH_INVERTED", c.joy_axis_body_pitch_inverted);
-  c.joy_button_stand = getenv_int_or("JOY_BUTTON_STAND", c.joy_button_stand);
-  c.joy_button_sit = getenv_int_or("JOY_BUTTON_SIT", c.joy_button_sit);
-  c.joy_button_reset_arm = getenv_int_or("JOY_BUTTON_RESET_ARM", c.joy_button_reset_arm);
-  c.joy_button_recover = getenv_int_or("JOY_BUTTON_RECOVER", c.joy_button_recover);
-  c.joy_button_walk = getenv_int_or("JOY_BUTTON_WALK", c.joy_button_walk);
-  c.joy_button_stairs = getenv_int_or("JOY_BUTTON_STAIRS", c.joy_button_stairs);
-  c.joy_button_crawl = getenv_int_or("JOY_BUTTON_CRAWL", c.joy_button_crawl);
-  c.joy_button_dock = getenv_int_or("JOY_BUTTON_DOCK", c.joy_button_dock);
-  c.joy_button_estop = getenv_int_or("JOY_BUTTON_ESTOP", c.joy_button_estop);
-
-  c.camera_source = getenv_or("CAMERA_SOURCE", c.camera_source);
-  c.camera_stream_name = getenv_or("CAMERA_STREAM_NAME", c.camera_stream_name);
-  c.left_camera_source = getenv_or("LEFT_CAMERA_SOURCE", c.left_camera_source);
-  c.left_camera_stream_name = getenv_or("LEFT_CAMERA_STREAM_NAME", c.left_camera_stream_name);
-  c.right_camera_source = getenv_or("RIGHT_CAMERA_SOURCE", c.right_camera_source);
-  c.right_camera_stream_name = getenv_or("RIGHT_CAMERA_STREAM_NAME", c.right_camera_stream_name);
-  c.back_camera_source = getenv_or("BACK_CAMERA_SOURCE", c.back_camera_source);
-  c.back_camera_stream_name = getenv_or("BACK_CAMERA_STREAM_NAME", c.back_camera_stream_name);
-  c.front_left_camera_source =
-      getenv_or("FRONT_LEFT_CAMERA_SOURCE", c.front_left_camera_source);
-  c.front_right_camera_source =
-      getenv_or("FRONT_RIGHT_CAMERA_SOURCE", c.front_right_camera_source);
-  c.front_image_stream_name =
-      getenv_or("FRONT_IMAGE_STREAM_NAME", c.front_image_stream_name);
-  c.camera_fps = getenv_int_or("CAMERA_FPS", c.camera_fps);
-  c.surround_camera_fps = getenv_int_or("SURROUND_CAMERA_FPS", c.surround_camera_fps);
-  c.surround_camera_poll_hz =
-      getenv_int_or("SURROUND_CAMERA_POLL_HZ", c.surround_camera_poll_hz);
-  c.front_image_fps = getenv_int_or("FRONT_IMAGE_FPS", c.front_image_fps);
-  c.front_image_poll_hz = getenv_int_or("FRONT_IMAGE_POLL_HZ", c.front_image_poll_hz);
-  c.front_image_roll_degrees_configured =
-      getenv_int_if_set("FRONT_IMAGE_ROLL_DEGREES", &c.front_image_roll_degrees);
-  c.right_camera_rotate_180 =
-      getenv_bool_or("RIGHT_CAMERA_ROTATE_180", c.right_camera_rotate_180);
-  c.localization_image_stream_name =
-      getenv_or("LOCALIZATION_IMAGE_STREAM_NAME", c.localization_image_stream_name);
-  c.localization_image_fps = getenv_int_or("LOCALIZATION_IMAGE_FPS", c.localization_image_fps);
-  c.localization_image_poll_hz =
-      getenv_int_or("LOCALIZATION_IMAGE_POLL_HZ", c.localization_image_poll_hz);
-  c.graphnav_global_localization_stream =
-      getenv_or("GRAPHNAV_GLOBAL_LOCALIZATION_STREAM", c.graphnav_global_localization_stream);
-  c.graphnav_global_localization_hz =
-      getenv_int_or("GRAPHNAV_GLOBAL_LOCALIZATION_HZ", c.graphnav_global_localization_hz);
-  c.graphnav_map_stream = getenv_or("GRAPHNAV_MAP_STREAM", c.graphnav_map_stream);
-  c.graphnav_metadata_stream =
-      getenv_or("GRAPHNAV_METADATA_STREAM", c.graphnav_metadata_stream);
-  c.graphnav_overlay_stream =
-      getenv_or("GRAPHNAV_OVERLAY_STREAM", c.graphnav_overlay_stream);
-  c.graphnav_nav_state_stream =
-      getenv_or("GRAPHNAV_NAV_STATE_STREAM", c.graphnav_nav_state_stream);
-  c.graphnav_map_image_stream_name =
-      getenv_or("GRAPHNAV_MAP_IMAGE_STREAM_NAME", c.graphnav_map_image_stream_name);
-  c.graphnav_map_image_metadata_stream_name =
-      getenv_or("GRAPHNAV_MAP_IMAGE_METADATA_STREAM_NAME",
-                c.graphnav_map_image_metadata_stream_name);
-  c.graphnav_map_image_fps =
-      getenv_int_or("GRAPHNAV_MAP_IMAGE_FPS", c.graphnav_map_image_fps);
-  c.graphnav_map_image_poll_hz =
-      getenv_int_or("GRAPHNAV_MAP_IMAGE_POLL_HZ", c.graphnav_map_image_poll_hz);
-  bool arm_present = false;
-  if (getenv_bool_if_set("ARM_PRESENT", &arm_present)) {
-    c.arm_present_override = arm_present ? 1 : 0;
-  }
-  c.twist_deadband = getenv_double_or("TWIST_DEADBAND", c.twist_deadband);
-  c.teleop_idle_timeout_ms = getenv_int_or("TELEOP_IDLE_TIMEOUT_MS", c.teleop_idle_timeout_ms);
-
-  c.max_vx_mps = getenv_double_or("MAX_VX_MPS", c.max_vx_mps);
-  c.max_vy_mps = getenv_double_or("MAX_VY_MPS", c.max_vy_mps);
-  c.max_wz_rps = getenv_double_or("MAX_WZ_RPS", c.max_wz_rps);
-  c.max_body_pitch_rad = getenv_double_or("MAX_BODY_PITCH_RAD", c.max_body_pitch_rad);
-  c.translation_response_curve =
-      getenv_double_or("TRANSLATION_RESPONSE_CURVE", c.translation_response_curve);
-  c.rotation_response_curve =
-      getenv_double_or("ROTATION_RESPONSE_CURVE", c.rotation_response_curve);
-  c.linear_accel_limit_mps2 =
-      getenv_double_or("LINEAR_ACCEL_LIMIT_MPS2", c.linear_accel_limit_mps2);
-  c.strafe_accel_limit_mps2 =
-      getenv_double_or("STRAFE_ACCEL_LIMIT_MPS2", c.strafe_accel_limit_mps2);
-  c.angular_accel_limit_rps2 =
-      getenv_double_or("ANGULAR_ACCEL_LIMIT_RPS2", c.angular_accel_limit_rps2);
-  c.body_pitch_rate_limit_radps =
-      getenv_double_or("BODY_PITCH_RATE_LIMIT_RADPS", c.body_pitch_rate_limit_radps);
-
-  c.lease_retain_hz = getenv_int_or("LEASE_RETAIN_HZ", c.lease_retain_hz);
-  c.heartbeat_timeout_ms = getenv_int_or("HEARTBEAT_TIMEOUT_MS", c.heartbeat_timeout_ms);
-  c.zero_velocity_repeats = getenv_int_or("ZERO_VELOCITY_REPEATS", c.zero_velocity_repeats);
-  c.dock_station_id = getenv_int_or("DOCK_STATION_ID", c.dock_station_id);
-  c.dock_attempts = getenv_int_or("DOCK_ATTEMPTS", c.dock_attempts);
-  c.dock_poll_ms = getenv_int_or("DOCK_POLL_MS", c.dock_poll_ms);
-  c.dock_command_timeout_sec = getenv_int_or("DOCK_COMMAND_TIMEOUT_SEC", c.dock_command_timeout_sec);
-  c.arm_raise_x = getenv_double_or("ARM_RAISE_X", c.arm_raise_x);
-  c.arm_raise_y = getenv_double_or("ARM_RAISE_Y", c.arm_raise_y);
-  c.arm_raise_z = getenv_double_or("ARM_RAISE_Z", c.arm_raise_z);
-  c.arm_raise_qw = getenv_double_or("ARM_RAISE_QW", c.arm_raise_qw);
-  c.arm_raise_qx = getenv_double_or("ARM_RAISE_QX", c.arm_raise_qx);
-  c.arm_raise_qy = getenv_double_or("ARM_RAISE_QY", c.arm_raise_qy);
-  c.arm_raise_qz = getenv_double_or("ARM_RAISE_QZ", c.arm_raise_qz);
-  c.arm_raise_move_sec = getenv_double_or("ARM_RAISE_MOVE_SEC", c.arm_raise_move_sec);
-  c.arm_hold_interval_ms = getenv_int_or("ARM_HOLD_INTERVAL_MS", c.arm_hold_interval_ms);
-  c.graphnav_store_dir = getenv_or("GRAPHNAV_STORE_DIR", c.graphnav_store_dir);
-  c.waypoint_text_stream = getenv_or("WAYPOINT_TEXT_STREAM", c.waypoint_text_stream);
-  c.maps_text_stream = getenv_or("MAPS_TEXT_STREAM", c.maps_text_stream);
-  c.graphnav_command_timeout_sec =
-      getenv_int_or("GRAPHNAV_COMMAND_TIMEOUT_SEC", c.graphnav_command_timeout_sec);
+  apply_env_overrides(&c, false);
   return c;
 }
 
@@ -403,19 +440,10 @@ Config load_config() {
     }
   } else {
     std::cerr << "Config JSON not found/readable: " << json_path
-              << " (using defaults + env secrets)" << std::endl;
+              << " (using defaults + env overrides)" << std::endl;
   }
 
-  // Secrets come from env in normal adapter execution. Keep a narrow runtime
-  // override for the local agent target so containerized deployments can
-  // redirect the adapter without rewriting the JSON config.
-  c.spot_username = getenv_or("SPOT_USERNAME", c.spot_username);
-  c.spot_password = getenv_or("SPOT_PASSWORD", c.spot_password);
-  c.formant_agent_target = getenv_or("FORMANT_AGENT_TARGET", c.formant_agent_target);
-  bool arm_present = false;
-  if (getenv_bool_if_set("ARM_PRESENT", &arm_present)) {
-    c.arm_present_override = arm_present ? 1 : 0;
-  }
+  apply_env_overrides(&c, true);
   return c;
 }
 

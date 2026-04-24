@@ -10,7 +10,8 @@ message StreamControl {
 }
 
 message AdapterConfig {
-  reserved 28, 29;
+  reserved 28, 29, 42;
+  reserved "arm_hold_interval_ms";
   google.protobuf.StringValue spot_host = 1;
   google.protobuf.StringValue formant_agent_target = 2;
   google.protobuf.StringValue teleop_twist_stream = 3;
@@ -57,7 +58,6 @@ message AdapterConfig {
   google.protobuf.DoubleValue arm_raise_qy = 39;
   google.protobuf.DoubleValue arm_raise_qz = 40;
   google.protobuf.DoubleValue arm_raise_move_sec = 41;
-  google.protobuf.Int32Value arm_hold_interval_ms = 42;
   google.protobuf.StringValue graphnav_store_dir = 50;
   google.protobuf.StringValue waypoint_text_stream = 51;
   google.protobuf.Int32Value graphnav_command_timeout_sec = 52;

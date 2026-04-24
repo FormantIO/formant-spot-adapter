@@ -24,9 +24,12 @@ import { App as FormantApp } from "@formant/data-sdk";
 import {
   DEFAULT_MODULE_CONFIG,
   authenticateAndGetDevice,
+  createCommandRequestId,
   formatGotoPosePayload,
   formatMapIdPayload,
+  formatRequestIdPayload,
   formatWaypointDeletePayload,
+  formatWaypointGotoPayload,
   formatWaypointGotoByNamePayload,
   formatWaypointSavePayload,
   getInitialModuleConfig,
@@ -730,6 +733,16 @@ function MapStage({
       (entry): entry is { waypoint: GraphNavOverlayWaypoint; point: { x: number; y: number } } =>
         Boolean(entry)
     );
+  const waypointPixelsById = new Map(
+    waypointPixels.flatMap(({ waypoint, point }) =>
+      waypoint.id ? [[waypoint.id, point] as const] : []
+    )
+  );
+  const edgeLines = (snapshot.overlay?.edges || []).flatMap((edge) => {
+    const from = waypointPixelsById.get(edge.from_waypoint_id);
+    const to = waypointPixelsById.get(edge.to_waypoint_id);
+    return from && to ? [{ from, to }] : [];
+  });
 
   const handleMapClick = (event: React.MouseEvent<SVGSVGElement>) => {
     if (selectionMode !== "point") return;
@@ -840,6 +853,19 @@ function MapStage({
             cursor: selectionMode === "point" ? "crosshair" : "default"
           }}
         >
+          {edgeLines.map(({ from, to }, index) => (
+            <line
+              key={`${from.x},${from.y}-${to.x},${to.y}-${index}`}
+              x1={from.x}
+              y1={from.y}
+              x2={to.x}
+              y2={to.y}
+              stroke="rgba(255,255,255,0.24)"
+              strokeWidth="2"
+              strokeLinecap="round"
+            />
+          ))}
+
           {waypointPixels.map(({ waypoint, point }) => {
             const waypointSignature = getWaypointSignature(waypoint);
             const currentWaypointMatches =
@@ -970,6 +996,7 @@ export default function App() {
   const [mapSearch, setMapSearch] = useState("");
   const [mapsExpanded, setMapsExpanded] = useState(false);
   const [pendingCommand, setPendingCommand] = useState<string>();
+  const [pendingCommandRequestId, setPendingCommandRequestId] = useState<string>();
   const [commandError, setCommandError] = useState<string>();
   const [commandNotice, setCommandNotice] = useState<string>();
 
@@ -1091,11 +1118,20 @@ export default function App() {
   }, [snapshot.navState?.active, snapshot.navState?.command_id]);
 
   useEffect(() => {
-    if (snapshot.navState?.phase === "active" || snapshot.navState?.phase === "terminal") {
-      setCommandNotice(undefined);
+    const phase = snapshot.navState?.phase;
+    if (phase !== "starting" && phase !== "active" && phase !== "terminal") return;
+    const navRequestId =
+      snapshot.navState?.request_id || snapshot.navState?.command_request_id || "";
+    if (pendingCommandRequestId && navRequestId !== pendingCommandRequestId) return;
+    setCommandNotice(undefined);
+    if (pendingCommandRequestId && navRequestId === pendingCommandRequestId) {
+      setPendingCommandRequestId(undefined);
     }
   }, [
+    pendingCommandRequestId,
     snapshot.navState?.phase,
+    snapshot.navState?.request_id,
+    snapshot.navState?.command_request_id,
     snapshot.navState?.last_completed_command_id,
     snapshot.navState?.command_id
   ]);
@@ -1430,6 +1466,7 @@ export default function App() {
     setMapSearch("");
     setMapsExpanded(false);
     setPendingCommand(undefined);
+    setPendingCommandRequestId(undefined);
     setCommandError(undefined);
     setCommandNotice(undefined);
     setBootstrapState({ status: "idle" });
@@ -1443,9 +1480,11 @@ export default function App() {
     name: string,
     payload: string | undefined,
     optimisticNotice: string,
-    successNotice: string
+    successNotice: string,
+    requestId?: string
   ) => {
     setPendingCommand(name);
+    setPendingCommandRequestId(requestId);
     setCommandError(undefined);
     setCommandNotice(optimisticNotice);
 
@@ -1454,11 +1493,13 @@ export default function App() {
       await currentDevice.sendCommand(name, payload);
       setCommandNotice(successNotice);
     } catch (deviceError) {
+      setPendingCommandRequestId(undefined);
       setCommandError(
         deviceError instanceof Error ? deviceError.message : `Command ${name} failed.`
       );
     } finally {
       setPendingCommand((current) => (current === name ? undefined : current));
+      if (!requestId) setPendingCommandRequestId(undefined);
     }
   };
 
@@ -1595,24 +1636,30 @@ export default function App() {
 
   const confirmWaypointNavigation = () => {
     if (selection?.kind !== "waypoint" || !displayedMapUuid) return;
-    const payload = formatWaypointGotoByNamePayload(displayedMapUuid, selection.waypoint.name);
+    const requestId = createCommandRequestId("waypoint");
+    const payload = selection.waypoint.id
+      ? formatWaypointGotoPayload(displayedMapUuid, selection.waypoint.id, requestId)
+      : formatWaypointGotoByNamePayload(displayedMapUuid, selection.waypoint.name, requestId);
     setModalState(undefined);
     setSelection(undefined);
     void sendCommand(
       config.waypointGotoCommandName,
       payload,
       `Sending ${selection.waypoint.name}...`,
-      `${selection.waypoint.name} command sent. Waiting for navigation state...`
+      `${selection.waypoint.name} command sent. Waiting for navigation state...`,
+      requestId
     );
   };
 
   const confirmPointNavigation = () => {
     if (selection?.kind !== "point" || !displayedMapUuid) return;
+    const requestId = createCommandRequestId("pose");
     const payload = formatGotoPosePayload(
       displayedMapUuid,
       selection.target.x,
       selection.target.y,
-      selection.target.yawDeg
+      selection.target.yawDeg,
+      requestId
     );
     setModalState(undefined);
     setSelection(undefined);
@@ -1620,7 +1667,8 @@ export default function App() {
       config.gotoPoseCommandName,
       payload,
       "Sending point target...",
-      "Point target command sent. Waiting for navigation state..."
+      "Point target command sent. Waiting for navigation state...",
+      requestId
     );
   };
 
@@ -1637,7 +1685,16 @@ export default function App() {
   };
 
   const invokeAction = (name: string, optimisticNotice: string, successNotice: string) => {
-    void sendCommand(name, undefined, optimisticNotice, successNotice);
+    const shouldCorrelateNav =
+      name === config.cancelNavCommandName || name === config.returnAndDockCommandName;
+    const requestId = shouldCorrelateNav ? createCommandRequestId("nav-action") : undefined;
+    void sendCommand(
+      name,
+      requestId ? formatRequestIdPayload(requestId) : undefined,
+      optimisticNotice,
+      successNotice,
+      requestId
+    );
   };
 
   return (

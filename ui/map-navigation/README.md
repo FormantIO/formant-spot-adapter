@@ -9,7 +9,11 @@ This directory contains a static single-page application intended to be hosted o
 - Opens a Formant realtime connection and subscribes to the Spot GraphNav map image, image metadata, overlay, and nav state streams
 - Renders the live robot pose, waypoint overlay, active target, and readiness state
 - Makes saved waypoint navigation the primary workflow, with arbitrary point navigation as an advanced mode
-- Sends `spot.waypoint.goto`, `spot.graphnav.goto_pose`, `spot.graphnav.cancel`, `spot.return_and_dock`, and `spot.undock` through Formant
+- Sends `spot.waypoint.goto`, `spot.graphnav.goto_pose`, `spot.graphnav.cancel`,
+  `spot.return_and_dock`, and `spot.undock` through Formant. Waypoint navigation prefers stable
+  `waypoint_id` values from `spot.graphnav.overlay`.
+- Uses JSON command payloads with generated `request_id` values for navigation actions, then matches
+  those IDs against `spot.nav.state` so UI notices clear only when the adapter has accepted that request.
 
 By default the module depends on:
 
@@ -40,7 +44,7 @@ Recommended module configuration:
 
 `spot.graphnav.metadata` is intentionally not part of the default module contract. It can be too
 large for some downstream query paths. The adapter publishes `spot.graphnav.overlay` instead as a
-small UI-safe JSON stream for waypoint and edge rendering.
+small UI-safe JSON stream for waypoint IDs, labels, dock status, and edge rendering.
 
 ## Local development
 
