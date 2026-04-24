@@ -84,13 +84,7 @@ std::string json_escape(const std::string& in) {
   return out;
 }
 
-std::string trim_copy(const std::string& in) {
-  size_t begin = 0;
-  while (begin < in.size() && std::isspace(static_cast<unsigned char>(in[begin]))) ++begin;
-  size_t end = in.size();
-  while (end > begin && std::isspace(static_cast<unsigned char>(in[end - 1]))) --end;
-  return in.substr(begin, end - begin);
-}
+std::string trim_copy(const std::string& in);
 
 void skip_json_ws(const std::string& input, size_t* pos) {
   if (!pos) return;
