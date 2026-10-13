@@ -174,6 +174,23 @@ target_include_directories(graphnav-map-render-test PRIVATE
 
 add_test(NAME graphnav-map-render-test COMMAND graphnav-map-render-test)
 
+add_executable(formant-agent-client-test
+  tests/formant_agent_client_test.cpp
+  src/formant_agent_client.cpp
+)
+
+target_include_directories(formant-agent-client-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_BINARY_DIR}/generated
+)
+
+target_link_libraries(formant-agent-client-test PRIVATE
+  formant_proto
+  Threads::Threads
+)
+
+add_test(NAME formant-agent-client-test COMMAND formant-agent-client-test)
+
 # The supported service deployment path for a source checkout is scripts/deploy.sh,
 # which generates a checkout-specific unit file. Keep cmake --install limited to
 # the binary and example configuration artifacts.

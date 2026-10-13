@@ -82,6 +82,14 @@ All commands are namespaced `spot.*`.
 
 - Formant stream throttling (`grpc_code=8`) can hide diagnostics in cloud streams, especially
   `spot.adapter.log`. Local adapter stdout/stderr remains the most reliable debug source.
+- The adapter slows a stream down when the agent pushes back on it. Three things count: an
+  explicit throttle (`grpc_code=8`), a post that times out (`grpc_code=4`, what a saturated
+  agent returns), and three `UNAVAILABLE` failures in a row (`grpc_code=14`). The log line says
+  which with `reason=`. Timeouts and unavailability back a stream off to at most one post per
+  5 seconds and each accepted post halves the interval, so a single timeout costs about a
+  second of reduced rate. Explicit throttles can go to 30 seconds and recover slowly, as before.
+- Commands, command responses, teleop and heartbeat streams use their own gRPC connection to
+  the agent, separate from telemetry and image posts.
 - If joystick mapping sends mostly zeros, robot behavior follows zeros regardless of hold logic.
   Expected joystick mapping is:
   - `linear.x` forward/back
