@@ -39,6 +39,13 @@ bash -n scripts/*.sh
 python3 -m py_compile scripts/*.py
 ```
 
+Unit tests need no robot. After `./scripts/build.sh`:
+
+```bash
+cmake --build build --target graphnav-map-render-test formant-agent-client-test
+(cd build && ctest --output-on-failure)
+```
+
 If you are not working on a Jetson or do not have access to a Spot robot, that
 is fine, but say so clearly in your change notes. Do not claim hardware
 verification you did not perform.

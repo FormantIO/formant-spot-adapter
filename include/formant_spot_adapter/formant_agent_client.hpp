@@ -11,6 +11,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include "formant_spot_adapter/post_backoff.hpp"
 #include "protos/agent/v1/agent.pb.h"
 #include "protos/agent/v1/agent.grpc.pb.h"
 #include "protos/model/v1/commands.pb.h"
@@ -61,6 +62,8 @@ class FormantAgentClient {
     long long last_success_ms{0};
     int learned_interval_ms{0};
     int success_streak{0};
+    int consecutive_unavailable{0};
+    bool inferred_overload{false};
   };
 
   long long NowMs() const;
@@ -72,7 +75,11 @@ class FormantAgentClient {
                                const char* method_name);
 
   std::string target_;
-  std::unique_ptr<v1::agent::Agent::Stub> stub_;
+  // Telemetry and image posts. High volume, allowed to back up.
+  std::unique_ptr<v1::agent::Agent::Stub> data_stub_;
+  // Commands, command responses, teleop and heartbeat streams. Own connection so
+  // a telemetry flood on data_stub_ cannot delay them.
+  std::unique_ptr<v1::agent::Agent::Stub> control_stub_;
   std::atomic<bool> stop_{false};
   std::thread teleop_thread_;
   std::thread command_thread_;

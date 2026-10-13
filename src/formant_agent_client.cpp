@@ -8,24 +8,81 @@ namespace fsa {
 
 namespace {
 
-constexpr int kThrottleInitialBackoffMs = 500;
-constexpr int kThrottleMaxBackoffMs = 30000;
-constexpr int kThrottlePaddingMinMs = 100;
 constexpr int kSuccessesBeforeSpeedup = 8;
 constexpr int kSpeedupMinStepMs = 50;
 
-bool is_throttle_status(const grpc::Status& status) {
-  if (status.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED) return true;
-  const std::string message = status.error_message();
-  return message.find("throttl") != std::string::npos ||
-         message.find("rate limit") != std::string::npos;
+// gRPC reuses one TCP connection for channels that have the same target and the
+// same arguments. A distinct argument gives each role its own connection, so a
+// flood of image posts cannot queue in front of commands and teleop.
+std::shared_ptr<grpc::Channel> make_channel(const std::string& target, const char* role) {
+  grpc::ChannelArguments args;
+  args.SetString("fsa.channel_role", role);
+  return grpc::CreateCustomChannel(target, grpc::InsecureChannelCredentials(), args);
 }
 
 }  // namespace
 
+PostPressure ClassifyPostFailure(grpc::StatusCode code, const std::string& message) {
+  if (code == grpc::StatusCode::RESOURCE_EXHAUSTED) return PostPressure::kThrottled;
+  if (message.find("throttl") != std::string::npos ||
+      message.find("rate limit") != std::string::npos) {
+    return PostPressure::kThrottled;
+  }
+  if (code == grpc::StatusCode::DEADLINE_EXCEEDED) return PostPressure::kDeadlineExceeded;
+  if (code == grpc::StatusCode::UNAVAILABLE) return PostPressure::kUnavailable;
+  return PostPressure::kNone;
+}
+
+const char* PostPressureName(PostPressure pressure) {
+  switch (pressure) {
+    case PostPressure::kThrottled:
+      return "throttled";
+    case PostPressure::kDeadlineExceeded:
+      return "deadline_exceeded";
+    case PostPressure::kUnavailable:
+      return "unavailable";
+    case PostPressure::kNone:
+      break;
+  }
+  return "none";
+}
+
+int NextBackoffIntervalMs(PostPressure pressure, int current_interval_ms,
+                          long long ms_since_last_success) {
+  const int current_ms = std::max(0, current_interval_ms);
+  if (pressure == PostPressure::kNone) return current_ms;
+
+  int candidate_ms =
+      current_ms > 0
+          ? current_ms + std::max(kThrottlePaddingMinMs, current_ms / 2)
+          : kThrottleInitialBackoffMs;
+  if (pressure == PostPressure::kThrottled && ms_since_last_success > 0) {
+    // The gap since the last accepted post approximates the rate the agent is
+    // enforcing. Clamp before narrowing: the gap is unbounded.
+    const long long observed_ms =
+        std::min<long long>(ms_since_last_success, kThrottleMaxBackoffMs);
+    const int padded_ms = static_cast<int>(observed_ms) +
+                          std::max(kThrottlePaddingMinMs, static_cast<int>(observed_ms) / 4);
+    candidate_ms = std::max(candidate_ms, padded_ms);
+  }
+
+  // An inferred overload must not undo a longer interval already learned from an
+  // explicit throttle on the same stream.
+  const int cap_ms = pressure == PostPressure::kThrottled
+                         ? kThrottleMaxBackoffMs
+                         : std::max(kOverloadMaxBackoffMs, current_ms);
+  return std::min(cap_ms, candidate_ms);
+}
+
+int OverloadRecoveryIntervalMs(int current_interval_ms) {
+  const int halved_ms = std::max(0, current_interval_ms) / 2;
+  return halved_ms < kThrottlePaddingMinMs ? 0 : halved_ms;
+}
+
 FormantAgentClient::FormantAgentClient(const std::string& target)
     : target_(target),
-      stub_(v1::agent::Agent::NewStub(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()))) {
+      data_stub_(v1::agent::Agent::NewStub(make_channel(target, "data"))),
+      control_stub_(v1::agent::Agent::NewStub(make_channel(target, "control"))) {
   std::cerr << "[formant] target=" << target_ << std::endl;
 }
 
@@ -67,7 +124,14 @@ void FormantAgentClient::RecordPostSuccess(const std::string& stream) {
   std::lock_guard<std::mutex> lk(throttle_mu_);
   auto& state = stream_throttle_state_[stream];
   state.last_success_ms = now;
-  if (state.learned_interval_ms > 0) {
+  state.consecutive_unavailable = 0;
+  if (state.learned_interval_ms > 0 && state.inferred_overload) {
+    state.learned_interval_ms = OverloadRecoveryIntervalMs(state.learned_interval_ms);
+    state.inferred_overload = state.learned_interval_ms > 0;
+    state.success_streak = 0;
+    state.next_allowed_ms =
+        state.learned_interval_ms > 0 ? now + state.learned_interval_ms : 0;
+  } else if (state.learned_interval_ms > 0) {
     state.success_streak += 1;
     if (state.success_streak >= kSuccessesBeforeSpeedup) {
       const int speedup_ms =
@@ -87,39 +151,46 @@ FormantAgentClient::PostResult FormantAgentClient::RecordPostFailure(
     const std::string& stream, const grpc::Status& status, const char* method_name) {
   PostResult result;
   result.grpc_code = static_cast<int>(status.error_code());
-  if (is_throttle_status(status)) {
+  PostPressure pressure = ClassifyPostFailure(status.error_code(), status.error_message());
+  int learned_interval_ms = 0;
+  {
     const long long now = NowMs();
-    int learned_interval_ms = kThrottleInitialBackoffMs;
-    {
-      std::lock_guard<std::mutex> lk(throttle_mu_);
-      auto& state = stream_throttle_state_[stream];
-      const int current_interval_ms = std::max(0, state.learned_interval_ms);
-      int candidate_interval_ms =
-          current_interval_ms > 0
-              ? std::min(kThrottleMaxBackoffMs,
-                         current_interval_ms + std::max(kThrottlePaddingMinMs,
-                                                        current_interval_ms / 2))
-              : kThrottleInitialBackoffMs;
-      if (state.last_success_ms > 0 && now > state.last_success_ms) {
-        const int observed_interval_ms = static_cast<int>(now - state.last_success_ms);
-        const int padded_interval_ms =
-            observed_interval_ms +
-            std::max(kThrottlePaddingMinMs, observed_interval_ms / 4);
-        candidate_interval_ms =
-            std::max(candidate_interval_ms, padded_interval_ms);
+    std::lock_guard<std::mutex> lk(throttle_mu_);
+    auto& state = stream_throttle_state_[stream];
+    if (pressure == PostPressure::kUnavailable) {
+      state.consecutive_unavailable += 1;
+      if (state.consecutive_unavailable < kUnavailableFailuresBeforeBackoff) {
+        pressure = PostPressure::kNone;
       }
-      learned_interval_ms =
-          std::min(kThrottleMaxBackoffMs, candidate_interval_ms);
+    } else {
+      state.consecutive_unavailable = 0;
+    }
+    if (pressure != PostPressure::kNone) {
+      const long long ms_since_last_success =
+          state.last_success_ms > 0 && now > state.last_success_ms
+              ? now - state.last_success_ms
+              : 0;
+      // An interval stays "inferred" only while no explicit throttle has
+      // contributed to it; an explicit throttle keeps its slower recovery.
+      state.inferred_overload =
+          pressure != PostPressure::kThrottled &&
+          (state.learned_interval_ms <= 0 || state.inferred_overload);
+      learned_interval_ms = NextBackoffIntervalMs(
+          pressure, state.learned_interval_ms, ms_since_last_success);
       state.learned_interval_ms = learned_interval_ms;
       state.success_streak = 0;
       state.next_allowed_ms = now + learned_interval_ms;
       result.retry_after_ms = state.next_allowed_ms;
+      result.throttled = true;
     }
-    result.throttled = true;
+  }
+
+  if (result.throttled) {
     std::cerr << "[formant] " << method_name
               << " throttled stream=" << stream
               << " target=" << target_
               << " grpc_code=" << result.grpc_code
+              << " reason=" << PostPressureName(pressure)
               << " learned_interval_ms=" << learned_interval_ms
               << " msg=" << status.error_message() << std::endl;
     return result;
@@ -150,7 +221,7 @@ FormantAgentClient::PostResult FormantAgentClient::PostImage(
   ctx.set_deadline(std::chrono::system_clock::now() +
                    std::chrono::milliseconds(clamped_timeout_ms));
   v1::agent::PostDataResponse resp;
-  auto s = stub_->PostData(&ctx, dp, &resp);
+  auto s = data_stub_->PostData(&ctx, dp, &resp);
   if (s.ok()) {
     RecordPostSuccess(stream);
     result.ok = true;
@@ -173,7 +244,7 @@ FormantAgentClient::PostResult FormantAgentClient::PostNumeric(
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
   v1::agent::PostDataResponse resp;
-  auto s = stub_->PostData(&ctx, dp, &resp);
+  auto s = data_stub_->PostData(&ctx, dp, &resp);
   if (s.ok()) {
     RecordPostSuccess(stream);
     result.ok = true;
@@ -196,7 +267,7 @@ FormantAgentClient::PostResult FormantAgentClient::PostText(
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
   v1::agent::PostDataResponse resp;
-  auto s = stub_->PostData(&ctx, dp, &resp);
+  auto s = data_stub_->PostData(&ctx, dp, &resp);
   if (s.ok()) {
     RecordPostSuccess(stream);
     result.ok = true;
@@ -219,7 +290,7 @@ FormantAgentClient::PostResult FormantAgentClient::PostLocalization(
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(1000));
   v1::agent::PostDataResponse resp;
-  auto s = stub_->PostData(&ctx, dp, &resp);
+  auto s = data_stub_->PostData(&ctx, dp, &resp);
   if (s.ok()) {
     RecordPostSuccess(stream);
     result.ok = true;
@@ -246,7 +317,7 @@ FormantAgentClient::PostResult FormantAgentClient::PostBitset(
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
   v1::agent::PostDataResponse resp;
-  auto s = stub_->PostData(&ctx, dp, &resp);
+  auto s = data_stub_->PostData(&ctx, dp, &resp);
   if (s.ok()) {
     RecordPostSuccess(stream);
     result.ok = true;
@@ -256,7 +327,8 @@ FormantAgentClient::PostResult FormantAgentClient::PostBitset(
 }
 
 bool FormantAgentClient::SendCommandResponse(const std::string& request_id, bool success) {
-  std::lock_guard<std::mutex> lk(post_mu_);
+  // Deliberately not under post_mu_: a command response must not wait behind
+  // queued telemetry posts, each of which can hold that lock for its full deadline.
   v1::agent::SendCommandResponseRequest req;
   req.mutable_response()->set_request_id(request_id);
   req.mutable_response()->set_success(success);
@@ -264,7 +336,7 @@ bool FormantAgentClient::SendCommandResponse(const std::string& request_id, bool
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
   v1::agent::SendCommandResponseResponse resp;
-  auto s = stub_->SendCommandResponse(&ctx, req, &resp);
+  auto s = control_stub_->SendCommandResponse(&ctx, req, &resp);
   if (!s.ok()) {
     std::cerr << "[formant] SendCommandResponse failed target=" << target_
               << " grpc_code=" << static_cast<int>(s.error_code())
@@ -292,7 +364,7 @@ void FormantAgentClient::StartTeleopLoop(const std::vector<std::string>& stream_
       }
       v1::agent::GetTeleopControlDataStreamRequest req;
       for (const auto& f : stream_filter) req.add_stream_filter(f);
-      auto stream = stub_->GetTeleopControlDataStream(ctx.get(), req);
+      auto stream = control_stub_->GetTeleopControlDataStream(ctx.get(), req);
       if (on_stream_connected) on_stream_connected();
 
       v1::agent::GetTeleopControlDataStreamResponse msg;
@@ -336,7 +408,7 @@ void FormantAgentClient::StartCommandLoop(const std::vector<std::string>& comman
       }
       v1::agent::GetCommandRequestStreamRequest req;
       for (const auto& f : command_filter) req.add_command_filter(f);
-      auto stream = stub_->GetCommandRequestStream(ctx.get(), req);
+      auto stream = control_stub_->GetCommandRequestStream(ctx.get(), req);
       if (on_stream_connected) on_stream_connected();
 
       v1::agent::GetCommandRequestStreamResponse msg;
@@ -379,7 +451,7 @@ void FormantAgentClient::StartHeartbeatLoop(
         heartbeat_ctx_ = ctx;
       }
       v1::agent::GetTeleopHeartbeatStreamRequest req;
-      auto stream = stub_->GetTeleopHeartbeatStream(ctx.get(), req);
+      auto stream = control_stub_->GetTeleopHeartbeatStream(ctx.get(), req);
       if (on_stream_connected) on_stream_connected();
 
       v1::agent::GetTeleopHeartbeatStreamResponse msg;
@@ -424,7 +496,7 @@ bool FormantAgentClient::GetAppConfigMap(std::unordered_map<std::string, std::st
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(200));
   v1::agent::GetApplicationConfigurationRequest req;
   v1::agent::GetApplicationConfigurationResponse resp;
-  auto s = stub_->GetApplicationConfiguration(&ctx, req, &resp);
+  auto s = data_stub_->GetApplicationConfiguration(&ctx, req, &resp);
   if (!s.ok()) return false;
 
   const auto& m = resp.configuration().configuration_map();
