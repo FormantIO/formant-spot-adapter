@@ -1928,6 +1928,67 @@ bool SpotClient::CanDock(int dock_id, bool* out_can_dock) {
   return true;
 }
 
+bool SpotClient::GetDockFiducialSighting(int dock_id, DockFiducialSighting* out_sighting) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!out_sighting) return false;
+  *out_sighting = DockFiducialSighting{};
+  if (!EnsureWorldObjectClient()) return false;
+
+  ::bosdyn::api::ListWorldObjectRequest req;
+  req.add_object_type(::bosdyn::api::WORLD_OBJECT_APRILTAG);
+  auto wo = world_object_client_->ListWorldObjects(req);
+  if (!wo.status) {
+    SetLastError("ListWorldObjects failed: " + wo.status.DebugString());
+    return false;
+  }
+
+  // Both timestamps are on the robot's clock, so the age needs no time sync. If
+  // the service leaves the header time empty, fall back to the time-synced
+  // robot clock.
+  ::google::protobuf::Timestamp received = wo.response.header().request_received_timestamp();
+  if (received.seconds() <= 0 && EnsureTimeSync()) {
+    received = time_sync_endpoint_->RobotTimestampFromLocal(std::chrono::system_clock::now());
+  }
+  const bool has_received = received.seconds() > 0;
+
+  const ::bosdyn::api::WorldObject* best = nullptr;
+  for (const auto& obj : wo.response.world_objects()) {
+    if (!obj.has_apriltag_properties()) continue;
+    if (obj.apriltag_properties().tag_id() != dock_id) continue;
+    if (!best || obj.acquisition_time().seconds() > best->acquisition_time().seconds() ||
+        (obj.acquisition_time().seconds() == best->acquisition_time().seconds() &&
+         obj.acquisition_time().nanos() > best->acquisition_time().nanos())) {
+      best = &obj;
+    }
+  }
+  if (!best) return true;
+
+  out_sighting->found = true;
+  if (has_received && best->has_acquisition_time()) {
+    const double received_s = static_cast<double>(received.seconds()) + received.nanos() * 1e-9;
+    const double acquired_s = static_cast<double>(best->acquisition_time().seconds()) +
+                              best->acquisition_time().nanos() * 1e-9;
+    out_sighting->has_age = true;
+    out_sighting->age_sec = std::max(0.0, received_s - acquired_s);
+  }
+
+  // Position at detection time, from the filtered tag frame or else the raw one.
+  const auto& props = best->apriltag_properties();
+  for (const std::string* frame : {&props.frame_name_fiducial_filtered(), &props.frame_name_fiducial()}) {
+    ::bosdyn::api::SE3Pose body_tform_fiducial;
+    if (frame->empty() || !::bosdyn::api::get_a_tform_b(best->transforms_snapshot(), "body", *frame,
+                                                        &body_tform_fiducial)) {
+      continue;
+    }
+    out_sighting->has_position = true;
+    out_sighting->body_x = body_tform_fiducial.position().x();
+    out_sighting->body_y = body_tform_fiducial.position().y();
+    out_sighting->body_z = body_tform_fiducial.position().z();
+    break;
+  }
+  return true;
+}
+
 bool SpotClient::GetDockingStatus(int* out_status) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!out_status) return false;

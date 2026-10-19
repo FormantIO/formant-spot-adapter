@@ -20,6 +20,7 @@
 #include "bosdyn/client/sdk/client_sdk.h"
 #include "bosdyn/client/time_sync/time_sync_helpers.h"
 #include "bosdyn/client/world_objects/world_object_client.h"
+#include "formant_spot_adapter/dock_preflight.hpp"
 #include "formant_spot_adapter/spot_check_client.hpp"
 
 namespace fsa {
@@ -268,6 +269,10 @@ class SpotClient {
   bool DiscoverSingleDockId(int* out_dock_id);
   bool GetDockingStatus(int* out_status);
   bool CanDock(int dock_id, bool* out_can_dock);
+  // Looks up the dock's AprilTag (tag id == dock id) in the world-object list.
+  // Returns false only if the query itself failed; a tag that is not listed is
+  // reported as found=false.
+  bool GetDockFiducialSighting(int dock_id, DockFiducialSighting* out_sighting);
   bool AutoDock(int dock_id, int attempts, int poll_ms, int command_timeout_sec);
   bool Undock(int poll_ms, int command_timeout_sec);
   void RequestDockCancel();

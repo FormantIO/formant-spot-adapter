@@ -221,6 +221,14 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_dock_attempts()) c->dock_attempts = j.dock_attempts().value();
   if (j.has_dock_poll_ms()) c->dock_poll_ms = j.dock_poll_ms().value();
   if (j.has_dock_command_timeout_sec()) c->dock_command_timeout_sec = j.dock_command_timeout_sec().value();
+  if (j.has_dock_preflight_max_fiducial_age_sec()) {
+    c->dock_preflight_max_fiducial_age_sec = j.dock_preflight_max_fiducial_age_sec().value();
+  }
+  if (j.has_dock_preflight_max_distance_m()) {
+    c->dock_preflight_max_distance_m = j.dock_preflight_max_distance_m().value();
+  }
+  if (j.has_dock_home_alias()) c->dock_home_alias = j.dock_home_alias().value();
+  if (j.has_dock_preflight_wait_sec()) c->dock_preflight_wait_sec = j.dock_preflight_wait_sec().value();
   if (j.has_arm_raise_x()) c->arm_raise_x = j.arm_raise_x().value();
   if (j.has_arm_raise_y()) c->arm_raise_y = j.arm_raise_y().value();
   if (j.has_arm_raise_z()) c->arm_raise_z = j.arm_raise_z().value();
@@ -368,6 +376,12 @@ Config load_config_from_env() {
   c.dock_attempts = getenv_int_or("DOCK_ATTEMPTS", c.dock_attempts);
   c.dock_poll_ms = getenv_int_or("DOCK_POLL_MS", c.dock_poll_ms);
   c.dock_command_timeout_sec = getenv_int_or("DOCK_COMMAND_TIMEOUT_SEC", c.dock_command_timeout_sec);
+  c.dock_preflight_max_fiducial_age_sec =
+      getenv_double_or("DOCK_PREFLIGHT_MAX_FIDUCIAL_AGE_SEC", c.dock_preflight_max_fiducial_age_sec);
+  c.dock_preflight_max_distance_m =
+      getenv_double_or("DOCK_PREFLIGHT_MAX_DISTANCE_M", c.dock_preflight_max_distance_m);
+  c.dock_home_alias = getenv_or("DOCK_HOME_ALIAS", c.dock_home_alias);
+  c.dock_preflight_wait_sec = getenv_double_or("DOCK_PREFLIGHT_WAIT_SEC", c.dock_preflight_wait_sec);
   c.arm_raise_x = getenv_double_or("ARM_RAISE_X", c.arm_raise_x);
   c.arm_raise_y = getenv_double_or("ARM_RAISE_Y", c.arm_raise_y);
   c.arm_raise_z = getenv_double_or("ARM_RAISE_Z", c.arm_raise_z);

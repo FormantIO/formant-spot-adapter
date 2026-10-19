@@ -129,6 +129,9 @@ class Adapter {
   bool TeleopSessionActive() const;
   void RequestDock();
   int ResolveDockId();
+  // Refuses to start AutoDock unless the dock's tag is in view and close enough.
+  // Logs the measurements either way. `tag` is "[dock]" or "[return_and_dock]".
+  bool RunDockPreflight(const std::string& tag, int dock_id);
   void QueueStatusText(const std::string& stream, const std::string& value);
   void QueueStatusNumeric(const std::string& stream, double value);
   void QueueStatusBitset(const std::string& stream, const std::vector<std::pair<std::string, bool>>& bits);

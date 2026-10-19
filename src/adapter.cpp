@@ -5432,6 +5432,14 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
     return false;
   }
 
+  if (!RunDockPreflight(return_and_dock ? "[return_and_dock]" : "[dock]", dock_id)) {
+    if (!return_and_dock) {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      ClearDockWaypointCandidateLocked();
+    }
+    return false;
+  }
+
   docking_in_progress_ = true;
   moving_ = false;
   spot_.ZeroVelocity(1);
@@ -6073,6 +6081,40 @@ int Adapter::ResolveDockId() {
   return -1;
 }
 
+bool Adapter::RunDockPreflight(const std::string& tag, int dock_id) {
+  DockPreflightLimits limits;
+  limits.max_fiducial_age_sec = cfg_.dock_preflight_max_fiducial_age_sec;
+  limits.max_distance_m = cfg_.dock_preflight_max_distance_m;
+
+  limits.wait_sec = cfg_.dock_preflight_wait_sec;
+
+  // Look again until the deadline: right after a turn the tag can be out of view
+  // for a moment, and one failed query should not cost the dock.
+  const long long deadline_ms = now_ms() + static_cast<long long>(std::max(0.0, limits.wait_sec) * 1000.0);
+  DockPreflightResult result;
+  std::string query_error;
+  while (true) {
+    DockFiducialSighting sighting;
+    if (limits.max_fiducial_age_sec > 0.0 && !spot_.GetDockFiducialSighting(dock_id, &sighting)) {
+      query_error = spot_.LastError();
+      result = DockPreflightResult{};
+      result.reason = "could not check fiducial " + std::to_string(dock_id) + ": " + query_error;
+    } else {
+      result = EvaluateDockPreflight(dock_id, sighting, limits);
+    }
+    if (result.ok || now_ms() >= deadline_ms || !running_.load()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  }
+  if (!result.ok) {
+    EmitLog(tag + " refused: " + result.reason +
+            (result.detail.empty() ? "" : " (" + result.detail + ")"));
+    return false;
+  }
+  EmitLog(tag + " preflight ok dock_id=" + std::to_string(dock_id) +
+          (result.detail.empty() ? "" : " " + result.detail));
+  return true;
+}
+
 void Adapter::DockLoop() {
   auto navigate_with_recovery = [this](const std::string& waypoint_id,
                                        uint32_t* out_command_id) -> bool {
@@ -6210,6 +6252,14 @@ void Adapter::DockLoop() {
     if (!can_dock) {
       EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
               " dock unavailable id=" + std::to_string(dock_id));
+      continue;
+    }
+
+    if (!RunDockPreflight(return_and_dock ? "[return_and_dock]" : "[dock]", dock_id)) {
+      if (!return_and_dock) {
+        std::lock_guard<std::mutex> lk(map_mu_);
+        ClearDockWaypointCandidateLocked();
+      }
       continue;
     }
 
@@ -7307,6 +7357,8 @@ void Adapter::CaptureDockWaypointCandidate() {
 void Adapter::CommitDockWaypointCandidateOnSuccess() {
   std::string map_id;
   std::string waypoint_id;
+  std::string previous_dock_waypoint;
+  DockAliasSync alias_sync;
   bool stage_only = false;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
@@ -7314,11 +7366,25 @@ void Adapter::CommitDockWaypointCandidateOnSuccess() {
     waypoint_id = pending_dock_candidate_waypoint_id_;
     ClearDockWaypointCandidateLocked();
     if (map_id.empty() || waypoint_id.empty()) return;
+    previous_dock_waypoint = EffectiveDockWaypointForMapLocked(map_id);
     if (MappingSessionAppliesToMapLocked(map_id)) {
       mapping_session_.staged_dock_waypoint_id = waypoint_id;
       stage_only = true;
     } else {
       dock_waypoint_by_map_[map_id] = waypoint_id;
+    }
+    // Move the human/agent name for the dock-home along with it, so "goto charging
+    // dock" and return_and_dock stay on the same waypoint. Only when the name was
+    // missing or already on the old dock-home.
+    alias_sync = DecideDockAliasSync(EffectiveWaypointAliasesForMapLocked(map_id), cfg_.dock_home_alias,
+                                     previous_dock_waypoint, waypoint_id);
+    if (alias_sync.write) {
+      if (stage_only) {
+        mapping_session_.staged_alias_deletes.erase(alias_sync.key);
+        mapping_session_.staged_alias_upserts[alias_sync.key] = waypoint_id;
+      } else {
+        waypoint_aliases_by_map_[map_id][alias_sync.key] = waypoint_id;
+      }
     }
   }
   if (!SaveAdapterMapState()) {
@@ -7327,6 +7393,12 @@ void Adapter::CommitDockWaypointCandidateOnSuccess() {
   RefreshGraphNavMetadataForMap(map_id);
   EmitLog(std::string("[dock] dock waypoint ") + (stage_only ? "staged" : "saved") +
           " map_id=" + map_id + " waypoint_id=" + waypoint_id);
+  if (alias_sync.write) {
+    EmitLog("[dock] alias \"" + alias_sync.key + "\" now points at the dock waypoint" +
+            (alias_sync.previous.empty() ? std::string("") : " (was " + alias_sync.previous + ")"));
+  } else if (!alias_sync.conflict.empty()) {
+    EmitLog("[dock] warning: " + alias_sync.conflict);
+  }
 }
 
 std::string Adapter::BuildWaypointTextLocked() const {

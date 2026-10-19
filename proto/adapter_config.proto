@@ -49,6 +49,10 @@ message AdapterConfig {
   google.protobuf.Int32Value dock_attempts = 31;
   google.protobuf.Int32Value dock_poll_ms = 32;
   google.protobuf.Int32Value dock_command_timeout_sec = 33;
+  google.protobuf.DoubleValue dock_preflight_max_fiducial_age_sec = 102;
+  google.protobuf.DoubleValue dock_preflight_max_distance_m = 103;
+  google.protobuf.StringValue dock_home_alias = 104;
+  google.protobuf.DoubleValue dock_preflight_wait_sec = 105;
   google.protobuf.DoubleValue arm_raise_x = 34;
   google.protobuf.DoubleValue arm_raise_y = 35;
   google.protobuf.DoubleValue arm_raise_z = 36;

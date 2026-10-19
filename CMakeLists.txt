@@ -128,6 +128,7 @@ add_executable(formant-spot-adapter
   src/graphnav_map_render.cpp
   src/spot_client.cpp
   src/spot_check_client.cpp
+  src/dock_preflight.cpp
   src/adapter.cpp
 )
 
@@ -190,6 +191,17 @@ target_link_libraries(formant-agent-client-test PRIVATE
 )
 
 add_test(NAME formant-agent-client-test COMMAND formant-agent-client-test)
+
+add_executable(dock-preflight-test
+  tests/dock_preflight_test.cpp
+  src/dock_preflight.cpp
+)
+
+target_include_directories(dock-preflight-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME dock-preflight-test COMMAND dock-preflight-test)
 
 # The supported service deployment path for a source checkout is scripts/deploy.sh,
 # which generates a checkout-specific unit file. Keep cmake --install limited to

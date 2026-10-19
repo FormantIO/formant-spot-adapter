@@ -104,6 +104,13 @@ struct Config {
   int dock_attempts{3};
   int dock_poll_ms{1000};
   int dock_command_timeout_sec{30};
+  // Pre-dock preflight (see dock_preflight.hpp). Age 0 or less disables it.
+  double dock_preflight_max_fiducial_age_sec{5.0};
+  double dock_preflight_max_distance_m{5.0};
+  double dock_preflight_wait_sec{4.0};
+  // Waypoint alias kept equal to the dock-home after every successful dock.
+  // Empty disables the sync.
+  std::string dock_home_alias{"charging dock"};
 
   // Saved "raised" hand pose in body frame. Set in config JSON.
   double arm_raise_x{0.0};
