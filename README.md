@@ -152,13 +152,26 @@ Additional non-GraphNav command-channel actions:
 - `spot.sit`: sit command; command path does not require active teleop heartbeat.
 - `spot.recover`: self-right command; command path does not require active teleop heartbeat.
 - `spot.dock`: run autodock procedure; command path does not require active teleop heartbeat.
+  - Refused before the robot moves unless the dock's AprilTag (tag id = dock id) was detected
+    within `dock_preflight_max_fiducial_age_sec` (default 5 s) and is within
+    `dock_preflight_max_distance_m` (default 5 m). It keeps looking for up to
+    `dock_preflight_wait_sec` (default 4 s) before refusing, so a tag that is briefly out of view
+    after a turn does not cost the dock. The refusal is logged with the reason, the tag's age,
+    distance and bearing. Set the age limit to 0 to turn the preflight off. The same
+    preflight runs for `spot.return_and_dock` (after it reaches the dock waypoint) and the teleop
+    dock button. Every allowed dock also logs these measurements (`preflight ok ...`).
 - `spot.undock`: undock from the current dock and move to prep pose; command path does not require active teleop heartbeat.
   - No parameters.
   - Fails if the robot is not currently docked.
 - `spot.return_and_dock`: navigate to saved dock waypoint for active map, then run dock.
   - No parameters.
   - Fails if no dock waypoint is saved yet for the active/default map.
-  - Successful manual `spot.dock` learns/saves current localized waypoint as dock waypoint.
+  - Successful manual `spot.dock` learns/saves current localized waypoint as dock waypoint. If
+    the `dock_home_alias` waypoint name (default `charging dock`, matched ignoring case) is missing
+    or was on the old dock waypoint, it moves to the new one, so
+    `spot.waypoint.goto name="charging dock"` and `spot.return_and_dock` keep going to the same
+    place. A name that points somewhere else is left alone and a warning is logged. Set
+    `dock_home_alias` to `""` in the JSON config to turn the sync off.
 - `spot.rotate_left`: rotate left in place by a requested angle. Parameter: `degrees`.
 - `spot.rotate_right`: rotate right in place by a requested angle. Parameter: `degrees`.
 - `spot.reset_arm`: explicit arm reset/stow; command path does not require active teleop heartbeat.
