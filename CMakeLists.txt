@@ -126,6 +126,7 @@ add_executable(formant-spot-adapter
   src/config.cpp
   src/formant_agent_client.cpp
   src/graphnav_map_render.cpp
+  src/command_params.cpp
   src/spot_client.cpp
   src/spot_check_client.cpp
   src/dock_preflight.cpp
@@ -163,6 +164,17 @@ target_link_libraries(image-pull-benchmark PRIVATE
 )
 
 enable_testing()
+
+add_executable(command-params-test
+  tests/command_params_test.cpp
+  src/command_params.cpp
+)
+
+target_include_directories(command-params-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME command-params-test COMMAND command-params-test)
 
 add_executable(graphnav-map-render-test
   tests/graphnav_map_render_test.cpp

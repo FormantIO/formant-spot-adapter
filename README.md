@@ -142,6 +142,11 @@ value in `streamControls`.
 
 All commands are namespaced as `spot.*` and accept optional text parameters.
 
+Parameter text is `key=value` pairs separated by `,` `;` or newlines, or a JSON object. A
+command's main parameter can also be given as a bare value (`kitchen` instead of
+`name=kitchen`). A parameter that is not present is treated as missing: text meant for one
+parameter is never used as the value of another.
+
 Additional non-GraphNav command-channel actions:
 - `spot.stand`: stand command; command path does not require active teleop heartbeat.
 - `spot.sit`: sit command; command path does not require active teleop heartbeat.
