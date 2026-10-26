@@ -138,8 +138,6 @@ class Adapter {
   bool HandleMapCommand(const v1::model::CommandRequest& request);
   bool HandleWaypointCommand(const v1::model::CommandRequest& request);
   bool ExtractCommandText(const v1::model::CommandRequest& request, std::string* out) const;
-  std::string ExtractParam(const std::string& input,
-                           const std::vector<std::string>& keys) const;
   bool LoadAdapterMapState();
   bool SaveAdapterMapState();
   void ClearMappingSessionLocked();

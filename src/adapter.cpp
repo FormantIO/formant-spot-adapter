@@ -1,4 +1,5 @@
 #include "formant_spot_adapter/adapter.hpp"
+#include "formant_spot_adapter/command_params.hpp"
 #include "formant_spot_adapter/graphnav_map_render.hpp"
 
 #include <algorithm>
@@ -5028,15 +5029,15 @@ bool Adapter::ExecuteWaypointGotoCommand(const v1::model::CommandRequest& reques
   if (!EnsureLeaseForCommand("spot.waypoint.goto")) return false;
   std::string text;
   (void)ExtractCommandText(request, &text);
-  const std::string requested_map_uuid = Trim(ExtractParam(text, {"map_uuid"}));
+  const std::string requested_map_uuid = Trim(ExtractCommandParam(text, {"map_uuid"}));
   std::string map_id;
   std::string map_uuid;
   if (!ValidateGraphNavCommandMapUuid("spot.waypoint.goto", requested_map_uuid, false,
                                       &map_id, &map_uuid)) {
     return false;
   }
-  std::string waypoint_id = Trim(ExtractParam(text, {"waypoint_id"}));
-  std::string name = Trim(ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"}));
+  std::string waypoint_id = Trim(ExtractCommandParam(text, {"waypoint_id"}));
+  std::string name = Trim(ExtractCommandParamOrBareValue(text, {"name", "waypoint", "waypoint_name", "alias"}));
   if (waypoint_id.empty() && name.empty()) {
     EmitLog("[graphnav] spot.waypoint.goto rejected: missing waypoint_id or waypoint name");
     return false;
@@ -5091,15 +5092,15 @@ bool Adapter::ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest
   if (!EnsureLeaseForCommand("spot.waypoint.goto_straight")) return false;
   std::string text;
   (void)ExtractCommandText(request, &text);
-  const std::string requested_map_uuid = Trim(ExtractParam(text, {"map_uuid"}));
+  const std::string requested_map_uuid = Trim(ExtractCommandParam(text, {"map_uuid"}));
   std::string map_id;
   std::string map_uuid;
   if (!ValidateGraphNavCommandMapUuid("spot.waypoint.goto_straight", requested_map_uuid, false,
                                       &map_id, &map_uuid)) {
     return false;
   }
-  std::string waypoint_id = Trim(ExtractParam(text, {"waypoint_id"}));
-  std::string name = Trim(ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"}));
+  std::string waypoint_id = Trim(ExtractCommandParam(text, {"waypoint_id"}));
+  std::string name = Trim(ExtractCommandParamOrBareValue(text, {"name", "waypoint", "waypoint_name", "alias"}));
   if (waypoint_id.empty() && name.empty()) {
     EmitLog("[graphnav] spot.waypoint.goto_straight rejected: missing waypoint_id or waypoint name");
     return false;
@@ -5160,7 +5161,7 @@ bool Adapter::ExecuteGraphNavGotoPoseCommand(const v1::model::CommandRequest& re
   (void)ExtractCommandText(request, &text);
   std::string map_id;
   std::string map_uuid;
-  if (!ValidateGraphNavCommandMapUuid(action_name, Trim(ExtractParam(text, {"map_uuid"})), true,
+  if (!ValidateGraphNavCommandMapUuid(action_name, Trim(ExtractCommandParam(text, {"map_uuid"})), true,
                                       &map_id, &map_uuid)) {
     return false;
   }
@@ -5182,20 +5183,20 @@ bool Adapter::ExecuteGraphNavGotoPoseCommand(const v1::model::CommandRequest& re
 
   double seed_x = 0.0;
   double seed_y = 0.0;
-  if (!parse_double_value(ExtractParam(text, {"x", "seed_x"}), &seed_x) ||
-      !parse_double_value(ExtractParam(text, {"y", "seed_y"}), &seed_y)) {
+  if (!parse_double_value(ExtractCommandParam(text, {"x", "seed_x"}), &seed_x) ||
+      !parse_double_value(ExtractCommandParam(text, {"y", "seed_y"}), &seed_y)) {
     EmitLog("[graphnav] " + action_name + " rejected: missing x/y seed-frame goal");
     return false;
   }
 
   bool has_explicit_yaw = false;
   double seed_yaw_rad = 0.0;
-  if (parse_double_value(ExtractParam(text, {"yaw_rad", "yaw", "theta", "heading_rad"}),
+  if (parse_double_value(ExtractCommandParam(text, {"yaw_rad", "yaw", "theta", "heading_rad"}),
                          &seed_yaw_rad)) {
     has_explicit_yaw = true;
   } else {
     double seed_yaw_deg = 0.0;
-    if (parse_double_value(ExtractParam(text, {"yaw_deg", "heading_deg", "degrees"}),
+    if (parse_double_value(ExtractCommandParam(text, {"yaw_deg", "heading_deg", "degrees"}),
                            &seed_yaw_deg)) {
       has_explicit_yaw = true;
       seed_yaw_rad = seed_yaw_deg * 3.14159265358979323846 / 180.0;
@@ -5839,7 +5840,7 @@ bool Adapter::ExecuteRotateCommand(const v1::model::CommandRequest& request, boo
 
   std::string text;
   (void)ExtractCommandText(request, &text);
-  const std::string degrees_text = Trim(ExtractParam(text, {"degrees", "deg"}));
+  const std::string degrees_text = Trim(ExtractCommandParamOrBareValue(text, {"degrees", "deg"}));
   if (degrees_text.empty()) {
     EmitLog("[command] " + command_name + " rejected: missing required parameter degrees");
     return false;
@@ -6273,44 +6274,6 @@ bool Adapter::ExtractCommandText(const v1::model::CommandRequest& request, std::
     return true;
   }
   return false;
-}
-
-std::string Adapter::ExtractParam(const std::string& input, const std::vector<std::string>& keys) const {
-  const std::string trimmed = Trim(input);
-  if (trimmed.empty()) return "";
-  if (keys.empty()) return trimmed;
-
-  for (const auto& key : keys) {
-    const std::string quoted_key = "\"" + key + "\"";
-    size_t pos = trimmed.find(quoted_key);
-    if (pos != std::string::npos) {
-      pos = trimmed.find(':', pos + quoted_key.size());
-      if (pos != std::string::npos) {
-        ++pos;
-        while (pos < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[pos]))) ++pos;
-        if (pos < trimmed.size() && trimmed[pos] == '"') {
-          ++pos;
-          size_t end = trimmed.find('"', pos);
-          if (end != std::string::npos) return Trim(trimmed.substr(pos, end - pos));
-        } else {
-          size_t end = pos;
-          while (end < trimmed.size() && trimmed[end] != ',' && trimmed[end] != '}') ++end;
-          return Trim(trimmed.substr(pos, end - pos));
-        }
-      }
-    }
-
-    const std::string eq = key + "=";
-    pos = ToLower(trimmed).find(ToLower(eq));
-    if (pos != std::string::npos) {
-      pos += eq.size();
-      size_t end = trimmed.find_first_of(",;\n\r", pos);
-      if (end == std::string::npos) end = trimmed.size();
-      return Trim(trimmed.substr(pos, end - pos));
-    }
-  }
-
-  return trimmed;
 }
 
 std::string Adapter::MapDirectoryFor(const std::string& map_id) const {
@@ -7923,7 +7886,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       }
     }
 
-    std::string map_id = ExtractParam(text, {"name", "map_id", "map", "id"});
+    std::string map_id = ExtractCommandParamOrBareValue(text, {"name", "map_id", "map", "id"});
     map_id = sanitize_id_token(map_id);
     if (map_id.empty()) {
       EmitLog("[graphnav] map.create rejected: missing name");
@@ -7986,7 +7949,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
         return false;
       }
     }
-    std::string map_id = ExtractParam(text, {"map_id", "map", "id"});
+    std::string map_id = ExtractCommandParamOrBareValue(text, {"map_id", "map", "id"});
     map_id = sanitize_id_token(map_id);
     if (map_id.empty()) {
       EmitLog("[graphnav] map.load rejected: missing map_id");
@@ -8026,7 +7989,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
   }
 
   if (request.command() == "spot.map.set_default") {
-    std::string map_id = ExtractParam(text, {"map_id", "map", "id"});
+    std::string map_id = ExtractCommandParamOrBareValue(text, {"map_id", "map", "id"});
     map_id = sanitize_id_token(map_id);
     if (map_id.empty()) {
       EmitLog("[graphnav] map.set_default rejected: missing map_id");
@@ -8056,7 +8019,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
   }
 
   if (request.command() == "spot.map.delete") {
-    std::string map_id = ExtractParam(text, {"map_id", "map", "id"});
+    std::string map_id = ExtractCommandParamOrBareValue(text, {"map_id", "map", "id"});
     map_id = sanitize_id_token(map_id);
     if (map_id.empty()) {
       EmitLog("[graphnav] map.delete rejected: missing map_id");
@@ -8194,7 +8157,7 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
 bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
   std::string text;
   (void)ExtractCommandText(request, &text);
-  std::string name = Trim(ExtractParam(text, {"name", "waypoint", "waypoint_name", "alias"}));
+  std::string name = Trim(ExtractCommandParamOrBareValue(text, {"name", "waypoint", "waypoint_name", "alias"}));
 
   if (request.command() == "spot.waypoint.delete") {
     if (name.empty()) {
@@ -8260,6 +8223,12 @@ bool Adapter::HandleWaypointCommand(const v1::model::CommandRequest& request) {
   }
 
   if (request.command() == "spot.waypoint.save") {
+    if (name.empty() && !Trim(text).empty()) {
+      // Only auto-name when no parameter was given. Text that was meant to carry
+      // a name but did not parse should not become a silently renamed waypoint.
+      EmitLog("[graphnav] waypoint.save rejected: could not read a waypoint name from parameter");
+      return false;
+    }
     if (name.empty()) {
       name = "saved-" + std::to_string(now_ms());
       EmitLog(std::string("[graphnav] waypoint.save: auto-generated name=") + name);
