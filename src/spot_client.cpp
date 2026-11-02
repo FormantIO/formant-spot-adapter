@@ -1567,9 +1567,35 @@ bool SpotClient::UploadGraphMap(const StoredMap& map_data) {
 bool SpotClient::GetGraphWaypointCount(int* out_count) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!out_count) return false;
-  ::bosdyn::api::graph_nav::Graph graph;
-  if (!DownloadCurrentGraph(&graph)) return false;
-  *out_count = graph.waypoints_size();
+  if (!EnsureGraphNavRecordingClient()) return false;
+  auto r = graph_nav_recording_client_->GetRecordStatus();
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+  *out_count = r.response.map_stats().waypoints().count();
+  return true;
+}
+
+bool SpotClient::GetBodyLeaseOwner(std::string* out_client_name) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!out_client_name) return false;
+  if (!lease_client_) {
+    SetLastError("Lease client unavailable");
+    return false;
+  }
+  auto r = lease_client_->ListLeases();
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+  out_client_name->clear();
+  for (const auto& resource : r.response.resources()) {
+    if (resource.resource() == "body") {
+      *out_client_name = resource.lease_owner().client_name();
+      break;
+    }
+  }
   return true;
 }
 

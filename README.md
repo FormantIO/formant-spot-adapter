@@ -215,22 +215,26 @@ Additional non-GraphNav command-channel actions:
     visual-feature refinement (falls back to the point-cloud result if visual refinement fails).
   - Succeeds only when GraphNav returns `STATUS_OK`, its quality check returns
     `QUALITY_CHECK_SUCCESS`, and it reports no suspected ambiguity. GraphNav applies a `STATUS_OK`
-    localization even when the quality check fails; in that case the command fails and
-    navigation stays blocked (see below) until the localization is confirmed or replaced.
-  - No lease needed and the robot does not move. Rejected while navigating, mapping, or while the
-    map is still being restored. The result is published on `spot.nav.state`.
+    localization even when the quality check fails; in that case the command fails and the adapter
+    clears that localization the same way restart recovery does (below). If it cannot be cleared,
+    navigation stays blocked until it is confirmed or replaced.
+  - No lease needed for the localization itself and the robot does not move. Rejected while
+    navigating, mapping, while the map is still being restored, or while restart recovery runs.
+    The result is published on `spot.nav.state`.
 - `spot.localize.confirm`: an operator confirms the robot's current localization after checking
   its position on the map. Clears the navigation block described below. Fails if the robot is not
-  localized. No parameters.
+  localized or restart recovery is still running. A localization that failed GraphNav's own
+  checks and could not be cleared is only confirmed with `force=true`.
 
 Restart localization recovery:
 - The adapter saves the last confirmed localization (waypoint plus the robot's offset from it) to
   `<graphnav_store_dir>/last_localization.txt`, at most every 5 s and only when the waypoint
   changes or the robot moves 0.5 m / turns 15 deg. Nothing is saved while a restore is pending, a
   map is recording, or the localization is unconfirmed.
-- The map restore runs at adapter start and also while the adapter keeps running when Spot's
-  GraphNav graph is found empty (checked after every reconnect and every 30 s), which is what a
-  Spot body reboot looks like.
+- The map restore runs at adapter start. It also runs while the adapter keeps running after a
+  reconnect (a Spot body reboot drops the connection) when Spot's GraphNav map stats show an empty
+  graph on two checks 5 s apart within 2 minutes of the reconnect and no other client holds the
+  body lease. A graph another client cleared on purpose without a reconnect is left alone.
 - If the restore's nearest-fiducial localization fails because no fiducial is usable
   (`STATUS_NO_MATCHING_FIDUCIAL`, `FIDUCIAL_TOO_FAR_AWAY`, `FIDUCIAL_TOO_OLD`,
   `FIDUCIAL_POSE_UNCERTAIN`), the adapter tries SetLocalization once at the saved waypoint and
@@ -238,12 +242,19 @@ Restart localization recovery:
   before the reboot no longer exists). It is skipped when the saved record is for another map, its
   waypoint is gone, it is older than `localize_recovery_max_record_age_sec` (default 86400, 0 turns
   recovery off), or the restore ran more than `localize_recovery_max_restore_delay_sec` (default
-  60) after it was scheduled, for example because another client held the lease.
+  60) after it could first start (scheduled, or Spot's API answering after a power cycle,
+  whichever is later), for example because another client held the lease.
+- From the moment the restore's fiducial localization fails until recovery has finished,
+  navigation, `spot.localize`, `spot.localize.confirm` and saving the localization are refused, so
+  nothing can act on a pose recovery has applied but not yet accepted or cleared. Navigation is
+  also refused while a map restore is pending.
 - An accepted recovery leaves the localization unconfirmed (`localize_confirmed=false` on
   `spot.nav.state`). A recovery result that fails the quality or ambiguity check is cleared:
   GraphNav has no clear-localization call, so the adapter runs ClearGraph (which clears
   localization) and re-uploads the same map, leaving the robot on its map but unlocalized. This
-  needs the body lease; if it cannot be taken, the localization stays and is marked unconfirmed.
+  needs the body lease; if it cannot be taken, the localization stays and is marked unconfirmed
+  (confirming it then needs `force=true`). If the clear works but the re-upload fails, the normal
+  restore retries the upload without running recovery again.
 - While the localization is unconfirmed, GraphNav navigation (`spot.waypoint.goto`,
   `spot.waypoint.goto_straight`, `spot.graphnav.goto_pose`, `spot.graphnav.goto_pose_straight`,
   `spot.return_and_dock`, the teleop return-and-dock) is refused with a reason in the log. Each

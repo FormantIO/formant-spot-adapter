@@ -226,7 +226,8 @@ parameters documented in the repository `README.md`.
   quality check, or the reason it was rejected), and `localize_at_ms`.
 - `localize_confirmed`: false after an automatic restart recovery (or a rejected localization that
   could not be cleared) until `spot.localize.confirm`, a successful `spot.localize`, or a fiducial
-  localization. GraphNav navigation commands are refused while it is false.
+  localization, and also false while restart recovery is running. GraphNav navigation commands
+  are refused while it is false.
   `localize_unconfirmed_reason` explains why.
 
 - `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
@@ -449,7 +450,9 @@ parameters documented in the repository `README.md`.
 
 - `spot.localize.confirm` (command)
 - Operator confirms the current localization after an automatic restart recovery; clears the
-  navigation block (`localize_confirmed` becomes true). No parameters. Fails if not localized.
+  navigation block (`localize_confirmed` becomes true). Fails if not localized or while restart
+  recovery is running. Optional `force=true` is required to confirm a localization that failed
+  GraphNav's quality or ambiguity check and could not be cleared.
 
 Command response behavior:
 - Formant command responses are terminal; success/failure is returned when the action reaches completion.

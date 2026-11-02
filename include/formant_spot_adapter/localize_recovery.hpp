@@ -154,19 +154,31 @@ WaypointRecoveryPlan DecideWaypointRecovery(const WaypointRecoveryInputs& in);
 // Tracks whether the current localization came from an automatic guess that a
 // person has not confirmed. While unconfirmed, GraphNav navigation commands are
 // refused, because a wrong guess sends the robot to the wrong place.
+//
+// Restart recovery is bracketed by OnRecoveryStarted / OnRecoveryFinished. In
+// between, navigation, spot.localize, operator confirmation and saving the
+// localization are all refused, so nothing can act on (or overwrite) a pose
+// that recovery has applied but not yet judged or cleared.
 class LocalizationConfirmation {
  public:
-  bool confirmed() const { return confirmed_; }
+  bool confirmed() const { return state_ == State::kConfirmed && !recovery_in_progress_; }
+  bool recovery_in_progress() const { return recovery_in_progress_; }
   // Why it is unconfirmed, empty when confirmed.
-  const std::string& pending_reason() const { return pending_reason_; }
+  std::string pending_reason() const;
 
+  // Fiducial localization failed during a restore and recovery is about to run.
+  void OnRecoveryStarted();
+  // Recovery is done (attempted, skipped or failed). If nothing was applied the
+  // robot is simply unlocalized and there is nothing to confirm.
+  void OnRecoveryFinished();
   // Automatic restart recovery left the robot localized at `waypoint_id`.
   void OnAutomaticLocalization(const std::string& waypoint_id);
   // GraphNav applied a localization that failed its quality or ambiguity check
   // and it could not be cleared.
   void OnRejectedLocalization(const std::string& waypoint_id, const std::string& reason);
-  // An operator ran spot.localize.confirm while the robot was localized.
-  void OnOperatorConfirm();
+  // An operator ran spot.localize.confirm. Refused while recovery runs, and for a
+  // rejected localization unless `force`. Returns false with `refusal` set.
+  bool TryOperatorConfirm(bool force, std::string* refusal);
   // A person chose the waypoint with spot.localize and it was accepted.
   void OnOperatorLocalize();
   // Fiducial localization succeeded; the dock tag fixes the pose independently.
@@ -174,12 +186,19 @@ class LocalizationConfirmation {
   // The robot has no localization any more (graph cleared or re-uploaded).
   void OnLocalizationCleared();
 
-  // Empty when `action` may run; otherwise an operator-facing refusal.
+  // Empty when `action` (a navigation command) may run; otherwise a refusal.
   std::string NavigationBlockReason(const std::string& action) const;
+  // Empty when spot.localize may run; otherwise a refusal.
+  std::string LocalizeCommandBlockReason() const;
+  // Whether the current localization may be saved for the next restart.
+  bool AllowsPersist() const { return confirmed(); }
 
  private:
-  bool confirmed_{true};
-  std::string pending_reason_;
+  enum class State { kConfirmed, kRecovering, kAutomatic, kRejected };
+  State state_{State::kConfirmed};
+  bool recovery_in_progress_{false};
+  std::string waypoint_id_;
+  std::string rejection_;
 };
 
 }  // namespace fsa

@@ -4110,6 +4110,20 @@ void Adapter::SetSpotConnected() {
   }
   if (!was_connected) {
     EmitLog("[spot] connection established");
+    const long long connected_ms = now_ms();
+    bool restore_pending = false;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      restore_pending = !pending_restore_map_id_.empty();
+    }
+    if (restore_pending) {
+      // The restore cannot start before Spot answers; after a whole-robot power
+      // cycle that can take minutes. Measure the restore delay from here.
+      restore_scheduled_ms_ = connected_ms;
+    }
+    first_empty_robot_graph_ms_ = 0;
+    last_robot_graph_check_ms_ = 0;
+    robot_graph_check_deadline_ms_ = connected_ms + 120000;
     check_robot_graph_after_connect_ = true;
   }
   const bool has_arm = spot_.HasArm();
@@ -4385,6 +4399,7 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
     next_map_restore_attempt_ms_ = now + 5000;
     return;
   }
+  graph_left_empty_by_adapter_ = false;
   {
     // A freshly uploaded graph carries no trusted localization yet.
     std::lock_guard<std::mutex> lk(nav_state_mu_);
@@ -4398,6 +4413,11 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
     fiducial_error = spot_.LastError();
     EmitLog(std::string("[graphnav] deferred restore localization warning map_id=") +
             restore_map_id + " error=" + fiducial_error);
+    // Block navigation, spot.localize, confirmation and saving from now until
+    // recovery has finished; the restore below clears pending_restore_map_id_
+    // before recovery runs.
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    localization_confirmation_.OnRecoveryStarted();
   }
   // Give the lease back before any recovery attempt; SetLocalization does not
   // need it, and recovery takes its own if it has to clear a rejected result.
@@ -4419,37 +4439,71 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
 
   if (!fiducial_error.empty()) {
     MaybeRecoverLocalizationAtLastWaypoint(restore_map_id, map_data, fiducial_error);
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    localization_confirmation_.OnRecoveryFinished();
   }
 }
 
 void Adapter::MaybeScheduleRestoreForEmptyRobotGraph(long long now) {
-  // A Spot body reboot clears GraphNav's graph while the adapter keeps running.
-  // Check after every reconnect and every 30 s; if the robot has no graph but the
-  // adapter has an active map with waypoints, schedule the same restore (and
-  // localization recovery) that runs at adapter start.
-  if (!SpotConnected()) return;
-  const bool after_connect = check_robot_graph_after_connect_.load();
-  if (!after_connect && (now - last_robot_graph_check_ms_.load()) < 30000) return;
+  // A Spot body reboot drops the connection and clears GraphNav's graph while the
+  // adapter keeps running. After each reconnect, look at the robot's map stats (no
+  // graph download) every 5 s for up to 2 minutes. Restore only if the graph is
+  // empty on two checks in a row and no other client holds the body lease, so a
+  // graph someone cleared on purpose from another client is left alone.
+  if (!check_robot_graph_after_connect_.load() || !SpotConnected()) return;
+  if (now > robot_graph_check_deadline_ms_.load()) {
+    check_robot_graph_after_connect_ = false;
+    return;
+  }
+  if ((now - last_robot_graph_check_ms_.load()) < 5000) return;
   last_robot_graph_check_ms_ = now;
-  check_robot_graph_after_connect_ = false;
 
   std::string map_id;
   {
     std::lock_guard<std::mutex> lk(map_mu_);
-    if (!pending_restore_map_id_.empty() || HasActiveMappingSessionLocked() ||
-        map_recording_active_.load()) {
+    if (!pending_restore_map_id_.empty()) {
+      check_robot_graph_after_connect_ = false;
+      return;
+    }
+    if (HasActiveMappingSessionLocked() || map_recording_active_.load()) {
+      check_robot_graph_after_connect_ = false;
       return;
     }
     map_id = active_map_id_;
     if (map_id.empty() || !graphnav_map_artifacts_ || graphnav_map_artifacts_->map_id != map_id ||
         graphnav_map_artifacts_->snapshot.waypoints.empty()) {
+      check_robot_graph_after_connect_ = false;
       return;
     }
   }
   int robot_waypoints = 0;
-  if (!spot_.GetGraphWaypointCount(&robot_waypoints)) return;
-  if (robot_waypoints > 0) return;
+  if (!spot_.GetGraphWaypointCount(&robot_waypoints)) return;  // GraphNav may still be booting
+  if (robot_waypoints > 0) {
+    check_robot_graph_after_connect_ = false;
+    first_empty_robot_graph_ms_ = 0;
+    return;
+  }
+  if (first_empty_robot_graph_ms_.load() == 0) {
+    first_empty_robot_graph_ms_ = now;
+    return;
+  }
+  check_robot_graph_after_connect_ = false;
+  first_empty_robot_graph_ms_ = 0;
   if (IsGraphNavNavigationActive()) return;
+  if (!lease_owned_.load()) {
+    std::string owner;
+    if (!spot_.GetBodyLeaseOwner(&owner)) {
+      EmitLog("[graphnav] robot graph is empty after reconnect but the lease owner is unknown (" +
+              spot_.LastError() + "); not restoring map_id=" + map_id);
+      return;
+    }
+    if (!owner.empty()) {
+      EmitLog("[graphnav] robot graph is empty after reconnect but the body lease is held by " +
+              owner + "; not restoring map_id=" + map_id +
+              " (another client may have cleared it on purpose)");
+      return;
+    }
+  }
 
   {
     std::lock_guard<std::mutex> lk(map_mu_);
@@ -4457,15 +4511,16 @@ void Adapter::MaybeScheduleRestoreForEmptyRobotGraph(long long now) {
     pending_restore_map_id_ = map_id;
   }
   restore_scheduled_ms_ = now;
-  waypoint_recovery_attempted_ = false;
+  // If the graph is empty because our own clear+re-upload failed, restore the
+  // map but do not run recovery again.
+  if (!graph_left_empty_by_adapter_.exchange(false)) waypoint_recovery_attempted_ = false;
   next_map_restore_attempt_ms_ = 0;
   {
     std::lock_guard<std::mutex> lk(nav_state_mu_);
     localization_confirmation_.OnLocalizationCleared();
   }
-  EmitLog("[graphnav] robot has no GraphNav graph (Spot rebooted?)" +
-          std::string(after_connect ? " after reconnect" : "") +
-          "; scheduling restore of map_id=" + map_id);
+  EmitLog("[graphnav] robot has no GraphNav graph after reconnect (Spot rebooted?); "
+          "scheduling restore of map_id=" + map_id);
 }
 
 void Adapter::PollGraphNavNavigation(long long now) {
@@ -5042,7 +5097,7 @@ void Adapter::MaybePersistLastLocalization(const SpotClient::LocalizationSnapsho
   {
     // Never save a guess nobody has confirmed; the next restart would reuse it.
     std::lock_guard<std::mutex> lk(nav_state_mu_);
-    if (!localization_confirmation_.confirmed()) return;
+    if (!localization_confirmation_.AllowsPersist()) return;
   }
   LastLocalization rec;
   {
@@ -5096,7 +5151,20 @@ bool Adapter::ClearRejectedLocalization(const std::string& map_id,
     temporary_lease = true;
   }
   bool ok = spot_.ClearGraph();
-  if (ok) ok = spot_.UploadGraphMap(map_data);
+  if (ok) {
+    ok = spot_.UploadGraphMap(map_data);
+    if (!ok) {
+      // The robot is now without a graph. Let the normal restore re-upload it;
+      // waypoint_recovery_attempted_ stays set so recovery does not run again.
+      graph_left_empty_by_adapter_ = true;
+      {
+        std::lock_guard<std::mutex> lk(map_mu_);
+        if (pending_restore_map_id_.empty()) pending_restore_map_id_ = map_id;
+      }
+      restore_scheduled_ms_ = now_ms();
+      next_map_restore_attempt_ms_ = now_ms() + 5000;
+    }
+  }
   if (!ok && out_error) *out_error = spot_.LastError();
   if (temporary_lease && !spot_.ReturnBodyLease()) {
     EmitLog("[graphnav] warning returning temporary lease after clearing localization map_id=" +
@@ -5224,6 +5292,14 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
     return false;
   };
   if (!params.error.empty()) return reject("", params.error);
+  {
+    std::string blocked;
+    {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      blocked = localization_confirmation_.LocalizeCommandBlockReason();
+    }
+    if (!blocked.empty()) return reject("", blocked);
+  }
   if (graphnav_navigation_active_.load()) {
     return reject("", "navigation is active; cancel it before relocalizing");
   }
@@ -5273,17 +5349,38 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
   SpotClient::WaypointLocalizeResult result;
   if (!spot_.SetLocalizationAtWaypoint(req, &result)) {
     const std::string error = spot_.LastError();
-    if (result.applied) {
-      // The robot now holds a localization we rejected; keep navigation blocked
-      // until someone confirms or replaces it.
+    if (!result.applied) {
+      EmitLog("[graphnav] " + action + " failed: " + error);
+      RecordLocalizeResult("command", false, waypoint_id,
+                           result.reason.empty() ? error : result.reason);
+      return false;
+    }
+    // GraphNav applied a localization we rejected. Clear it the same way restart
+    // recovery does; if that is impossible, keep navigation blocked.
+    SpotClient::StoredMap map_data;
+    std::string clear_error;
+    bool cleared = false;
+    if (LoadMapFromDisk(map_id, &map_data)) {
+      cleared = ClearRejectedLocalization(map_id, map_data, &clear_error);
+    } else {
+      clear_error = "could not read map " + map_id + " from disk";
+    }
+    {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
-      localization_confirmation_.OnRejectedLocalization(result.localized_waypoint_id,
-                                                        result.reason);
+      if (cleared) {
+        localization_confirmation_.OnLocalizationCleared();
+      } else {
+        localization_confirmation_.OnRejectedLocalization(result.localized_waypoint_id,
+                                                          result.reason);
+      }
     }
     EmitLog("[graphnav] " + action + " failed: " + error +
-            (result.applied ? "; navigation blocked until confirmed or replaced" : ""));
+            (cleared ? "; localization cleared, robot left unlocalized"
+                     : "; clearing it failed (" + clear_error +
+                           "), navigation blocked until confirmed or replaced"));
     RecordLocalizeResult("command", false, waypoint_id,
-                         result.reason.empty() ? error : result.reason);
+                         result.reason + (cleared ? "; localization cleared"
+                                                  : "; could not clear (" + clear_error + ")"));
     return false;
   }
   {
@@ -5297,8 +5394,12 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
   return true;
 }
 
-bool Adapter::ExecuteLocalizeConfirmCommand() {
+bool Adapter::ExecuteLocalizeConfirmCommand(const v1::model::CommandRequest& request) {
   const std::string action = "spot.localize.confirm";
+  std::string text;
+  (void)ExtractCommandText(request, &text);
+  const std::string force_text = ToLower(Trim(ExtractCommandParam(text, {"force"})));
+  const bool force = force_text == "true" || force_text == "1" || force_text == "yes";
   std::string waypoint_id;
   if (!spot_.GetLocalizationWaypointId(&waypoint_id)) {
     EmitLog("[graphnav] " + action + " rejected: robot is not localized");
@@ -5306,10 +5407,17 @@ bool Adapter::ExecuteLocalizeConfirmCommand() {
     return false;
   }
   bool was_confirmed = false;
+  bool ok = false;
+  std::string refusal;
   {
     std::lock_guard<std::mutex> lk(nav_state_mu_);
     was_confirmed = localization_confirmation_.confirmed();
-    localization_confirmation_.OnOperatorConfirm();
+    ok = localization_confirmation_.TryOperatorConfirm(force, &refusal);
+  }
+  if (!ok) {
+    EmitLog("[graphnav] " + action + " rejected: " + refusal);
+    RecordLocalizeResult("confirm", false, waypoint_id, refusal);
+    return false;
   }
   if (was_confirmed) {
     EmitLog("[graphnav] " + action + ": localization already confirmed waypoint_id=" +
@@ -5317,15 +5425,29 @@ bool Adapter::ExecuteLocalizeConfirmCommand() {
     return true;
   }
   EmitLog("[graphnav] " + action + ": operator confirmed localization waypoint_id=" +
-          waypoint_id + "; navigation allowed");
-  RecordLocalizeResult("confirm", true, waypoint_id, "operator confirmed");
+          waypoint_id + (force ? " (forced)" : "") + "; navigation allowed");
+  RecordLocalizeResult("confirm", true, waypoint_id,
+                       force ? "operator confirmed (forced)" : "operator confirmed");
   return true;
 }
 
 bool Adapter::EnsureLocalizationConfirmedForNavigation(const std::string& action_name) {
   {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (!pending_restore_map_id_.empty()) {
+      EmitLog("[graphnav] " + action_name + " refused: map " + pending_restore_map_id_ +
+              " is still being restored to the robot");
+      return false;
+    }
+  }
+  {
     std::lock_guard<std::mutex> lk(nav_state_mu_);
     if (localization_confirmation_.confirmed()) return true;
+    if (localization_confirmation_.recovery_in_progress()) {
+      const std::string reason = localization_confirmation_.NavigationBlockReason(action_name);
+      EmitLog("[graphnav] " + reason);
+      return false;
+    }
   }
   // A fiducial localization fixes the pose independently of the guess.
   if (spot_.SetLocalizationFiducial()) {
@@ -5970,7 +6092,7 @@ bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
   }
   if (command == "spot.graphnav.cancel") return ExecuteGraphNavCancelCommand();
   if (command == "spot.localize") return ExecuteLocalizeCommand(request);
-  if (command == "spot.localize.confirm") return ExecuteLocalizeConfirmCommand();
+  if (command == "spot.localize.confirm") return ExecuteLocalizeConfirmCommand(request);
   if (command.rfind("spot.waypoint.", 0) == 0) return HandleWaypointCommand(request);
   return false;
 }

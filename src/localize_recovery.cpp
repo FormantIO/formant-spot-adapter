@@ -333,45 +333,104 @@ LocalizeAcceptance EvaluateWaypointLocalization(const std::string& status,
   return a;
 }
 
+std::string LocalizationConfirmation::pending_reason() const {
+  if (recovery_in_progress_) return "restart localization recovery is in progress";
+  switch (state_) {
+    case State::kConfirmed:
+      return "";
+    case State::kRecovering:
+      return "restart localization recovery is in progress";
+    case State::kAutomatic:
+      return "localization at waypoint " + waypoint_id_ +
+             " was set automatically after a restart and is not confirmed";
+    case State::kRejected:
+      return "the robot holds a localization" +
+             (waypoint_id_.empty() ? std::string() : " at waypoint " + waypoint_id_) +
+             " that was rejected (" + rejection_ + ")";
+  }
+  return "";
+}
+
+void LocalizationConfirmation::OnRecoveryStarted() {
+  recovery_in_progress_ = true;
+  state_ = State::kRecovering;
+  waypoint_id_.clear();
+  rejection_.clear();
+}
+
+void LocalizationConfirmation::OnRecoveryFinished() {
+  recovery_in_progress_ = false;
+  if (state_ == State::kRecovering) state_ = State::kConfirmed;
+}
+
 void LocalizationConfirmation::OnAutomaticLocalization(const std::string& waypoint_id) {
-  confirmed_ = false;
-  pending_reason_ = "localization at waypoint " + waypoint_id +
-                    " was set automatically after a restart and is not confirmed";
+  state_ = State::kAutomatic;
+  waypoint_id_ = waypoint_id;
+  rejection_.clear();
 }
 
 void LocalizationConfirmation::OnRejectedLocalization(const std::string& waypoint_id,
                                                       const std::string& reason) {
-  confirmed_ = false;
-  pending_reason_ = "the robot holds a localization" +
-                    (waypoint_id.empty() ? std::string() : " at waypoint " + waypoint_id) +
-                    " that was rejected (" + reason + ")";
+  state_ = State::kRejected;
+  waypoint_id_ = waypoint_id;
+  rejection_ = reason;
 }
 
-void LocalizationConfirmation::OnOperatorConfirm() {
-  confirmed_ = true;
-  pending_reason_.clear();
+bool LocalizationConfirmation::TryOperatorConfirm(bool force, std::string* refusal) {
+  auto refuse = [&](const std::string& why) {
+    if (refusal) *refusal = why;
+    return false;
+  };
+  if (recovery_in_progress_ || state_ == State::kRecovering) {
+    return refuse("restart localization recovery is in progress; wait for it to finish");
+  }
+  if (state_ == State::kRejected && !force) {
+    return refuse(pending_reason() +
+                  "; GraphNav's own checks failed, so confirming needs force=true (or run "
+                  "spot.localize at the right waypoint)");
+  }
+  state_ = State::kConfirmed;
+  waypoint_id_.clear();
+  rejection_.clear();
+  if (refusal) refusal->clear();
+  return true;
 }
 
 void LocalizationConfirmation::OnOperatorLocalize() {
-  confirmed_ = true;
-  pending_reason_.clear();
+  state_ = State::kConfirmed;
+  waypoint_id_.clear();
+  rejection_.clear();
 }
 
 void LocalizationConfirmation::OnFiducialLocalization() {
-  confirmed_ = true;
-  pending_reason_.clear();
+  state_ = State::kConfirmed;
+  waypoint_id_.clear();
+  rejection_.clear();
 }
 
 void LocalizationConfirmation::OnLocalizationCleared() {
-  confirmed_ = true;
-  pending_reason_.clear();
+  // While recovery runs it stays "recovering" so OnRecoveryFinished can tell
+  // that nothing is left to confirm.
+  state_ = recovery_in_progress_ ? State::kRecovering : State::kConfirmed;
+  waypoint_id_.clear();
+  rejection_.clear();
 }
 
 std::string LocalizationConfirmation::NavigationBlockReason(const std::string& action) const {
-  if (confirmed_) return "";
-  return action + " refused: " + pending_reason_ +
+  if (confirmed()) return "";
+  if (recovery_in_progress_ || state_ == State::kRecovering) {
+    return action + " refused: restart localization recovery is in progress; try again shortly.";
+  }
+  return action + " refused: " + pending_reason() +
          ". Check the robot's position on the map, then run spot.localize.confirm, or run "
          "spot.localize at the right waypoint, or let it see the dock fiducial.";
+}
+
+std::string LocalizationConfirmation::LocalizeCommandBlockReason() const {
+  if (recovery_in_progress_ || state_ == State::kRecovering) {
+    return "restart localization recovery is in progress; try again shortly";
+  }
+  return "";
 }
 
 }  // namespace fsa

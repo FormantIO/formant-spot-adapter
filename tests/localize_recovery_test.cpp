@@ -286,16 +286,18 @@ void test_acceptance() {
 
 void test_confirmation() {
   fsa::LocalizationConfirmation c;
+  std::string refusal;
   check(c.confirmed(), "starts confirmed");
+  check(c.AllowsPersist(), "confirmed localization may be saved");
   check(c.NavigationBlockReason("spot.waypoint.goto").empty(), "confirmed: navigation allowed");
   c.OnAutomaticLocalization("wp-1");
-  check(!c.confirmed(), "automatic recovery is unconfirmed");
+  check(!c.confirmed() && !c.AllowsPersist(), "automatic recovery is unconfirmed, not saved");
   const std::string reason = c.NavigationBlockReason("spot.return_and_dock");
   check(contains(reason, "spot.return_and_dock refused"), "block names the action: " + reason);
   check(contains(reason, "spot.localize.confirm"), "block says how to confirm: " + reason);
   check(contains(reason, "wp-1"), "block names the waypoint: " + reason);
-  c.OnOperatorConfirm();
-  check(c.confirmed() && c.pending_reason().empty(), "operator confirm unblocks");
+  check(c.TryOperatorConfirm(false, &refusal), "operator confirm unblocks an automatic guess");
+  check(c.confirmed() && c.pending_reason().empty(), "confirmed after operator confirm");
 
   c.OnAutomaticLocalization("wp-1");
   c.OnFiducialLocalization();
@@ -309,8 +311,71 @@ void test_confirmation() {
   check(!c.confirmed(), "a rejected but applied localization blocks");
   check(contains(c.NavigationBlockReason("spot.waypoint.goto"), "POOR_POINT_CLOUD_MATCH"),
         "block carries the rejection reason");
+  check(!c.TryOperatorConfirm(false, &refusal), "a rejected localization needs force to confirm");
+  check(contains(refusal, "force=true"), "refusal explains force: " + refusal);
+  check(!c.confirmed(), "refused confirm leaves it blocked");
+  check(c.TryOperatorConfirm(true, &refusal), "force=true confirms a rejected localization");
+  check(c.confirmed(), "confirmed after a forced confirm");
+
+  c.OnRejectedLocalization("wp-2", "ambiguous");
   c.OnLocalizationCleared();
   check(c.confirmed(), "once cleared there is nothing left to confirm");
+}
+
+// The restore clears its pending flag before recovery runs. Everything that could
+// act on a freshly applied pose must stay blocked from the moment fiducial
+// localization fails until recovery has finished.
+void test_recovery_ordering() {
+  std::string refusal;
+  {
+    // Recovery accepted: blocked throughout, then unconfirmed until a person confirms.
+    fsa::LocalizationConfirmation c;
+    c.OnLocalizationCleared();  // map uploaded
+    c.OnRecoveryStarted();      // fiducial failed, before pending is cleared
+    check(c.recovery_in_progress(), "recovery in progress after start");
+    check(contains(c.NavigationBlockReason("spot.waypoint.goto"), "in progress"),
+          "navigation blocked as soon as recovery starts");
+    check(!c.LocalizeCommandBlockReason().empty(), "spot.localize blocked during recovery");
+    check(!c.AllowsPersist(), "nothing saved during recovery");
+    check(!c.TryOperatorConfirm(true, &refusal), "even a forced confirm waits for recovery");
+    c.OnAutomaticLocalization("wp-1");  // SetLocalization accepted
+    check(!c.NavigationBlockReason("spot.waypoint.goto").empty(),
+          "still blocked between SetLocalization and the end of recovery");
+    check(!c.AllowsPersist(), "applied pose not saved before recovery ends");
+    check(!c.TryOperatorConfirm(false, &refusal), "no confirm before recovery ends");
+    c.OnRecoveryFinished();
+    check(!c.recovery_in_progress(), "recovery finished");
+    check(!c.confirmed(), "accepted recovery is still unconfirmed");
+    check(c.LocalizeCommandBlockReason().empty(), "spot.localize allowed after recovery");
+    check(c.TryOperatorConfirm(false, &refusal), "confirm allowed after recovery");
+    check(c.confirmed() && c.AllowsPersist(), "confirmed and saveable");
+  }
+  {
+    // Recovery rejected and cleared: blocked until the clear is done, then free.
+    fsa::LocalizationConfirmation c;
+    c.OnRecoveryStarted();
+    c.OnLocalizationCleared();  // ClearGraph + re-upload done
+    check(!c.NavigationBlockReason("spot.waypoint.goto").empty(),
+          "blocked after the clear while recovery is still running");
+    c.OnRecoveryFinished();
+    check(c.confirmed(), "unlocalized robot after a cleared rejection has nothing to confirm");
+  }
+  {
+    // Recovery skipped: nothing applied.
+    fsa::LocalizationConfirmation c;
+    c.OnRecoveryStarted();
+    c.OnRecoveryFinished();
+    check(c.confirmed(), "skipped recovery leaves nothing to confirm");
+  }
+  {
+    // Recovery rejected and the clear failed: stays blocked, needs force.
+    fsa::LocalizationConfirmation c;
+    c.OnRecoveryStarted();
+    c.OnRejectedLocalization("wp-3", "GraphNav quality check QUALITY_CHECK_SKIPPED");
+    c.OnRecoveryFinished();
+    check(!c.confirmed(), "uncleared rejection stays blocked");
+    check(!c.TryOperatorConfirm(false, &refusal), "uncleared rejection needs force");
+  }
 }
 
 void test_recovery_decision() {
@@ -407,6 +472,7 @@ int main() {
   test_fiducial_errors();
   test_acceptance();
   test_confirmation();
+  test_recovery_ordering();
   test_recovery_decision();
 
   if (failures == 0) std::cout << "localize_recovery_test: all checks passed" << std::endl;

@@ -95,7 +95,7 @@ class Adapter {
   bool WaitForGraphNavCommandResult(uint32_t command_id, long long timeout_ms);
   bool EnsureLocalizedForNavigation(const std::string& action_name);
   bool ExecuteLocalizeCommand(const v1::model::CommandRequest& request);
-  bool ExecuteLocalizeConfirmCommand();
+  bool ExecuteLocalizeConfirmCommand(const v1::model::CommandRequest& request);
   bool EnsureLocalizationConfirmedForNavigation(const std::string& action_name);
   void MaybeScheduleRestoreForEmptyRobotGraph(long long now);
   bool ClearRejectedLocalization(const std::string& map_id, const SpotClient::StoredMap& map_data,
@@ -464,8 +464,15 @@ class Adapter {
   std::atomic<bool> waypoint_recovery_attempted_{false};
   // When the pending map restore was scheduled (startup or empty robot graph).
   std::atomic<long long> restore_scheduled_ms_{0};
+  // After a reconnect, look for an empty robot graph (Spot body reboot) until
+  // this deadline. Two empty checks in a row are needed before restoring.
   std::atomic<bool> check_robot_graph_after_connect_{false};
+  std::atomic<long long> robot_graph_check_deadline_ms_{0};
   std::atomic<long long> last_robot_graph_check_ms_{0};
+  std::atomic<long long> first_empty_robot_graph_ms_{0};
+  // ClearGraph succeeded but the re-upload failed, so the robot's graph is empty
+  // because of us; the next restore must not re-run recovery.
+  std::atomic<bool> graph_left_empty_by_adapter_{false};
   std::mutex last_localization_mu_;
   fsa::LastLocalizationThrottle last_localization_throttle_;
   std::atomic<long long> last_nav_hold_log_ms_{0};

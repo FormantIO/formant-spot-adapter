@@ -284,8 +284,11 @@ class SpotClient {
   bool BuildGraphNavMapSnapshot(const StoredMap& map_data, GraphNavMapSnapshot* out_snapshot);
   bool UploadGraphMap(const StoredMap& map_data);
   bool ClearGraph();
-  // Number of waypoints in the graph currently loaded on the robot.
+  // Number of waypoints in the graph currently loaded on the robot, from the
+  // recording service's map stats (no graph download).
   bool GetGraphWaypointCount(int* out_count);
+  // Who holds the body lease right now; empty client name when nobody does.
+  bool GetBodyLeaseOwner(std::string* out_client_name);
   bool SetLocalizationFiducial();
   // No lease needed. Returns true only for an accepted result (see
   // EvaluateWaypointLocalization). On failure LastError() gives the reason.
