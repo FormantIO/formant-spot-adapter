@@ -246,8 +246,14 @@ Restart localization recovery:
   whichever is later), for example because another client held the lease.
 - From the moment the restore's fiducial localization fails until recovery has finished,
   navigation, `spot.localize`, `spot.localize.confirm` and saving the localization are refused, so
-  nothing can act on a pose recovery has applied but not yet accepted or cleared. Navigation is
-  also refused while a map restore is pending.
+  nothing can act on a pose recovery has applied but not yet accepted or cleared. The same window
+  covers each `spot.localize` attempt.
+- Navigation is also refused while a map restore is pending ("map ... is still being restored to
+  the robot" in `spot.adapter.log`). The restore retries every 5 s and stays pending while the map
+  file under `<graphnav_store_dir>/maps/<map_id>` cannot be read, the upload fails, or another
+  client (for example the tablet) holds the body lease. To clear it, release the lease on the
+  other client, or fix or replace the map files, or load a different map with `spot.map.load`.
+  If none of these works, restart the adapter.
 - An accepted recovery leaves the localization unconfirmed (`localize_confirmed=false` on
   `spot.nav.state`). A recovery result that fails the quality or ambiguity check is cleared:
   GraphNav has no clear-localization call, so the adapter runs ClearGraph (which clears

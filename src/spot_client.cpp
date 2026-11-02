@@ -1564,17 +1564,33 @@ bool SpotClient::UploadGraphMap(const StoredMap& map_data) {
   return true;
 }
 
-bool SpotClient::GetGraphWaypointCount(int* out_count) {
+bool SpotClient::GetGraphWaypointCount(int* out_count, std::string* out_signal) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!out_count) return false;
+  auto decide = [&](int count, const char* signal) {
+    *out_count = count;
+    if (out_signal) *out_signal = signal;
+    return true;
+  };
   if (!EnsureGraphNavRecordingClient()) return false;
   auto r = graph_nav_recording_client_->GetRecordStatus();
   if (!r.status) {
     SetLastError(r.status.DebugString());
     return false;
   }
-  *out_count = r.response.map_stats().waypoints().count();
-  return true;
+  if (r.response.has_map_stats() && r.response.map_stats().waypoints().count() > 0) {
+    return decide(r.response.map_stats().waypoints().count(), "record_status");
+  }
+  // Zero or missing map stats: do not trust that alone before restoring a map.
+  if (!EnsureGraphNavClient()) return false;
+  ::bosdyn::api::graph_nav::GetLocalizationStateRequest loc_req;
+  auto loc = graph_nav_client_->GetLocalizationState(loc_req);
+  if (loc.status && !loc.response.localization().waypoint_id().empty()) {
+    return decide(1, "localization_state");
+  }
+  ::bosdyn::api::graph_nav::Graph graph;
+  if (!DownloadCurrentGraph(&graph)) return false;
+  return decide(graph.waypoints_size(), "download_graph");
 }
 
 bool SpotClient::GetBodyLeaseOwner(std::string* out_client_name) {

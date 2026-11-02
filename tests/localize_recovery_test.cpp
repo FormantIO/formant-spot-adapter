@@ -376,6 +376,47 @@ void test_recovery_ordering() {
     check(!c.confirmed(), "uncleared rejection stays blocked");
     check(!c.TryOperatorConfirm(false, &refusal), "uncleared rejection needs force");
   }
+  {
+    // Operator spot.localize: same window, so the 1 Hz persist and navigation
+    // cannot use a pose that is about to be rejected and cleared.
+    fsa::LocalizationConfirmation c;
+    check(c.TryBeginOperatorAttempt(&refusal), "operator attempt starts when idle");
+    check(!c.AllowsPersist(), "nothing saved during an operator attempt");
+    check(!c.NavigationBlockReason("spot.waypoint.goto").empty(),
+          "navigation blocked during an operator attempt");
+    check(!c.TryBeginOperatorAttempt(&refusal), "a second attempt is refused");
+    check(contains(refusal, "in progress"), "refusal says why: " + refusal);
+    check(!c.TryOperatorConfirm(true, &refusal), "no confirm during an operator attempt");
+    c.OnLocalizationCleared();  // result rejected, cleared
+    check(!c.AllowsPersist(), "still nothing saved after the clear until the attempt ends");
+    c.OnRecoveryFinished();
+    check(c.confirmed() && c.AllowsPersist(), "cleared operator attempt leaves nothing to confirm");
+  }
+  {
+    // A failed operator attempt that applied nothing keeps the earlier state.
+    fsa::LocalizationConfirmation c;
+    c.OnAutomaticLocalization("wp-1");
+    check(c.TryBeginOperatorAttempt(&refusal), "operator attempt allowed while unconfirmed");
+    c.OnRecoveryFinished();
+    check(!c.confirmed() && contains(c.pending_reason(), "wp-1"),
+          "failed attempt does not confirm the automatic guess");
+  }
+  {
+    // Accepted operator attempt.
+    fsa::LocalizationConfirmation c;
+    c.OnAutomaticLocalization("wp-1");
+    check(c.TryBeginOperatorAttempt(&refusal), "attempt begins");
+    c.OnOperatorLocalize();
+    check(!c.AllowsPersist(), "not saved until the attempt window closes");
+    c.OnRecoveryFinished();
+    check(c.confirmed(), "accepted operator attempt confirms");
+  }
+  {
+    // Operator attempt refused while restart recovery runs.
+    fsa::LocalizationConfirmation c;
+    c.OnRecoveryStarted();
+    check(!c.TryBeginOperatorAttempt(&refusal), "operator attempt refused during recovery");
+  }
 }
 
 void test_recovery_decision() {

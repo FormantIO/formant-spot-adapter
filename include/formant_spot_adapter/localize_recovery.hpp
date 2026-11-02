@@ -168,6 +168,11 @@ class LocalizationConfirmation {
 
   // Fiducial localization failed during a restore and recovery is about to run.
   void OnRecoveryStarted();
+  // An operator spot.localize is about to call SetLocalization. Opens the same
+  // window as OnRecoveryStarted (close it with OnRecoveryFinished) but keeps the
+  // current state, so a refused or failed attempt changes nothing. Returns false
+  // with `refusal` set when another attempt is already running.
+  bool TryBeginOperatorAttempt(std::string* refusal);
   // Recovery is done (attempted, skipped or failed). If nothing was applied the
   // robot is simply unlocalized and there is nothing to confirm.
   void OnRecoveryFinished();

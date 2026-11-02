@@ -334,12 +334,12 @@ LocalizeAcceptance EvaluateWaypointLocalization(const std::string& status,
 }
 
 std::string LocalizationConfirmation::pending_reason() const {
-  if (recovery_in_progress_) return "restart localization recovery is in progress";
+  if (recovery_in_progress_) return "a localization attempt (restart recovery or spot.localize) is in progress";
   switch (state_) {
     case State::kConfirmed:
       return "";
     case State::kRecovering:
-      return "restart localization recovery is in progress";
+      return "a localization attempt (restart recovery or spot.localize) is in progress";
     case State::kAutomatic:
       return "localization at waypoint " + waypoint_id_ +
              " was set automatically after a restart and is not confirmed";
@@ -356,6 +356,17 @@ void LocalizationConfirmation::OnRecoveryStarted() {
   state_ = State::kRecovering;
   waypoint_id_.clear();
   rejection_.clear();
+}
+
+bool LocalizationConfirmation::TryBeginOperatorAttempt(std::string* refusal) {
+  const std::string blocked = LocalizeCommandBlockReason();
+  if (!blocked.empty()) {
+    if (refusal) *refusal = blocked;
+    return false;
+  }
+  recovery_in_progress_ = true;
+  if (refusal) refusal->clear();
+  return true;
 }
 
 void LocalizationConfirmation::OnRecoveryFinished() {
@@ -382,7 +393,9 @@ bool LocalizationConfirmation::TryOperatorConfirm(bool force, std::string* refus
     return false;
   };
   if (recovery_in_progress_ || state_ == State::kRecovering) {
-    return refuse("restart localization recovery is in progress; wait for it to finish");
+    return refuse(
+        "a localization attempt (restart recovery or spot.localize) is in progress; wait for it "
+        "to finish");
   }
   if (state_ == State::kRejected && !force) {
     return refuse(pending_reason() +
@@ -419,7 +432,8 @@ void LocalizationConfirmation::OnLocalizationCleared() {
 std::string LocalizationConfirmation::NavigationBlockReason(const std::string& action) const {
   if (confirmed()) return "";
   if (recovery_in_progress_ || state_ == State::kRecovering) {
-    return action + " refused: restart localization recovery is in progress; try again shortly.";
+    return action + " refused: a localization attempt (restart recovery or spot.localize) is in "
+                    "progress; try again shortly.";
   }
   return action + " refused: " + pending_reason() +
          ". Check the robot's position on the map, then run spot.localize.confirm, or run "
@@ -428,7 +442,8 @@ std::string LocalizationConfirmation::NavigationBlockReason(const std::string& a
 
 std::string LocalizationConfirmation::LocalizeCommandBlockReason() const {
   if (recovery_in_progress_ || state_ == State::kRecovering) {
-    return "restart localization recovery is in progress; try again shortly";
+    return "a localization attempt (restart recovery or spot.localize) is in progress; try "
+           "again shortly";
   }
   return "";
 }
