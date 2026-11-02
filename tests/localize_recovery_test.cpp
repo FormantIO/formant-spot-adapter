@@ -326,6 +326,14 @@ void test_acceptance() {
   {
     auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED");
     f.has_correction = true;
+    f.correction_m = 0.05;
+    f.correction_z_m = 0.4;
+    check(fsa::EvaluateWaypointLocalization(f, op).ok,
+          "operator: the 25 cm bound is horizontal; height is not bounded");
+  }
+  {
+    auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED");
+    f.has_correction = true;
     f.correction_m = 0.30;
     const auto a = fsa::EvaluateWaypointLocalization(f, op);
     check(!a.ok && a.applied && contains(a.reason, "moved the pose"),
@@ -360,15 +368,64 @@ void test_acceptance() {
 
 void test_pose_correction() {
   fsa::LocalizePose guess;
-  fsa::LocalizePose got{0.03, -0.04, 0.0, 0.0, 0.0, std::sin(0.05), std::cos(0.05)};
-  double d = 0.0;
+  fsa::LocalizePose got{0.03, -0.04, 0.12, 0.0, 0.0, std::sin(0.05), std::cos(0.05)};
+  double xy = 0.0;
+  double z = 0.0;
   double yaw = 0.0;
-  fsa::PoseCorrection(guess, got, &d, &yaw);
-  check(near(d, 0.05), "correction distance is 5 cm");
+  fsa::PoseCorrection(guess, got, &xy, &z, &yaw);
+  check(near(xy, 0.05), "correction is horizontal: 5 cm, height excluded");
+  check(near(z, 0.12), "height difference reported separately");
   check(std::fabs(yaw - 0.1) < 1e-9, "correction yaw is 0.1 rad");
   fsa::LocalizePose turned{0, 0, 0, 0, 0, std::sin(3.1), std::cos(3.1)};  // yaw 6.2 rad
-  fsa::PoseCorrection(guess, turned, &d, &yaw);
+  fsa::PoseCorrection(guess, turned, &xy, &z, &yaw);
   check(std::fabs(yaw - (2 * 3.14159265358979323846 - 6.2)) < 1e-9, "yaw difference wraps");
+}
+
+void test_detail_and_confirmation_need() {
+  fsa::LocalizeDetailFields f;
+  f.status = "STATUS_OK";
+  f.quality_check = "QUALITY_CHECK_SKIPPED";
+  f.accepted_by = "operator_small_correction";
+  f.visual_verification = false;
+  f.has_correction = true;
+  f.correction_xy_m = 0.0423;
+  f.correction_z_m = -0.011;
+  f.correction_yaw_rad = 0.05;
+  const std::string d = fsa::FormatLocalizeDetail(f);
+  check(contains(d, "status=STATUS_OK"), "detail has status: " + d);
+  check(contains(d, "quality=QUALITY_CHECK_SKIPPED"), "detail has quality: " + d);
+  check(contains(d, "accepted_by=operator_small_correction"), "detail has accepted_by: " + d);
+  check(contains(d, "visual_verification=false"), "detail says whether verification ran: " + d);
+  check(contains(d, "correction_m=0.042"), "detail has horizontal correction: " + d);
+  check(contains(d, "correction_z_m=-0.011"), "detail has height correction: " + d);
+  check(contains(d, "correction_deg=2.9"), "detail has yaw correction in degrees: " + d);
+  fsa::LocalizeDetailFields rejected;
+  rejected.status = "STATUS_VISUAL_ALIGNMENT_FAILED";
+  rejected.visual_verification = true;
+  const std::string r = fsa::FormatLocalizeDetail(rejected);
+  check(contains(r, "accepted_by=none") && contains(r, "visual_verification=true") &&
+            contains(r, "correction_m=unknown") && contains(r, "correction_z_m=unknown") &&
+            contains(r, "correction_deg=unknown"),
+        "rejected detail still has every field: " + r);
+
+  check(fsa::OperatorAcceptNeedsConfirmation("operator_small_correction", false),
+        "small-correction accept on the unverified retry needs confirmation");
+  check(!fsa::OperatorAcceptNeedsConfirmation("operator_small_correction", true),
+        "small-correction accept on the verified attempt does not");
+  check(!fsa::OperatorAcceptNeedsConfirmation("visual_verification", true),
+        "visual verification accept does not");
+  check(!fsa::OperatorAcceptNeedsConfirmation("quality_check", false), "quality success does not");
+
+  fsa::LocalizationConfirmation c;
+  c.OnUnverifiedOperatorLocalization("aglow-weasel",
+                                     "visual alignment failed; accepted on small correction");
+  check(!c.confirmed() && !c.AllowsPersist(), "unverified operator accept is unconfirmed");
+  const std::string why = c.NavigationBlockReason("spot.waypoint.goto");
+  check(contains(why, "visual alignment failed; accepted on small correction"),
+        "block explains the weaker evidence: " + why);
+  std::string refusal;
+  check(c.TryOperatorConfirm(false, &refusal), "plain confirm is enough (not a rejection)");
+  check(c.confirmed(), "confirmed after spot.localize.confirm");
 }
 
 void test_specs() {
@@ -633,6 +690,7 @@ int main() {
   test_fiducial_errors();
   test_acceptance();
   test_pose_correction();
+  test_detail_and_confirmation_need();
   test_specs();
   test_confirmation();
   test_recovery_ordering();

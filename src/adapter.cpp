@@ -39,6 +39,20 @@ long long now_ms() {
   return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+// localize_detail for one SetLocalization attempt (see FormatLocalizeDetail).
+std::string localize_detail(const SpotClient::WaypointLocalizeResult& r) {
+  LocalizeDetailFields f;
+  f.status = r.status;
+  f.quality_check = r.quality_check;
+  f.accepted_by = r.ok ? r.basis : std::string();
+  f.visual_verification = r.visual_verification;
+  f.has_correction = r.has_correction;
+  f.correction_xy_m = r.correction_m;
+  f.correction_z_m = r.correction_z_m;
+  f.correction_yaw_rad = r.correction_yaw_rad;
+  return FormatLocalizeDetail(f);
+}
+
 // Closes a localization attempt window (LocalizationConfirmation::OnRecoveryStarted
 // or TryBeginOperatorAttempt) on every exit path, exceptions included.
 class LocalizeAttemptWindow {
@@ -5255,9 +5269,8 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
       std::lock_guard<std::mutex> lk(nav_state_mu_);
       localization_confirmation_.OnAutomaticLocalization(result.localized_waypoint_id);
     }
-    const std::string detail = "status=" + result.status + " quality=" + result.quality_check +
-                               " accepted_by=" + result.basis +
-                               "; unconfirmed, navigation blocked until spot.localize.confirm";
+    const std::string detail =
+        localize_detail(result) + "; unconfirmed, navigation blocked until spot.localize.confirm";
     EmitLog("[graphnav] restart localization recovery succeeded waypoint_id=" +
             result.localized_waypoint_id + " " + detail);
     RecordLocalizeResult("restart_recovery", true, result.localized_waypoint_id, detail);
@@ -5266,8 +5279,10 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
 
   const std::string error = spot_.LastError();
   if (!result.applied) {
-    EmitLog("[graphnav] restart localization recovery failed: " + error);
-    RecordLocalizeResult("restart_recovery", false, in.last.waypoint_id, error);
+    EmitLog("[graphnav] restart localization recovery failed: " + error + "; " +
+            localize_detail(result));
+    RecordLocalizeResult("restart_recovery", false, in.last.waypoint_id,
+                         error + "; " + localize_detail(result));
     return;
   }
   // GraphNav applied a localization we do not trust. Leave the robot unlocalized.
@@ -5278,9 +5293,9 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
       localization_confirmation_.OnLocalizationCleared();
     }
     EmitLog("[graphnav] restart localization recovery rejected (" + result.reason +
-            "); localization cleared, robot left unlocalized");
+            "); localization cleared, robot left unlocalized; " + localize_detail(result));
     RecordLocalizeResult("restart_recovery", false, in.last.waypoint_id,
-                         result.reason + "; localization cleared");
+                         result.reason + "; localization cleared; " + localize_detail(result));
     return;
   }
   {
@@ -5293,7 +5308,7 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
           "; navigation blocked until the localization is confirmed or replaced");
   RecordLocalizeResult("restart_recovery", false, in.last.waypoint_id,
                        result.reason + "; could not clear (" + clear_error +
-                           "), navigation blocked");
+                           "), navigation blocked; " + localize_detail(result));
 }
 
 bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
@@ -5381,9 +5396,10 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
   if (!accepted) {
     const std::string error = spot_.LastError();
     if (!result.applied) {
-      EmitLog("[graphnav] " + action + " failed: " + error);
+      EmitLog("[graphnav] " + action + " failed: " + error + "; " + localize_detail(result));
       RecordLocalizeResult("command", false, waypoint_id,
-                           result.reason.empty() ? error : result.reason);
+                           (result.reason.empty() ? error : result.reason) + "; " +
+                               localize_detail(result));
       return false;
     }
     // GraphNav applied a localization we rejected. Clear it the same way restart
@@ -5408,24 +5424,31 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
     EmitLog("[graphnav] " + action + " failed: " + error +
             (cleared ? "; localization cleared, robot left unlocalized"
                      : "; clearing it failed (" + clear_error +
-                           "), navigation blocked until confirmed or replaced"));
+                           "), navigation blocked until confirmed or replaced") +
+            "; " + localize_detail(result));
     RecordLocalizeResult("command", false, waypoint_id,
-                         result.reason + (cleared ? "; localization cleared"
-                                                  : "; could not clear (" + clear_error + ")"));
+                         result.reason +
+                             (cleared ? "; localization cleared"
+                                      : "; could not clear (" + clear_error + ")") +
+                             "; " + localize_detail(result));
     return false;
   }
+  // Accepted only on a small correction after visual alignment failed: weaker
+  // evidence, so a person still has to confirm before navigating.
+  const bool needs_confirm =
+      OperatorAcceptNeedsConfirmation(result.basis, result.visual_verification);
   {
     std::lock_guard<std::mutex> lk(nav_state_mu_);
-    localization_confirmation_.OnOperatorLocalize();
+    if (needs_confirm) {
+      localization_confirmation_.OnUnverifiedOperatorLocalization(
+          result.localized_waypoint_id, "visual alignment failed; accepted on small correction");
+    } else {
+      localization_confirmation_.OnOperatorLocalize();
+    }
   }
-  std::ostringstream detail_stream;
-  detail_stream << "status=" << result.status << " quality=" << result.quality_check
-                << " accepted_by=" << result.basis;
-  if (result.has_correction) {
-    detail_stream << " correction_m=" << result.correction_m
-                  << " correction_deg=" << result.correction_yaw_rad * 180.0 / 3.14159265358979323846;
-  }
-  const std::string detail = detail_stream.str();
+  const std::string detail =
+      localize_detail(result) +
+      (needs_confirm ? "; unconfirmed, navigation blocked until spot.localize.confirm" : "");
   EmitLog("[graphnav] " + action + " succeeded name=" + name +
           " localized_waypoint_id=" + result.localized_waypoint_id + " " + detail);
   RecordLocalizeResult("command", true, result.localized_waypoint_id, detail);

@@ -179,8 +179,11 @@ class SpotClient {
     // How far GraphNav moved the pose from the guess, when it kept the guessed
     // waypoint as the reference.
     bool has_correction{false};
-    double correction_m{0.0};
+    double correction_m{0.0};  // horizontal (x, y)
+    double correction_z_m{0.0};
     double correction_yaw_rad{0.0};
+    // The request asked for verified visual alignment.
+    bool visual_verification{false};
     // Waypoint GraphNav ended up localized to.
     std::string localized_waypoint_id;
   };

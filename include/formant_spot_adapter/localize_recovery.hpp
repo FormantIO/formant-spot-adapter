@@ -50,7 +50,9 @@ constexpr double kMaxLocalizeYawDeg = 45.0;
 //   4. QUALITY_CHECK_SKIPPED is accepted when visual verification was requested
 //      (STATUS_OK then means it passed), or, only where the policy allows it (an
 //      operator who asserted the waypoint), when the ambiguity check was
-//      requested and the pose moved at most max_correction from the guess.
+//      requested and the pose moved at most max_correction (horizontal x/y and
+//      yaw) from the guess. If that happened on the retry without visual
+//      verification, the localization still needs spot.localize.confirm.
 //   5. Every other quality result (poor point cloud match, poor gravity
 //      alignment, bad height, unknown) is rejected.
 // Trade-off of 4b: a small correction does not prove the point clouds matched;
@@ -101,9 +103,11 @@ struct LocalizeResponseFacts {
   bool ambiguity_check_requested{false};
   bool visual_verification_requested{false};
   // How far the result moved from the guess. Only known when GraphNav kept the
-  // guessed waypoint as the reference.
+  // guessed waypoint as the reference. correction_m is horizontal (x, y) only;
+  // height is reported separately and not bounded.
   bool has_correction{false};
   double correction_m{0.0};
+  double correction_z_m{0.0};
   double correction_yaw_rad{0.0};
 };
 
@@ -121,9 +125,27 @@ struct LocalizeAcceptance {
 LocalizeAcceptance EvaluateWaypointLocalization(const LocalizeResponseFacts& facts,
                                                 const LocalizeAcceptancePolicy& policy);
 
-// Distance and absolute yaw difference between two poses in the same frame.
-void PoseCorrection(const LocalizePose& guess, const LocalizePose& result, double* out_distance_m,
-                    double* out_yaw_rad);
+// Horizontal (x, y) distance, height difference and absolute yaw difference
+// between two poses in the same frame.
+void PoseCorrection(const LocalizePose& guess, const LocalizePose& result, double* out_xy_m,
+                    double* out_z_m, double* out_yaw_rad);
+
+// Everything localize_detail reports about one SetLocalization attempt.
+struct LocalizeDetailFields {
+  std::string status;
+  std::string quality_check;
+  // Empty when the result was rejected.
+  std::string accepted_by;
+  bool visual_verification{false};
+  bool has_correction{false};
+  double correction_xy_m{0.0};
+  double correction_z_m{0.0};
+  double correction_yaw_rad{0.0};
+};
+// "status=... quality=... accepted_by=... visual_verification=true|false
+// correction_m=... correction_z_m=... correction_deg=..." (correction fields are
+// "unknown" when GraphNav localized to a different waypoint than the guess).
+std::string FormatLocalizeDetail(const LocalizeDetailFields& fields);
 
 // Request specs. The operator command first asks for visual verification; if that
 // fails (STATUS_VISUAL_ALIGNMENT_FAILED, nothing applied) it retries once without
@@ -132,6 +154,9 @@ WaypointLocalizeSpec OperatorLocalizeSpec(const std::string& waypoint_id,
                                           const WaypointLocalizeLimits& limits,
                                           bool verify_visual_refinement);
 LocalizeAcceptancePolicy OperatorAcceptancePolicy();
+// An accepted operator result still needs spot.localize.confirm when it was
+// accepted only on a small correction without verified visual alignment.
+bool OperatorAcceptNeedsConfirmation(const std::string& accepted_by, bool visual_verification);
 struct LastLocalization;
 WaypointLocalizeSpec RecoveryLocalizeSpec(const LastLocalization& last);
 LocalizeAcceptancePolicy RecoveryAcceptancePolicy();
@@ -271,6 +296,9 @@ class LocalizationConfirmation {
   void OnRecoveryFinished();
   // Automatic restart recovery left the robot localized at `waypoint_id`.
   void OnAutomaticLocalization(const std::string& waypoint_id);
+  // An operator spot.localize was accepted on weaker evidence (for example a small
+  // correction after visual alignment failed). It needs spot.localize.confirm.
+  void OnUnverifiedOperatorLocalization(const std::string& waypoint_id, const std::string& why);
   // GraphNav applied a localization that failed its quality or ambiguity check
   // and it could not be cleared.
   void OnRejectedLocalization(const std::string& waypoint_id, const std::string& reason);
@@ -297,6 +325,8 @@ class LocalizationConfirmation {
   bool recovery_in_progress_{false};
   std::string waypoint_id_;
   std::string rejection_;
+  // Why an accepted localization still needs confirming; empty for restart recovery.
+  std::string unverified_note_;
 };
 
 }  // namespace fsa

@@ -222,8 +222,10 @@ parameters documented in the repository `README.md`.
   `current_seed_x`, `current_seed_y`, `current_seed_z`, and `current_seed_yaw_rad`.
 - Result of the last `spot.localize`, `spot.localize.confirm` or restart localization recovery:
   `localize_result` (`ok`, `failed`, or empty if none yet), `localize_source` (`command`,
-  `confirm` or `restart_recovery`), `localize_waypoint_id`, `localize_detail` (GraphNav status and
-  quality check, or the reason it was rejected), and `localize_at_ms`.
+  `confirm` or `restart_recovery`), `localize_waypoint_id`, `localize_detail` and `localize_at_ms`.
+  For a SetLocalization attempt `localize_detail` holds the rejection reason (if any) plus
+  `status`, `quality`, `accepted_by`, `visual_verification`, `correction_m` (horizontal),
+  `correction_z_m` and `correction_deg`.
 - `localize_confirmed`: false after an automatic restart recovery (or a rejected localization that
   could not be cleared) until `spot.localize.confirm`, a successful `spot.localize`, or a fiducial
   localization, and also false while restart recovery is running. GraphNav navigation commands
@@ -447,8 +449,9 @@ parameters documented in the repository `README.md`.
   `max_yaw_deg=<deg>` (default 20, max 45).
 - Needs `STATUS_OK` and no suspected ambiguity, plus `QUALITY_CHECK_SUCCESS`, or
   `QUALITY_CHECK_SKIPPED` with verified visual alignment, or (operator retry without visual
-  verification) `QUALITY_CHECK_SKIPPED` with the pose moved at most 25 cm / 10 deg from the guess.
-  See the README for the trade-off.
+  verification) `QUALITY_CHECK_SKIPPED` with the pose moved at most 25 cm horizontally / 10 deg
+  from the guess; that last case leaves the localization unconfirmed until
+  `spot.localize.confirm`. See the README for the trade-off.
 - Result is reported on `spot.nav.state` (`localize_*` fields) and `spot.adapter.log`.
 
 - `spot.localize.confirm` (command)

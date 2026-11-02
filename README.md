@@ -223,14 +223,18 @@ Additional non-GraphNav command-channel actions:
     - the quality check is `QUALITY_CHECK_SUCCESS`, or
     - it is `QUALITY_CHECK_SKIPPED` and verified visual alignment passed, or
     - (this command only, on the retry) it is `QUALITY_CHECK_SKIPPED`, the ambiguity check was
-      requested, GraphNav kept the guessed waypoint, and it moved the pose at most 25 cm and
-      10 deg from the guess.
+      requested, GraphNav kept the guessed waypoint, and it moved the pose at most 25 cm
+      horizontally (x, y; height is reported but not bounded) and 10 deg from the guess. A result
+      accepted this way is left unconfirmed ("visual alignment failed; accepted on small
+      correction"), so navigation stays blocked until `spot.localize.confirm`.
     Any other quality result is rejected. Trade-off of the last rule: a small correction does not
     prove the point clouds matched, since a poorly constrained match can also stay near the guess.
     It rests on the operator's statement that the robot is at that waypoint, with the ambiguity
-    check as the remaining automatic guard, and restart recovery never uses it. The log and
-    `localize_detail` name the rule that accepted (`accepted_by=quality_check`,
-    `visual_verification` or `operator_small_correction`) and the correction.
+    check as the remaining automatic guard, and restart recovery never uses it.
+  - The log and `localize_detail` always carry `status`, `quality`, `accepted_by`
+    (`quality_check`, `visual_verification`, `operator_small_correction` or `none`),
+    `visual_verification` (whether verification was requested), `correction_m` (horizontal),
+    `correction_z_m` and `correction_deg` (`unknown` when GraphNav picked another waypoint).
   - A rejected result that GraphNav applied is cleared the same way restart recovery does
     (below). If it cannot be cleared, navigation stays blocked until it is confirmed or replaced.
   - No lease needed for the localization itself and the robot does not move. Rejected while

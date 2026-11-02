@@ -353,7 +353,7 @@ LocalizeAcceptance EvaluateWaypointLocalization(const LocalizeResponseFacts& fac
       std::ostringstream oss;
       oss.precision(3);
       oss << "GraphNav skipped its quality check and moved the pose " << facts.correction_m
-          << " m / " << facts.correction_yaw_rad * 180.0 / kPi << " deg from the guess (limit "
+          << " m horizontally / " << facts.correction_yaw_rad * 180.0 / kPi << " deg from the guess (limit "
           << policy.max_correction_m << " m / " << policy.max_correction_yaw_rad * 180.0 / kPi
           << " deg)";
       a.reason = oss.str();
@@ -368,12 +368,12 @@ LocalizeAcceptance EvaluateWaypointLocalization(const LocalizeResponseFacts& fac
   return a;
 }
 
-void PoseCorrection(const LocalizePose& guess, const LocalizePose& result, double* out_distance_m,
-                    double* out_yaw_rad) {
+void PoseCorrection(const LocalizePose& guess, const LocalizePose& result, double* out_xy_m,
+                    double* out_z_m, double* out_yaw_rad) {
   const double dx = result.x - guess.x;
   const double dy = result.y - guess.y;
-  const double dz = result.z - guess.z;
-  if (out_distance_m) *out_distance_m = std::sqrt(dx * dx + dy * dy + dz * dz);
+  if (out_xy_m) *out_xy_m = std::sqrt(dx * dx + dy * dy);
+  if (out_z_m) *out_z_m = result.z - guess.z;
   LastLocalization g;
   g.qx = guess.qx;
   g.qy = guess.qy;
@@ -385,6 +385,24 @@ void PoseCorrection(const LocalizePose& guess, const LocalizePose& result, doubl
   r.qz = result.qz;
   r.qw = result.qw;
   if (out_yaw_rad) *out_yaw_rad = angle_diff(yaw_of(r), yaw_of(g));
+}
+
+std::string FormatLocalizeDetail(const LocalizeDetailFields& f) {
+  std::ostringstream oss;
+  oss << "status=" << (f.status.empty() ? "unknown" : f.status)
+      << " quality=" << (f.quality_check.empty() ? "unknown" : f.quality_check)
+      << " accepted_by=" << (f.accepted_by.empty() ? "none" : f.accepted_by)
+      << " visual_verification=" << (f.visual_verification ? "true" : "false");
+  if (f.has_correction) {
+    oss.setf(std::ios::fixed);
+    oss.precision(3);
+    oss << " correction_m=" << f.correction_xy_m << " correction_z_m=" << f.correction_z_m;
+    oss.precision(1);
+    oss << " correction_deg=" << f.correction_yaw_rad * 180.0 / kPi;
+  } else {
+    oss << " correction_m=unknown correction_z_m=unknown correction_deg=unknown";
+  }
+  return oss.str();
 }
 
 WaypointLocalizeSpec OperatorLocalizeSpec(const std::string& waypoint_id,
@@ -399,6 +417,10 @@ WaypointLocalizeSpec OperatorLocalizeSpec(const std::string& waypoint_id,
   spec.do_ambiguity_check = true;
   spec.send_current_ko_tform_body = true;
   return spec;
+}
+
+bool OperatorAcceptNeedsConfirmation(const std::string& accepted_by, bool visual_verification) {
+  return accepted_by == "operator_small_correction" && !visual_verification;
 }
 
 LocalizeAcceptancePolicy OperatorAcceptancePolicy() {
@@ -438,6 +460,10 @@ std::string LocalizationConfirmation::pending_reason() const {
     case State::kRecovering:
       return "a localization attempt (restart recovery or spot.localize) is in progress";
     case State::kAutomatic:
+      if (!unverified_note_.empty()) {
+        return "localization at waypoint " + waypoint_id_ + " (" + unverified_note_ +
+               ") is not confirmed";
+      }
       return "localization at waypoint " + waypoint_id_ +
              " was set automatically after a restart and is not confirmed";
     case State::kRejected:
@@ -475,6 +501,15 @@ void LocalizationConfirmation::OnAutomaticLocalization(const std::string& waypoi
   state_ = State::kAutomatic;
   waypoint_id_ = waypoint_id;
   rejection_.clear();
+  unverified_note_.clear();
+}
+
+void LocalizationConfirmation::OnUnverifiedOperatorLocalization(const std::string& waypoint_id,
+                                                                const std::string& why) {
+  state_ = State::kAutomatic;
+  waypoint_id_ = waypoint_id;
+  rejection_.clear();
+  unverified_note_ = why;
 }
 
 void LocalizationConfirmation::OnRejectedLocalization(const std::string& waypoint_id,

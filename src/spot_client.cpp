@@ -1573,16 +1573,15 @@ bool SpotClient::GetGraphWaypointCount(int* out_count, std::string* out_signal) 
     if (out_signal) *out_signal = signal;
     return true;
   };
-  if (!EnsureGraphNavRecordingClient()) return false;
-  auto r = graph_nav_recording_client_->GetRecordStatus();
-  if (!r.status) {
-    SetLastError(r.status.DebugString());
-    return false;
+  if (EnsureGraphNavRecordingClient()) {
+    auto r = graph_nav_recording_client_->GetRecordStatus();
+    if (r.status && r.response.has_map_stats() &&
+        r.response.map_stats().waypoints().count() > 0) {
+      return decide(r.response.map_stats().waypoints().count(), "record_status");
+    }
   }
-  if (r.response.has_map_stats() && r.response.map_stats().waypoints().count() > 0) {
-    return decide(r.response.map_stats().waypoints().count(), "record_status");
-  }
-  // Zero or missing map stats: do not trust that alone before restoring a map.
+  // GetRecordStatus failed, or reported zero or no map stats: do not trust that
+  // alone before restoring a map.
   if (!EnsureGraphNavClient()) return false;
   ::bosdyn::api::graph_nav::GetLocalizationStateRequest loc_req;
   auto loc = graph_nav_client_->GetLocalizationState(loc_req);
@@ -1686,6 +1685,8 @@ bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& reques
   }
   auto req = BuildWaypointSetLocalizationRequest(request, have_odom ? &odom_tform_body : nullptr);
 
+  result.visual_verification =
+      request.refine_with_visual_features && request.verify_visual_refinement;
   auto r = graph_nav_client_->SetLocalization(req);
   const auto status = r.response.status();
   result.status = SetLocalizationResponse::Status_Name(status);
@@ -1707,7 +1708,7 @@ bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& reques
                              t.rotation().w()};
       result.has_correction = true;
       PoseCorrection(request.waypoint_tform_body, got, &result.correction_m,
-                     &result.correction_yaw_rad);
+                     &result.correction_z_m, &result.correction_yaw_rad);
     }
   }
   LocalizeResponseFacts facts;
@@ -1715,10 +1716,10 @@ bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& reques
   facts.quality_check = result.quality_check;
   facts.suspected_ambiguity = result.suspected_ambiguity;
   facts.ambiguity_check_requested = request.do_ambiguity_check;
-  facts.visual_verification_requested =
-      request.refine_with_visual_features && request.verify_visual_refinement;
+  facts.visual_verification_requested = result.visual_verification;
   facts.has_correction = result.has_correction;
   facts.correction_m = result.correction_m;
+  facts.correction_z_m = result.correction_z_m;
   facts.correction_yaw_rad = result.correction_yaw_rad;
   // GraphNav applies a STATUS_OK localization even when its quality check fails,
   // so the RPC succeeding is not enough.
