@@ -5237,23 +5237,7 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
   }
   waypoint_recovery_attempted_ = true;
 
-  SpotClient::WaypointLocalizeRequest request;
-  request.waypoint_id = in.last.waypoint_id;
-  if (in.last.has_waypoint_tform_body) {
-    request.waypoint_tform_body.x = in.last.x;
-    request.waypoint_tform_body.y = in.last.y;
-    request.waypoint_tform_body.z = in.last.z;
-    request.waypoint_tform_body.qx = in.last.qx;
-    request.waypoint_tform_body.qy = in.last.qy;
-    request.waypoint_tform_body.qz = in.last.qz;
-    request.waypoint_tform_body.qw = in.last.qw;
-  }
-  const WaypointLocalizeLimits limits;
-  request.max_distance_m = limits.max_distance_m;
-  request.max_yaw_rad = limits.max_yaw_rad;
-  request.verify_visual_refinement = true;
-  // The saved pose was taken before the restart; that odom frame is gone.
-  request.send_current_ko_tform_body = false;
+  const SpotClient::WaypointLocalizeRequest request = RecoveryLocalizeSpec(in.last);
 
   std::string waypoint_name;
   {
@@ -5266,12 +5250,13 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
           " saved_age_s=" + std::to_string(age_s) + " (robot is not moved)");
 
   SpotClient::WaypointLocalizeResult result;
-  if (spot_.SetLocalizationAtWaypoint(request, &result)) {
+  if (spot_.SetLocalizationAtWaypoint(request, RecoveryAcceptancePolicy(), &result)) {
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
       localization_confirmation_.OnAutomaticLocalization(result.localized_waypoint_id);
     }
     const std::string detail = "status=" + result.status + " quality=" + result.quality_check +
+                               " accepted_by=" + result.basis +
                                "; unconfirmed, navigation blocked until spot.localize.confirm";
     EmitLog("[graphnav] restart localization recovery succeeded waypoint_id=" +
             result.localized_waypoint_id + " " + detail);
@@ -5363,15 +5348,11 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
   }
   if (name.empty()) name = waypoint_id;
 
-  SpotClient::WaypointLocalizeRequest req;
-  req.waypoint_id = waypoint_id;
-  req.max_distance_m = params.limits.max_distance_m;
-  req.max_yaw_rad = params.limits.max_yaw_rad;
-  // An operator-chosen waypoint on an older map may lack usable imagery; let a
-  // failed visual refinement fall back to the point-cloud result. The quality
-  // check and ambiguity check still gate acceptance.
-  req.verify_visual_refinement = false;
-  req.send_current_ko_tform_body = true;
+  // First try with visual verification. GraphNav 5.1 can skip its point-cloud
+  // quality check for a waypoint guess, and verified visual alignment is then the
+  // independent check. If visual alignment fails nothing is applied, and one retry
+  // without it is judged by the operator policy (see localize_recovery.hpp).
+  SpotClient::WaypointLocalizeRequest req = OperatorLocalizeSpec(waypoint_id, params.limits, true);
   EmitLog("[graphnav] " + action + " at name=" + name + " waypoint_id=" + waypoint_id +
           " map_id=" + map_id + " max_distance_m=" + std::to_string(req.max_distance_m) +
           " max_yaw_rad=" + std::to_string(req.max_yaw_rad));
@@ -5390,7 +5371,14 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
   LocalizeAttemptWindow attempt_window(&nav_state_mu_, &localization_confirmation_, true);
 
   SpotClient::WaypointLocalizeResult result;
-  if (!spot_.SetLocalizationAtWaypoint(req, &result)) {
+  bool accepted = spot_.SetLocalizationAtWaypoint(req, OperatorAcceptancePolicy(), &result);
+  if (!accepted && !result.applied && result.status == "STATUS_VISUAL_ALIGNMENT_FAILED") {
+    EmitLog("[graphnav] " + action +
+            ": visual alignment failed (nothing applied); retrying without visual verification");
+    req = OperatorLocalizeSpec(waypoint_id, params.limits, false);
+    accepted = spot_.SetLocalizationAtWaypoint(req, OperatorAcceptancePolicy(), &result);
+  }
+  if (!accepted) {
     const std::string error = spot_.LastError();
     if (!result.applied) {
       EmitLog("[graphnav] " + action + " failed: " + error);
@@ -5430,7 +5418,14 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
     std::lock_guard<std::mutex> lk(nav_state_mu_);
     localization_confirmation_.OnOperatorLocalize();
   }
-  const std::string detail = "status=" + result.status + " quality=" + result.quality_check;
+  std::ostringstream detail_stream;
+  detail_stream << "status=" << result.status << " quality=" << result.quality_check
+                << " accepted_by=" << result.basis;
+  if (result.has_correction) {
+    detail_stream << " correction_m=" << result.correction_m
+                  << " correction_deg=" << result.correction_yaw_rad * 180.0 / 3.14159265358979323846;
+  }
+  const std::string detail = detail_stream.str();
   EmitLog("[graphnav] " + action + " succeeded name=" + name +
           " localized_waypoint_id=" + result.localized_waypoint_id + " " + detail);
   RecordLocalizeResult("command", true, result.localized_waypoint_id, detail);

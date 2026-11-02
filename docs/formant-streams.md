@@ -445,7 +445,10 @@ parameters documented in the repository `README.md`.
 - Parameter text: `<name>`, `name=<alias_or_label>` or `waypoint_id=<id>`.
 - Optional `map_uuid=<uuid>`, `max_distance=<m>` (default 0.5, max 1.5),
   `max_yaw_deg=<deg>` (default 20, max 45).
-- Succeeds only with `STATUS_OK`, `QUALITY_CHECK_SUCCESS` and no suspected ambiguity.
+- Needs `STATUS_OK` and no suspected ambiguity, plus `QUALITY_CHECK_SUCCESS`, or
+  `QUALITY_CHECK_SKIPPED` with verified visual alignment, or (operator retry without visual
+  verification) `QUALITY_CHECK_SKIPPED` with the pose moved at most 25 cm / 10 deg from the guess.
+  See the README for the trade-off.
 - Result is reported on `spot.nav.state` (`localize_*` fields) and `spot.adapter.log`.
 
 - `spot.localize.confirm` (command)

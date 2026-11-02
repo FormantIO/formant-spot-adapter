@@ -311,26 +311,123 @@ WaypointRecoveryPlan DecideWaypointRecovery(const WaypointRecoveryInputs& in) {
   return plan;
 }
 
-LocalizeAcceptance EvaluateWaypointLocalization(const std::string& status,
-                                                const std::string& quality_check,
-                                                bool suspected_ambiguity) {
+LocalizeAcceptance EvaluateWaypointLocalization(const LocalizeResponseFacts& facts,
+                                                const LocalizeAcceptancePolicy& policy) {
   LocalizeAcceptance a;
-  if (status != "STATUS_OK") {
-    a.reason = "GraphNav status " + (status.empty() ? std::string("unknown") : status);
+  if (facts.status != "STATUS_OK") {
+    a.reason = "GraphNav status " + (facts.status.empty() ? std::string("unknown") : facts.status);
     return a;
   }
   a.applied = true;
-  if (quality_check != "QUALITY_CHECK_SUCCESS") {
-    a.reason = "GraphNav quality check " +
-               (quality_check.empty() ? std::string("unknown") : quality_check);
-    return a;
-  }
-  if (suspected_ambiguity) {
+  if (facts.suspected_ambiguity) {
     a.reason = "GraphNav suspects an ambiguous localization (a similar-looking pose nearby)";
     return a;
   }
-  a.ok = true;
+  if (facts.quality_check == "QUALITY_CHECK_SUCCESS") {
+    a.ok = true;
+    a.basis = "quality_check";
+    return a;
+  }
+  if (facts.quality_check == "QUALITY_CHECK_SKIPPED") {
+    if (facts.visual_verification_requested) {
+      // STATUS_OK with verify_refinement_quality means visual alignment passed.
+      a.ok = true;
+      a.basis = "visual_verification";
+      return a;
+    }
+    if (!policy.allow_skipped_with_small_correction) {
+      a.reason = "GraphNav skipped its quality check and visual verification was not used";
+      return a;
+    }
+    if (!facts.ambiguity_check_requested) {
+      a.reason = "GraphNav skipped its quality check and no ambiguity check was requested";
+      return a;
+    }
+    if (!facts.has_correction) {
+      a.reason = "GraphNav skipped its quality check and localized to a different waypoint than "
+                 "the guess";
+      return a;
+    }
+    if (facts.correction_m > policy.max_correction_m ||
+        facts.correction_yaw_rad > policy.max_correction_yaw_rad) {
+      std::ostringstream oss;
+      oss.precision(3);
+      oss << "GraphNav skipped its quality check and moved the pose " << facts.correction_m
+          << " m / " << facts.correction_yaw_rad * 180.0 / kPi << " deg from the guess (limit "
+          << policy.max_correction_m << " m / " << policy.max_correction_yaw_rad * 180.0 / kPi
+          << " deg)";
+      a.reason = oss.str();
+      return a;
+    }
+    a.ok = true;
+    a.basis = "operator_small_correction";
+    return a;
+  }
+  a.reason = "GraphNav quality check " +
+             (facts.quality_check.empty() ? std::string("unknown") : facts.quality_check);
   return a;
+}
+
+void PoseCorrection(const LocalizePose& guess, const LocalizePose& result, double* out_distance_m,
+                    double* out_yaw_rad) {
+  const double dx = result.x - guess.x;
+  const double dy = result.y - guess.y;
+  const double dz = result.z - guess.z;
+  if (out_distance_m) *out_distance_m = std::sqrt(dx * dx + dy * dy + dz * dz);
+  LastLocalization g;
+  g.qx = guess.qx;
+  g.qy = guess.qy;
+  g.qz = guess.qz;
+  g.qw = guess.qw;
+  LastLocalization r;
+  r.qx = result.qx;
+  r.qy = result.qy;
+  r.qz = result.qz;
+  r.qw = result.qw;
+  if (out_yaw_rad) *out_yaw_rad = angle_diff(yaw_of(r), yaw_of(g));
+}
+
+WaypointLocalizeSpec OperatorLocalizeSpec(const std::string& waypoint_id,
+                                          const WaypointLocalizeLimits& limits,
+                                          bool verify_visual_refinement) {
+  WaypointLocalizeSpec spec;
+  spec.waypoint_id = waypoint_id;  // identity waypoint_tform_body: "at the waypoint"
+  spec.max_distance_m = limits.max_distance_m;
+  spec.max_yaw_rad = limits.max_yaw_rad;
+  spec.refine_with_visual_features = true;
+  spec.verify_visual_refinement = verify_visual_refinement;
+  spec.do_ambiguity_check = true;
+  spec.send_current_ko_tform_body = true;
+  return spec;
+}
+
+LocalizeAcceptancePolicy OperatorAcceptancePolicy() {
+  LocalizeAcceptancePolicy policy;
+  policy.allow_skipped_with_small_correction = true;
+  return policy;
+}
+
+WaypointLocalizeSpec RecoveryLocalizeSpec(const LastLocalization& last) {
+  WaypointLocalizeSpec spec;
+  spec.waypoint_id = last.waypoint_id;
+  if (last.has_waypoint_tform_body) {
+    spec.waypoint_tform_body = {last.x, last.y, last.z, last.qx, last.qy, last.qz, last.qw};
+  }
+  const WaypointLocalizeLimits limits;
+  spec.max_distance_m = limits.max_distance_m;
+  spec.max_yaw_rad = limits.max_yaw_rad;
+  spec.refine_with_visual_features = true;
+  spec.verify_visual_refinement = true;
+  spec.do_ambiguity_check = true;
+  // The saved pose was taken before the restart; that odom frame is gone.
+  spec.send_current_ko_tform_body = false;
+  return spec;
+}
+
+LocalizeAcceptancePolicy RecoveryAcceptancePolicy() {
+  LocalizeAcceptancePolicy policy;
+  policy.allow_skipped_with_small_correction = false;
+  return policy;
 }
 
 std::string LocalizationConfirmation::pending_reason() const {

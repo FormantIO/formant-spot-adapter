@@ -26,11 +26,87 @@ struct WaypointLocalizeLimits {
 constexpr double kMaxLocalizeDistanceM = 1.5;
 constexpr double kMaxLocalizeYawDeg = 45.0;
 
-// Whether a SetLocalization answer may be trusted. GraphNav applies the
-// localization whenever the status is STATUS_OK, even when its own quality check
-// then reports a poor match or it suspects an ambiguous (for example rotated)
-// solution. Only STATUS_OK + QUALITY_CHECK_SUCCESS + no suspected ambiguity is
-// accepted.
+// What makes a SetLocalization answer trustworthy (Spot SDK 5.1).
+//
+// GraphNav applies a STATUS_OK localization even when its own point-cloud quality
+// check fails, so STATUS_OK alone is not enough. The 5.1 API has no field that
+// forces that quality check to run (no refine_algorithm; the `refinement` oneof
+// only offers refine_fiducial_result_with_icp, which needs a fiducial, and
+// refine_with_visual_features). It reports QUALITY_CHECK_SKIPPED when it "wasn't
+// enough data to make a determination", which is what a NO_FIDUCIAL waypoint
+// guess got on the robot. The checks that remain under the client's control:
+//   - refine_with_visual_features with verify_refinement_quality: GraphNav
+//     returns STATUS_VISUAL_ALIGNMENT_FAILED (nothing applied) when visual
+//     alignment fails or its pose solution is unreliable, so STATUS_OK means
+//     that independent check passed;
+//   - do_ambiguity_check: GraphNav reports a suspected_ambiguity when a nearby
+//     pose (for example turned 180 degrees) fits as well;
+//   - how far GraphNav moved the pose from the guess.
+//
+// Acceptance, in order:
+//   1. STATUS_OK is required; anything else applied nothing.
+//   2. A suspected ambiguity is always rejected.
+//   3. QUALITY_CHECK_SUCCESS is accepted.
+//   4. QUALITY_CHECK_SKIPPED is accepted when visual verification was requested
+//      (STATUS_OK then means it passed), or, only where the policy allows it (an
+//      operator who asserted the waypoint), when the ambiguity check was
+//      requested and the pose moved at most max_correction from the guess.
+//   5. Every other quality result (poor point cloud match, poor gravity
+//      alignment, bad height, unknown) is rejected.
+// Trade-off of 4b: a small correction does not prove the point clouds matched;
+// a poorly constrained match can also stay near the guess. It is accepted only
+// on a person's word that the robot is at that waypoint, with the ambiguity check
+// as the remaining automatic guard. Restart recovery never uses it.
+
+struct LocalizePose {
+  double x{0.0};
+  double y{0.0};
+  double z{0.0};
+  double qx{0.0};
+  double qy{0.0};
+  double qz{0.0};
+  double qw{1.0};
+};
+
+// Everything that goes into one SetLocalization request at a waypoint.
+struct WaypointLocalizeSpec {
+  std::string waypoint_id;
+  // Robot pose relative to the waypoint. Identity means "at the waypoint".
+  LocalizePose waypoint_tform_body;
+  double max_distance_m{0.5};
+  double max_yaw_rad{0.3490658503988659};
+  bool refine_with_visual_features{true};
+  // Fail with STATUS_VISUAL_ALIGNMENT_FAILED instead of falling back to the
+  // point-cloud result when visual refinement fails.
+  bool verify_visual_refinement{true};
+  bool do_ambiguity_check{true};
+  // Send the robot's current odom pose as ko_tform_body. Only correct when the
+  // guess is about the robot's pose right now; a guess saved before a reboot
+  // refers to an odom frame that no longer exists.
+  bool send_current_ko_tform_body{true};
+};
+
+struct LocalizeAcceptancePolicy {
+  // Rule 4b above. Operator command only.
+  bool allow_skipped_with_small_correction{false};
+  double max_correction_m{0.25};
+  double max_correction_yaw_rad{0.17453292519943295};  // 10 degrees
+};
+
+// What the request asked for and what GraphNav answered.
+struct LocalizeResponseFacts {
+  std::string status;
+  std::string quality_check;
+  bool suspected_ambiguity{false};
+  bool ambiguity_check_requested{false};
+  bool visual_verification_requested{false};
+  // How far the result moved from the guess. Only known when GraphNav kept the
+  // guessed waypoint as the reference.
+  bool has_correction{false};
+  double correction_m{0.0};
+  double correction_yaw_rad{0.0};
+};
+
 struct LocalizeAcceptance {
   bool ok{false};
   // GraphNav applied a localization (STATUS_OK). When `applied && !ok` the robot
@@ -38,10 +114,27 @@ struct LocalizeAcceptance {
   bool applied{false};
   // Why the result was rejected, empty when ok.
   std::string reason;
+  // Which check accepted it: quality_check, visual_verification or
+  // operator_small_correction. Empty when rejected.
+  std::string basis;
 };
-LocalizeAcceptance EvaluateWaypointLocalization(const std::string& status,
-                                                const std::string& quality_check,
-                                                bool suspected_ambiguity);
+LocalizeAcceptance EvaluateWaypointLocalization(const LocalizeResponseFacts& facts,
+                                                const LocalizeAcceptancePolicy& policy);
+
+// Distance and absolute yaw difference between two poses in the same frame.
+void PoseCorrection(const LocalizePose& guess, const LocalizePose& result, double* out_distance_m,
+                    double* out_yaw_rad);
+
+// Request specs. The operator command first asks for visual verification; if that
+// fails (STATUS_VISUAL_ALIGNMENT_FAILED, nothing applied) it retries once without
+// it, under the operator policy. Restart recovery makes one verified attempt.
+WaypointLocalizeSpec OperatorLocalizeSpec(const std::string& waypoint_id,
+                                          const WaypointLocalizeLimits& limits,
+                                          bool verify_visual_refinement);
+LocalizeAcceptancePolicy OperatorAcceptancePolicy();
+struct LastLocalization;
+WaypointLocalizeSpec RecoveryLocalizeSpec(const LastLocalization& last);
+LocalizeAcceptancePolicy RecoveryAcceptancePolicy();
 
 // Parameters of the `spot.localize` command.
 struct LocalizeCommandParams {

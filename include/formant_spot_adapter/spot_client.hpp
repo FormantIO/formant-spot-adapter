@@ -1,5 +1,6 @@
 #pragma once
 
+#include "formant_spot_adapter/localize_recovery.hpp"
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -157,23 +158,8 @@ class SpotClient {
   };
 
   // Localize against the loaded map from a guess of "the robot is here relative
-  // to this waypoint", without using fiducials.
-  struct WaypointLocalizeRequest {
-    std::string waypoint_id;
-    // Robot pose relative to the waypoint. Identity means "at the waypoint".
-    Pose3D waypoint_tform_body;
-    double max_distance_m{0.5};
-    double max_yaw_rad{0.3490658503988659};
-    bool refine_with_visual_features{true};
-    // Fail with STATUS_VISUAL_ALIGNMENT_FAILED instead of falling back to the
-    // point-cloud result when visual refinement fails.
-    bool verify_visual_refinement{true};
-    bool do_ambiguity_check{true};
-    // Send the robot's current odom pose as ko_tform_body. Only correct when the
-    // guess is about the robot's pose right now; a guess saved before a reboot
-    // refers to an odom frame that no longer exists.
-    bool send_current_ko_tform_body{true};
-  };
+  // to this waypoint", without using fiducials. See localize_recovery.hpp.
+  using WaypointLocalizeRequest = WaypointLocalizeSpec;
 
   struct WaypointLocalizeResult {
     // STATUS_OK, QUALITY_CHECK_SUCCESS and no suspected ambiguity.
@@ -188,6 +174,13 @@ class SpotClient {
     // QualityCheckResult name; GraphNav applies the localization even when poor.
     std::string quality_check;
     bool suspected_ambiguity{false};
+    // Which check accepted the result (see LocalizeAcceptance::basis).
+    std::string basis;
+    // How far GraphNav moved the pose from the guess, when it kept the guessed
+    // waypoint as the reference.
+    bool has_correction{false};
+    double correction_m{0.0};
+    double correction_yaw_rad{0.0};
     // Waypoint GraphNav ended up localized to.
     std::string localized_waypoint_id;
   };
@@ -297,6 +290,7 @@ class SpotClient {
   // No lease needed. Returns true only for an accepted result (see
   // EvaluateWaypointLocalization). On failure LastError() gives the reason.
   bool SetLocalizationAtWaypoint(const WaypointLocalizeRequest& request,
+                                 const LocalizeAcceptancePolicy& policy,
                                  WaypointLocalizeResult* out_result);
   bool GetLocalizationWaypointId(std::string* out_waypoint_id);
   bool GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot);

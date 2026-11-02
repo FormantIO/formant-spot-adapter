@@ -211,13 +211,28 @@ Additional non-GraphNav command-channel actions:
     (search radius around the waypoint, default 0.5, max 1.5), `max_yaw_deg=<deg>` (default 20,
     max 45).
   - Calls GraphNav SetLocalization with `FIDUCIAL_INIT_NO_FIDUCIAL`, an initial guess of identity
-    `waypoint_tform_body` at that waypoint, the current `ko_tform_body`, ambiguity checking, and
-    visual-feature refinement (falls back to the point-cloud result if visual refinement fails).
-  - Succeeds only when GraphNav returns `STATUS_OK`, its quality check returns
-    `QUALITY_CHECK_SUCCESS`, and it reports no suspected ambiguity. GraphNav applies a `STATUS_OK`
-    localization even when the quality check fails; in that case the command fails and the adapter
-    clears that localization the same way restart recovery does (below). If it cannot be cleared,
-    navigation stays blocked until it is confirmed or replaced.
+    `waypoint_tform_body` at that waypoint, the current `ko_tform_body`, `do_ambiguity_check`, and
+    `refine_with_visual_features` with `verify_refinement_quality`. If visual alignment fails
+    (`STATUS_VISUAL_ALIGNMENT_FAILED`, nothing applied) it retries once without verification.
+  - Acceptance. GraphNav applies a `STATUS_OK` localization even when its own point-cloud quality
+    check fails, and for a waypoint guess on Spot SDK 5.1 it can skip that check entirely
+    (`QUALITY_CHECK_SKIPPED`, seen on the robot). The 5.1 API has no request field that forces the
+    check to run: there is no refine algorithm option, and the only other refinement,
+    `refine_fiducial_result_with_icp`, needs a fiducial. So the adapter accepts a result when:
+    - the status is `STATUS_OK` and GraphNav reports no suspected ambiguity, and
+    - the quality check is `QUALITY_CHECK_SUCCESS`, or
+    - it is `QUALITY_CHECK_SKIPPED` and verified visual alignment passed, or
+    - (this command only, on the retry) it is `QUALITY_CHECK_SKIPPED`, the ambiguity check was
+      requested, GraphNav kept the guessed waypoint, and it moved the pose at most 25 cm and
+      10 deg from the guess.
+    Any other quality result is rejected. Trade-off of the last rule: a small correction does not
+    prove the point clouds matched, since a poorly constrained match can also stay near the guess.
+    It rests on the operator's statement that the robot is at that waypoint, with the ambiguity
+    check as the remaining automatic guard, and restart recovery never uses it. The log and
+    `localize_detail` name the rule that accepted (`accepted_by=quality_check`,
+    `visual_verification` or `operator_small_correction`) and the correction.
+  - A rejected result that GraphNav applied is cleared the same way restart recovery does
+    (below). If it cannot be cleared, navigation stays blocked until it is confirmed or replaced.
   - No lease needed for the localization itself and the robot does not move. Rejected while
     navigating, mapping, while the map is still being restored, or while restart recovery runs.
     The result is published on `spot.nav.state`.
@@ -239,7 +254,9 @@ Restart localization recovery:
   (`STATUS_NO_MATCHING_FIDUCIAL`, `FIDUCIAL_TOO_FAR_AWAY`, `FIDUCIAL_TOO_OLD`,
   `FIDUCIAL_POSE_UNCERTAIN`), the adapter tries SetLocalization once at the saved waypoint and
   offset, with visual refinement verification on and without `ko_tform_body` (the odom frame from
-  before the reboot no longer exists). It is skipped when the saved record is for another map, its
+  before the reboot no longer exists). It accepts only `QUALITY_CHECK_SUCCESS`, or
+  `QUALITY_CHECK_SKIPPED` with verified visual alignment, and never a suspected ambiguity. A map
+  without usable visual data therefore cannot be recovered automatically; use `spot.localize`. It is skipped when the saved record is for another map, its
   waypoint is gone, it is older than `localize_recovery_max_record_age_sec` (default 86400, 0 turns
   recovery off), or the restore ran more than `localize_recovery_max_restore_delay_sec` (default
   60) after it could first start (scheduled, or Spot's API answering after a power cycle,

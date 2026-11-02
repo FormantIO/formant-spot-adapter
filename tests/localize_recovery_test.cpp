@@ -248,40 +248,160 @@ fsa::WaypointRecoveryInputs walt_after_reboot() {
   return in;
 }
 
+fsa::LocalizeResponseFacts facts(const std::string& status, const std::string& quality,
+                                 bool ambiguity = false) {
+  fsa::LocalizeResponseFacts f;
+  f.status = status;
+  f.quality_check = quality;
+  f.suspected_ambiguity = ambiguity;
+  f.ambiguity_check_requested = true;
+  return f;
+}
+
 void test_acceptance() {
+  const auto op = fsa::OperatorAcceptancePolicy();
+  const auto rec = fsa::RecoveryAcceptancePolicy();
+  check(op.allow_skipped_with_small_correction, "operator policy allows the small-correction rule");
+  check(!rec.allow_skipped_with_small_correction, "recovery never uses the small-correction rule");
   {
-    const auto a = fsa::EvaluateWaypointLocalization("STATUS_OK", "QUALITY_CHECK_SUCCESS", false);
-    check(a.ok && a.applied && a.reason.empty(), "OK + quality success + no ambiguity is accepted");
+    const auto a = fsa::EvaluateWaypointLocalization(facts("STATUS_OK", "QUALITY_CHECK_SUCCESS"), rec);
+    check(a.ok && a.applied && a.basis == "quality_check", "quality success is accepted");
   }
   {
-    const auto a =
-        fsa::EvaluateWaypointLocalization("STATUS_OK", "QUALITY_CHECK_POOR_POINT_CLOUD_MATCH", false);
+    const auto a = fsa::EvaluateWaypointLocalization(
+        facts("STATUS_OK", "QUALITY_CHECK_POOR_POINT_CLOUD_MATCH"), op);
     check(!a.ok && a.applied, "poor point cloud match is applied but rejected");
     check(contains(a.reason, "POOR_POINT_CLOUD_MATCH"), "reason names the quality: " + a.reason);
   }
-  {
-    const auto a = fsa::EvaluateWaypointLocalization("STATUS_OK", "QUALITY_CHECK_SKIPPED", false);
-    check(!a.ok && a.applied, "skipped quality check is rejected");
+  for (const char* q : {"QUALITY_CHECK_POOR_GRAVITY_ALIGNMENT", "QUALITY_CHECK_BAD_HEIGHT",
+                        "QUALITY_CHECK_UNKNOWN"}) {
+    auto f = facts("STATUS_OK", q);
+    f.visual_verification_requested = true;
+    f.has_correction = true;
+    check(!fsa::EvaluateWaypointLocalization(f, op).ok,
+          std::string(q) + " is rejected even with visual verification");
   }
   {
-    const auto a = fsa::EvaluateWaypointLocalization("STATUS_OK", "QUALITY_CHECK_UNKNOWN", false);
-    check(!a.ok && a.applied, "unknown quality check is rejected");
-  }
-  {
-    const auto a = fsa::EvaluateWaypointLocalization("STATUS_OK", "QUALITY_CHECK_SUCCESS", true);
+    auto f = facts("STATUS_OK", "QUALITY_CHECK_SUCCESS", true);
+    f.visual_verification_requested = true;
+    const auto a = fsa::EvaluateWaypointLocalization(f, op);
     check(!a.ok && a.applied && contains(a.reason, "ambiguous"),
-          "suspected ambiguity is rejected: " + a.reason);
+          "suspected ambiguity is always rejected: " + a.reason);
   }
   {
-    const auto a =
-        fsa::EvaluateWaypointLocalization("STATUS_VISUAL_ALIGNMENT_FAILED", "QUALITY_CHECK_UNKNOWN", false);
+    const auto a = fsa::EvaluateWaypointLocalization(
+        facts("STATUS_VISUAL_ALIGNMENT_FAILED", "QUALITY_CHECK_UNKNOWN"), op);
     check(!a.ok && !a.applied && contains(a.reason, "VISUAL_ALIGNMENT_FAILED"),
           "visual alignment failure is a failure, not applied: " + a.reason);
   }
   {
-    const auto a = fsa::EvaluateWaypointLocalization("STATUS_FAILED", "", false);
+    const auto a = fsa::EvaluateWaypointLocalization(facts("STATUS_FAILED", ""), op);
     check(!a.ok && !a.applied, "STATUS_FAILED is not applied");
   }
+  // QUALITY_CHECK_SKIPPED: what Walt's dock waypoint returned on the robot.
+  {
+    auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED");
+    f.visual_verification_requested = true;
+    const auto a = fsa::EvaluateWaypointLocalization(f, rec);
+    check(a.ok && a.basis == "visual_verification",
+          "skipped + verified visual alignment is accepted, also for recovery");
+  }
+  {
+    auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED");
+    f.has_correction = true;
+    f.correction_m = 0.05;
+    const auto a = fsa::EvaluateWaypointLocalization(f, rec);
+    check(!a.ok && a.applied && contains(a.reason, "visual verification was not used"),
+          "recovery rejects skipped without visual verification: " + a.reason);
+  }
+  {
+    auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED");
+    f.has_correction = true;
+    f.correction_m = 0.05;
+    f.correction_yaw_rad = 0.02;
+    const auto a = fsa::EvaluateWaypointLocalization(f, op);
+    check(a.ok && a.basis == "operator_small_correction",
+          "operator: skipped + no ambiguity + 5 cm correction is accepted");
+  }
+  {
+    auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED");
+    f.has_correction = true;
+    f.correction_m = 0.30;
+    const auto a = fsa::EvaluateWaypointLocalization(f, op);
+    check(!a.ok && a.applied && contains(a.reason, "moved the pose"),
+          "operator: correction over 25 cm is rejected: " + a.reason);
+  }
+  {
+    auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED");
+    f.has_correction = true;
+    f.correction_yaw_rad = 0.2;  // about 11.5 deg
+    check(!fsa::EvaluateWaypointLocalization(f, op).ok, "operator: correction over 10 deg rejected");
+  }
+  {
+    auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED");
+    f.has_correction = false;
+    const auto a = fsa::EvaluateWaypointLocalization(f, op);
+    check(!a.ok && contains(a.reason, "different waypoint"),
+          "operator: unknown correction (other waypoint) is rejected: " + a.reason);
+  }
+  {
+    auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED");
+    f.ambiguity_check_requested = false;
+    f.has_correction = true;
+    check(!fsa::EvaluateWaypointLocalization(f, op).ok,
+          "operator: skipped without an ambiguity check is rejected");
+  }
+  {
+    auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED", true);
+    f.has_correction = true;
+    check(!fsa::EvaluateWaypointLocalization(f, op).ok, "operator: skipped + ambiguity rejected");
+  }
+}
+
+void test_pose_correction() {
+  fsa::LocalizePose guess;
+  fsa::LocalizePose got{0.03, -0.04, 0.0, 0.0, 0.0, std::sin(0.05), std::cos(0.05)};
+  double d = 0.0;
+  double yaw = 0.0;
+  fsa::PoseCorrection(guess, got, &d, &yaw);
+  check(near(d, 0.05), "correction distance is 5 cm");
+  check(std::fabs(yaw - 0.1) < 1e-9, "correction yaw is 0.1 rad");
+  fsa::LocalizePose turned{0, 0, 0, 0, 0, std::sin(3.1), std::cos(3.1)};  // yaw 6.2 rad
+  fsa::PoseCorrection(guess, turned, &d, &yaw);
+  check(std::fabs(yaw - (2 * 3.14159265358979323846 - 6.2)) < 1e-9, "yaw difference wraps");
+}
+
+void test_specs() {
+  fsa::WaypointLocalizeLimits limits;
+  limits.max_distance_m = 1.0;
+  limits.max_yaw_rad = 0.5;
+  const auto first = fsa::OperatorLocalizeSpec("wp-1", limits, true);
+  check(first.waypoint_id == "wp-1", "operator spec waypoint");
+  check(near(first.waypoint_tform_body.qw, 1.0) && near(first.waypoint_tform_body.x, 0.0),
+        "operator guess is identity: robot at the waypoint");
+  check(near(first.max_distance_m, 1.0) && near(first.max_yaw_rad, 0.5), "operator limits");
+  check(first.refine_with_visual_features && first.verify_visual_refinement,
+        "operator first pass verifies visual alignment");
+  check(first.do_ambiguity_check, "operator ambiguity check on");
+  check(first.send_current_ko_tform_body, "operator guess is about now: send ko_tform_body");
+  const auto retry = fsa::OperatorLocalizeSpec("wp-1", limits, false);
+  check(retry.refine_with_visual_features && !retry.verify_visual_refinement,
+        "operator retry refines visually without verification");
+
+  const auto saved = with_pose(rec("m", "wp-9"), 1.0, 2.0, 0.3);
+  const auto r = fsa::RecoveryLocalizeSpec(saved);
+  check(r.waypoint_id == "wp-9", "recovery spec waypoint");
+  check(near(r.waypoint_tform_body.x, 1.0) && near(r.waypoint_tform_body.y, 2.0) &&
+            near(r.waypoint_tform_body.qz, saved.qz),
+        "recovery guess is the saved offset");
+  check(r.refine_with_visual_features && r.verify_visual_refinement,
+        "recovery verifies visual alignment");
+  check(r.do_ambiguity_check, "recovery ambiguity check on");
+  check(!r.send_current_ko_tform_body, "recovery omits ko_tform_body (odom reset by reboot)");
+  const fsa::WaypointLocalizeLimits defaults;
+  check(near(r.max_distance_m, defaults.max_distance_m), "recovery uses default limits");
+  const auto r2 = fsa::RecoveryLocalizeSpec(rec("m", "wp-9"));
+  check(near(r2.waypoint_tform_body.qw, 1.0), "recovery without saved pose uses identity");
 }
 
 void test_confirmation() {
@@ -512,6 +632,8 @@ int main() {
   test_throttle();
   test_fiducial_errors();
   test_acceptance();
+  test_pose_correction();
+  test_specs();
   test_confirmation();
   test_recovery_ordering();
   test_recovery_decision();
