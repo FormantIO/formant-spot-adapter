@@ -16,6 +16,7 @@
 
 #include "formant_spot_adapter/config.hpp"
 #include "formant_spot_adapter/formant_agent_client.hpp"
+#include "formant_spot_adapter/localize_recovery.hpp"
 #include "formant_spot_adapter/spot_client.hpp"
 
 namespace fsa {
@@ -93,6 +94,15 @@ class Adapter {
   bool ExecuteUndockCommand();
   bool WaitForGraphNavCommandResult(uint32_t command_id, long long timeout_ms);
   bool EnsureLocalizedForNavigation(const std::string& action_name);
+  bool ExecuteLocalizeCommand(const v1::model::CommandRequest& request);
+  void RecordLocalizeResult(const std::string& source, bool ok, const std::string& waypoint_id,
+                            const std::string& detail);
+  std::string LastLocalizationPath() const;
+  void MaybePersistLastLocalization(const SpotClient::LocalizationSnapshot& localization,
+                                    long long now);
+  void MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored_map_id,
+                                              const SpotClient::StoredMap& map_data,
+                                              const std::string& fiducial_error);
   bool StartNavigateWithRecovery(const std::string& action_name,
                                  const std::string& waypoint_id,
                                  uint32_t* out_command_id,
@@ -412,6 +422,13 @@ class Adapter {
   std::string nav_terminal_reason_;
   uint32_t nav_last_completed_command_id_{0};
   long long nav_last_updated_ms_{0};
+  // Outcome of the last spot.localize command or restart recovery, published on
+  // the nav state stream. Guarded by nav_state_mu_.
+  std::string localize_result_;
+  std::string localize_source_;
+  std::string localize_waypoint_id_;
+  std::string localize_detail_;
+  long long localize_at_ms_{0};
   std::string nav_target_mode_;
   std::string nav_target_waypoint_id_;
   std::string nav_target_waypoint_name_;
@@ -437,6 +454,10 @@ class Adapter {
   std::atomic<long long> next_map_restore_attempt_ms_{0};
   std::atomic<long long> last_nav_feedback_poll_ms_{0};
   std::atomic<long long> last_nav_state_pub_ms_{0};
+  std::atomic<long long> last_localization_persist_poll_ms_{0};
+  std::atomic<bool> waypoint_recovery_attempted_{false};
+  std::mutex last_localization_mu_;
+  fsa::LastLocalizationThrottle last_localization_throttle_;
   std::atomic<long long> last_nav_hold_log_ms_{0};
   std::atomic<long long> last_nav_diag_log_ms_{0};
   std::atomic<bool> force_waypoint_publish_{true};

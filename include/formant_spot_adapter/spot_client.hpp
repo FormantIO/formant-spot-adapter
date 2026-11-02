@@ -142,6 +142,10 @@ class SpotClient {
     double waypoint_tform_body_x{0.0};
     double waypoint_tform_body_y{0.0};
     double waypoint_tform_body_z{0.0};
+    double waypoint_tform_body_qx{0.0};
+    double waypoint_tform_body_qy{0.0};
+    double waypoint_tform_body_qz{0.0};
+    double waypoint_tform_body_qw{1.0};
     bool has_seed_tform_body{false};
     double seed_tform_body_x{0.0};
     double seed_tform_body_y{0.0};
@@ -150,6 +154,29 @@ class SpotClient {
     double seed_tform_body_qy{0.0};
     double seed_tform_body_qz{0.0};
     double seed_tform_body_qw{1.0};
+  };
+
+  // Localize against the loaded map from a guess of "the robot is here relative
+  // to this waypoint", without using fiducials.
+  struct WaypointLocalizeRequest {
+    std::string waypoint_id;
+    // Robot pose relative to the waypoint. Identity means "at the waypoint".
+    Pose3D waypoint_tform_body;
+    double max_distance_m{0.5};
+    double max_yaw_rad{0.3490658503988659};
+    bool refine_with_visual_features{true};
+    bool do_ambiguity_check{true};
+  };
+
+  struct WaypointLocalizeResult {
+    bool ok{false};
+    // SetLocalizationResponse status name, e.g. STATUS_OK or STATUS_FAILED.
+    std::string status;
+    // QualityCheckResult name; GraphNav applies the localization even when poor.
+    std::string quality_check;
+    bool suspected_ambiguity{false};
+    // Waypoint GraphNav ended up localized to.
+    std::string localized_waypoint_id;
   };
 
   struct OccupancyGridMapSnapshot {
@@ -245,6 +272,9 @@ class SpotClient {
   bool UploadGraphMap(const StoredMap& map_data);
   bool ClearGraph();
   bool SetLocalizationFiducial();
+  // No lease needed. On failure LastError() names the STATUS_* value.
+  bool SetLocalizationAtWaypoint(const WaypointLocalizeRequest& request,
+                                 WaypointLocalizeResult* out_result);
   bool GetLocalizationWaypointId(std::string* out_waypoint_id);
   bool GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot);
   bool GetLocalizationMapSnapshot(LocalizationMapSnapshot* out_snapshot);

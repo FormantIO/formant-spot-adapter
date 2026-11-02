@@ -130,6 +130,7 @@ add_executable(formant-spot-adapter
   src/spot_client.cpp
   src/spot_check_client.cpp
   src/dock_preflight.cpp
+  src/localize_recovery.cpp
   src/adapter.cpp
 )
 
@@ -214,6 +215,18 @@ target_include_directories(dock-preflight-test PRIVATE
 )
 
 add_test(NAME dock-preflight-test COMMAND dock-preflight-test)
+
+add_executable(localize-recovery-test
+  tests/localize_recovery_test.cpp
+  src/localize_recovery.cpp
+  src/command_params.cpp
+)
+
+target_include_directories(localize-recovery-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME localize-recovery-test COMMAND localize-recovery-test)
 
 # The supported service deployment path for a source checkout is scripts/deploy.sh,
 # which generates a checkout-specific unit file. Keep cmake --install limited to

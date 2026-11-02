@@ -1,6 +1,7 @@
 #include "formant_spot_adapter/adapter.hpp"
 #include "formant_spot_adapter/command_params.hpp"
 #include "formant_spot_adapter/graphnav_map_render.hpp"
+#include "formant_spot_adapter/localize_recovery.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2571,6 +2572,7 @@ bool Adapter::Init() {
     if (!active_map_id_.empty()) {
       pending_restore_map_id_ = active_map_id_;
     }
+    waypoint_recovery_attempted_ = false;
     loaded_waypoint_id_to_label_.clear();
     loaded_waypoint_label_to_ids_.clear();
     loaded_waypoint_lower_label_to_ids_.clear();
@@ -2579,6 +2581,13 @@ bool Adapter::Init() {
     std::cerr << "[graphnav] aborted persisted mapping session during startup map_id="
               << aborted_mapping_map_id << std::endl;
     (void)SaveAdapterMapState();
+  }
+  {
+    LastLocalization saved;
+    if (LoadLastLocalization(LastLocalizationPath(), &saved)) {
+      std::lock_guard<std::mutex> lk(last_localization_mu_);
+      last_localization_throttle_.Seed(saved);
+    }
   }
   force_waypoint_publish_ = true;
   force_maps_publish_ = true;
@@ -2663,7 +2672,7 @@ void Adapter::Run() {
                            "spot.waypoint.delete", "spot.waypoint.goto",
                            "spot.waypoint.goto_straight",
                            "spot.graphnav.goto_pose", "spot.graphnav.goto_pose_straight",
-                           "spot.graphnav.cancel"},
+                           "spot.graphnav.cancel", "spot.localize"},
                           [this](const v1::model::CommandRequest& request) { HandleCommand(request); },
                           request_app_config_refresh);
   agent_.StartHeartbeatLoop(
@@ -4373,8 +4382,10 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
     return;
   }
   if (!spot_.SetLocalizationFiducial()) {
+    const std::string fiducial_error = spot_.LastError();
     EmitLog(std::string("[graphnav] deferred restore localization warning map_id=") +
-            restore_map_id + " error=" + spot_.LastError());
+            restore_map_id + " error=" + fiducial_error);
+    MaybeRecoverLocalizationAtLastWaypoint(restore_map_id, map_data, fiducial_error);
   }
   if (temporary_lease && !spot_.ReturnBodyLease()) {
     EmitLog(std::string("[graphnav] deferred restore warning returning temporary lease map_id=") +
@@ -4940,6 +4951,192 @@ bool Adapter::EnsureLocalizedForNavigation(const std::string& action_name) {
     return false;
   }
   EmitLog("[graphnav] " + action_name + " relocalized to waypoint_id=" + waypoint_id);
+  return true;
+}
+
+std::string Adapter::LastLocalizationPath() const {
+  return cfg_.graphnav_store_dir + "/last_localization.txt";
+}
+
+void Adapter::RecordLocalizeResult(const std::string& source, bool ok,
+                                   const std::string& waypoint_id, const std::string& detail) {
+  std::lock_guard<std::mutex> lk(nav_state_mu_);
+  localize_result_ = ok ? "ok" : "failed";
+  localize_source_ = source;
+  localize_waypoint_id_ = waypoint_id;
+  localize_detail_ = detail;
+  localize_at_ms_ = now_ms();
+}
+
+void Adapter::MaybePersistLastLocalization(const SpotClient::LocalizationSnapshot& localization,
+                                           long long now) {
+  if (localization.waypoint_id.empty()) return;
+  LastLocalization rec;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    // While a restore is pending or a map is being recorded, the robot's
+    // localization does not belong to the adapter's active map.
+    if (!pending_restore_map_id_.empty() || HasActiveMappingSessionLocked() ||
+        map_recording_active_.load()) {
+      return;
+    }
+    rec.map_id = active_map_id_.empty() ? default_map_id_ : active_map_id_;
+  }
+  if (rec.map_id.empty()) return;
+  rec.waypoint_id = localization.waypoint_id;
+  if (localization.has_waypoint_tform_body) {
+    rec.has_waypoint_tform_body = true;
+    rec.x = localization.waypoint_tform_body_x;
+    rec.y = localization.waypoint_tform_body_y;
+    rec.z = localization.waypoint_tform_body_z;
+    rec.qx = localization.waypoint_tform_body_qx;
+    rec.qy = localization.waypoint_tform_body_qy;
+    rec.qz = localization.waypoint_tform_body_qz;
+    rec.qw = localization.waypoint_tform_body_qw;
+  }
+  rec.updated_ms = now;
+
+  std::lock_guard<std::mutex> lk(last_localization_mu_);
+  if (!last_localization_throttle_.ShouldPersist(rec, now)) return;
+  std::string error;
+  if (!SaveLastLocalization(LastLocalizationPath(), rec, &error)) {
+    // Mark anyway so a broken disk does not log every second.
+    last_localization_throttle_.MarkPersisted(rec, now);
+    EmitLog("[graphnav] failed to save last localization: " + error);
+    return;
+  }
+  last_localization_throttle_.MarkPersisted(rec, now);
+}
+
+void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored_map_id,
+                                                     const SpotClient::StoredMap& map_data,
+                                                     const std::string& fiducial_error) {
+  WaypointRecoveryInputs in;
+  in.restored_map_id = restored_map_id;
+  in.fiducial_localization_ok = false;
+  in.fiducial_error = fiducial_error;
+  in.already_attempted = waypoint_recovery_attempted_.load();
+  in.has_last_localization = LoadLastLocalization(LastLocalizationPath(), &in.last);
+  if (in.has_last_localization) {
+    for (const auto& waypoint : map_data.graph.waypoints()) {
+      if (waypoint.id() == in.last.waypoint_id) {
+        in.last_waypoint_in_map = true;
+        break;
+      }
+    }
+  }
+  const WaypointRecoveryPlan plan = DecideWaypointRecovery(in);
+  if (!plan.attempt) {
+    EmitLog("[graphnav] restart localization recovery skipped map_id=" + restored_map_id + ": " +
+            plan.reason);
+    return;
+  }
+  waypoint_recovery_attempted_ = true;
+
+  SpotClient::WaypointLocalizeRequest request;
+  request.waypoint_id = in.last.waypoint_id;
+  if (in.last.has_waypoint_tform_body) {
+    request.waypoint_tform_body.x = in.last.x;
+    request.waypoint_tform_body.y = in.last.y;
+    request.waypoint_tform_body.z = in.last.z;
+    request.waypoint_tform_body.qx = in.last.qx;
+    request.waypoint_tform_body.qy = in.last.qy;
+    request.waypoint_tform_body.qz = in.last.qz;
+    request.waypoint_tform_body.qw = in.last.qw;
+  }
+  const WaypointLocalizeLimits limits;
+  request.max_distance_m = limits.max_distance_m;
+  request.max_yaw_rad = limits.max_yaw_rad;
+
+  std::string waypoint_name;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    waypoint_name = ResolveWaypointNameForIdLocked(in.last.waypoint_id);
+  }
+  const long long age_s =
+      in.last.updated_ms > 0 ? std::max(0LL, (now_ms() - in.last.updated_ms) / 1000) : -1;
+  EmitLog("[graphnav] restart localization recovery: " + plan.reason +
+          (waypoint_name.empty() ? std::string() : " name=" + waypoint_name) +
+          " saved_age_s=" + std::to_string(age_s) + " (robot is not moved)");
+
+  SpotClient::WaypointLocalizeResult result;
+  if (!spot_.SetLocalizationAtWaypoint(request, &result)) {
+    const std::string error = spot_.LastError();
+    EmitLog("[graphnav] restart localization recovery failed: " + error);
+    RecordLocalizeResult("restart_recovery", false, in.last.waypoint_id, error);
+    return;
+  }
+  const std::string detail = "status=" + result.status + " quality=" + result.quality_check +
+                             (result.suspected_ambiguity ? " suspected_ambiguity=true" : "");
+  EmitLog("[graphnav] restart localization recovery succeeded waypoint_id=" +
+          result.localized_waypoint_id + " " + detail);
+  RecordLocalizeResult("restart_recovery", true, result.localized_waypoint_id, detail);
+}
+
+bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
+  const std::string action = "spot.localize";
+  std::string text;
+  (void)ExtractCommandText(request, &text);
+  const LocalizeCommandParams params = ParseLocalizeCommandParams(text);
+  auto reject = [&](const std::string& waypoint_id, const std::string& reason) {
+    EmitLog("[graphnav] " + action + " rejected: " + reason);
+    RecordLocalizeResult("command", false, waypoint_id, reason);
+    return false;
+  };
+  if (!params.error.empty()) return reject("", params.error);
+  if (graphnav_navigation_active_.load()) {
+    return reject("", "navigation is active; cancel it before relocalizing");
+  }
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (map_recording_active_.load() || HasActiveMappingSessionLocked()) {
+      return reject("", "stop mapping first");
+    }
+    if (!pending_restore_map_id_.empty()) {
+      return reject("", "map " + pending_restore_map_id_ + " is still being restored to the robot");
+    }
+  }
+  std::string map_id;
+  std::string map_uuid;
+  if (!ValidateGraphNavCommandMapUuid(action, params.map_uuid, false, &map_id, &map_uuid)) {
+    RecordLocalizeResult("command", false, "", "map check failed");
+    return false;
+  }
+
+  std::string waypoint_id = params.waypoint_id;
+  std::string name = params.waypoint_name;
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (waypoint_id.empty()) {
+      if (!ResolveWaypointNameLocked(name, &waypoint_id)) {
+        return reject("", "unresolved or ambiguous waypoint name=" + name);
+      }
+    } else {
+      name = ResolveWaypointNameForIdLocked(waypoint_id);
+    }
+  }
+  if (name.empty()) name = waypoint_id;
+
+  SpotClient::WaypointLocalizeRequest req;
+  req.waypoint_id = waypoint_id;
+  req.max_distance_m = params.limits.max_distance_m;
+  req.max_yaw_rad = params.limits.max_yaw_rad;
+  EmitLog("[graphnav] " + action + " at name=" + name + " waypoint_id=" + waypoint_id +
+          " map_id=" + map_id + " max_distance_m=" + std::to_string(req.max_distance_m) +
+          " max_yaw_rad=" + std::to_string(req.max_yaw_rad));
+
+  SpotClient::WaypointLocalizeResult result;
+  if (!spot_.SetLocalizationAtWaypoint(req, &result)) {
+    const std::string error = spot_.LastError();
+    EmitLog("[graphnav] " + action + " failed: " + error);
+    RecordLocalizeResult("command", false, waypoint_id, error);
+    return false;
+  }
+  const std::string detail = "status=" + result.status + " quality=" + result.quality_check +
+                             (result.suspected_ambiguity ? " suspected_ambiguity=true" : "");
+  EmitLog("[graphnav] " + action + " succeeded name=" + name +
+          " localized_waypoint_id=" + result.localized_waypoint_id + " " + detail);
+  RecordLocalizeResult("command", true, result.localized_waypoint_id, detail);
   return true;
 }
 
@@ -5561,6 +5758,7 @@ bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
     return ExecuteGraphNavGotoPoseCommand(request, true);
   }
   if (command == "spot.graphnav.cancel") return ExecuteGraphNavCancelCommand();
+  if (command == "spot.localize") return ExecuteLocalizeCommand(request);
   if (command.rfind("spot.waypoint.", 0) == 0) return HandleWaypointCommand(request);
   return false;
 }
@@ -7841,6 +8039,11 @@ std::string Adapter::BuildGraphNavNavStateJson(
   long long updated_ms = 0;
   int status = 0;
   double remaining_route_m = 0.0;
+  std::string localize_result;
+  std::string localize_source;
+  std::string localize_waypoint_id;
+  std::string localize_detail;
+  long long localize_at_ms = 0;
   const bool localized = localization && !localization->waypoint_id.empty();
   const bool has_current_seed_pose = localized && localization->has_seed_tform_body;
   double current_seed_x = 0.0;
@@ -7878,6 +8081,11 @@ std::string Adapter::BuildGraphNavNavStateJson(
     updated_ms = nav_last_updated_ms_;
     status = last_nav_status_;
     remaining_route_m = last_nav_remaining_route_m_;
+    localize_result = localize_result_;
+    localize_source = localize_source_;
+    localize_waypoint_id = localize_waypoint_id_;
+    localize_detail = localize_detail_;
+    localize_at_ms = localize_at_ms_;
   }
 
   std::ostringstream oss;
@@ -7901,6 +8109,11 @@ std::string Adapter::BuildGraphNavNavStateJson(
       << ",\"localized\":" << (localized ? "true" : "false")
       << ",\"current_waypoint_id\":\""
       << json_escape(localized ? localization->waypoint_id : std::string()) << "\""
+      << ",\"localize_result\":\"" << json_escape(localize_result) << "\""
+      << ",\"localize_source\":\"" << json_escape(localize_source) << "\""
+      << ",\"localize_waypoint_id\":\"" << json_escape(localize_waypoint_id) << "\""
+      << ",\"localize_detail\":\"" << json_escape(localize_detail) << "\""
+      << ",\"localize_at_ms\":" << localize_at_ms
       << ",\"has_current_seed_pose\":" << (has_current_seed_pose ? "true" : "false")
       << ",\"has_seed_goal\":" << (has_seed_goal ? "true" : "false")
       << ",\"has_waypoint_goal\":" << (has_waypoint_goal ? "true" : "false");
@@ -7925,13 +8138,20 @@ std::string Adapter::BuildGraphNavNavStateJson(
 }
 
 void Adapter::PublishGraphNavNavState(long long now) {
-  if (cfg_.graphnav_nav_state_stream.empty()) return;
+  const bool publish = !cfg_.graphnav_nav_state_stream.empty();
+  const bool persist_due = (now - last_localization_persist_poll_ms_.load()) >= 1000;
+  if (!publish && !persist_due) return;
   const long long kPeriodicMs = 1000;
   SpotClient::LocalizationSnapshot localization;
   SpotClient::LocalizationSnapshot* localization_ptr = nullptr;
   if (SpotConnected() && spot_.GetLocalizationSnapshot(&localization)) {
     localization_ptr = &localization;
   }
+  if (persist_due) {
+    last_localization_persist_poll_ms_ = now;
+    if (localization_ptr) MaybePersistLastLocalization(*localization_ptr, now);
+  }
+  if (!publish) return;
   const std::string payload = BuildGraphNavNavStateJson(localization_ptr);
   bool changed = false;
   {

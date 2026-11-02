@@ -1585,15 +1585,92 @@ bool SpotClient::SetLocalizationFiducial() {
   ::bosdyn::api::graph_nav::SetLocalizationRequest req;
   req.set_fiducial_init(::bosdyn::api::graph_nav::SetLocalizationRequest::FIDUCIAL_INIT_NEAREST);
   auto r = graph_nav_client_->SetLocalization(req);
-  if (!r.status) {
+  // A non-OK response status also fails r.status; report the GraphNav status
+  // name in that case so callers can tell "no usable fiducial" apart.
+  if (!r.status &&
+      r.response.status() == ::bosdyn::api::graph_nav::SetLocalizationResponse::STATUS_UNKNOWN) {
     SetLastError(r.status.DebugString());
     return false;
   }
   if (r.response.status() != ::bosdyn::api::graph_nav::SetLocalizationResponse::STATUS_OK) {
-    SetLastError("SetLocalization failed status=" + std::to_string(static_cast<int>(r.response.status())));
+    SetLastError("SetLocalization failed status=" +
+                 ::bosdyn::api::graph_nav::SetLocalizationResponse::Status_Name(r.response.status()) +
+                 " (" + std::to_string(static_cast<int>(r.response.status())) + ")");
     return false;
   }
   return true;
+}
+
+bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& request,
+                                           WaypointLocalizeResult* out_result) {
+  using ::bosdyn::api::graph_nav::SetLocalizationRequest;
+  using ::bosdyn::api::graph_nav::SetLocalizationResponse;
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  WaypointLocalizeResult result;
+  auto finish = [&](bool ok) {
+    result.ok = ok;
+    if (out_result) *out_result = result;
+    return ok;
+  };
+  if (request.waypoint_id.empty()) {
+    SetLastError("SetLocalizationAtWaypoint: empty waypoint_id");
+    return finish(false);
+  }
+  if (!EnsureGraphNavClient()) return finish(false);
+  if (!EnsureTimeSync()) return finish(false);
+
+  SetLocalizationRequest req;
+  auto* guess = req.mutable_initial_guess();
+  guess->set_waypoint_id(request.waypoint_id);
+  auto* tform = guess->mutable_waypoint_tform_body();
+  tform->mutable_position()->set_x(request.waypoint_tform_body.x);
+  tform->mutable_position()->set_y(request.waypoint_tform_body.y);
+  tform->mutable_position()->set_z(request.waypoint_tform_body.z);
+  tform->mutable_rotation()->set_x(request.waypoint_tform_body.qx);
+  tform->mutable_rotation()->set_y(request.waypoint_tform_body.qy);
+  tform->mutable_rotation()->set_z(request.waypoint_tform_body.qz);
+  tform->mutable_rotation()->set_w(request.waypoint_tform_body.qw);
+  req.set_max_distance(request.max_distance_m);
+  req.set_max_yaw(request.max_yaw_rad);
+  req.set_fiducial_init(SetLocalizationRequest::FIDUCIAL_INIT_NO_FIDUCIAL);
+  req.set_do_ambiguity_check(request.do_ambiguity_check);
+  if (request.refine_with_visual_features) {
+    // Without verify_refinement_quality a failed visual refinement falls back to
+    // the point-cloud result instead of failing the whole request.
+    req.mutable_refine_with_visual_features()->set_verify_refinement_quality(false);
+  }
+
+  // Tell GraphNav where the robot was in odom when the guess was made, so a
+  // robot that shifts slightly during the call is still handled. Best effort.
+  if (EnsureRobotStateClient()) {
+    auto state = robot_state_client_->GetRobotState();
+    ::bosdyn::api::SE3Pose odom_tform_body;
+    if (state.status &&
+        ::bosdyn::api::GetOdomTformBody(
+            state.response.robot_state().kinematic_state().transforms_snapshot(),
+            &odom_tform_body)) {
+      *req.mutable_ko_tform_body() = odom_tform_body;
+    }
+  }
+
+  auto r = graph_nav_client_->SetLocalization(req);
+  const auto status = r.response.status();
+  result.status = SetLocalizationResponse::Status_Name(status);
+  result.quality_check =
+      SetLocalizationResponse::QualityCheckResult_Name(r.response.quality_check_result());
+  result.suspected_ambiguity = r.response.has_suspected_ambiguity();
+  if (status != SetLocalizationResponse::STATUS_OK) {
+    if (status == SetLocalizationResponse::STATUS_UNKNOWN && !r.status) {
+      SetLastError("SetLocalization(waypoint) rpc failed: " + r.status.DebugString());
+    } else {
+      SetLastError("SetLocalization(waypoint) failed status=" + result.status + " (" +
+                   std::to_string(static_cast<int>(status)) + ") waypoint_id=" +
+                   request.waypoint_id);
+    }
+    return finish(false);
+  }
+  result.localized_waypoint_id = r.response.localization().waypoint_id();
+  return finish(true);
 }
 
 bool SpotClient::GetLocalizationWaypointId(std::string* out_waypoint_id) {
@@ -1638,6 +1715,10 @@ bool SpotClient::GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot) {
     snapshot.waypoint_tform_body_x = localization.waypoint_tform_body().position().x();
     snapshot.waypoint_tform_body_y = localization.waypoint_tform_body().position().y();
     snapshot.waypoint_tform_body_z = localization.waypoint_tform_body().position().z();
+    snapshot.waypoint_tform_body_qx = localization.waypoint_tform_body().rotation().x();
+    snapshot.waypoint_tform_body_qy = localization.waypoint_tform_body().rotation().y();
+    snapshot.waypoint_tform_body_qz = localization.waypoint_tform_body().rotation().z();
+    snapshot.waypoint_tform_body_qw = localization.waypoint_tform_body().rotation().w();
   }
   if (localization.has_seed_tform_body()) {
     snapshot.has_seed_tform_body = true;

@@ -203,6 +203,26 @@ Additional non-GraphNav command-channel actions:
   - No parameters.
   - Requires a valid current localization and active lease.
 
+- `spot.localize`: localize on the active map from "the robot is at this waypoint", without
+  using fiducials. Use it when Spot is unlocalized away from the dock, for example after a reboot
+  where the only fiducial in the map (the dock tag) is out of view.
+  - Parameter examples: `kitchen`, `name=lights_out_04`, `waypoint_id=<id>`
+  - Optional: `map_uuid=<uuid>` (rejected if it is not the active map), `max_distance=<m>`
+    (search radius around the waypoint, default 0.5, max 3), `max_yaw_deg=<deg>` (default 20).
+  - Calls GraphNav SetLocalization with `FIDUCIAL_INIT_NO_FIDUCIAL`, an initial guess of identity
+    `waypoint_tform_body` at that waypoint, ambiguity checking, and visual-feature refinement.
+  - No lease needed and the robot does not move. Rejected while navigating or mapping.
+  - On failure the log line names the GraphNav status (for example `STATUS_FAILED` when the robot
+    is not actually near the waypoint). The result is also published on `spot.nav.state`.
+
+Restart localization recovery: the adapter saves the last waypoint the robot was localized at
+(and the robot's offset from it) to `<graphnav_store_dir>/last_localization.txt`, at most every
+5 s and only when the waypoint changes or the robot moves 0.5 m / turns 15 deg. After a restart, if
+restoring the map and localizing to the nearest fiducial fails because no fiducial is usable
+(`STATUS_NO_MATCHING_FIDUCIAL` and related), the adapter tries SetLocalization once at that saved
+waypoint and logs the result. It never moves the robot. If that also fails, drive the robot to a
+known waypoint and use `spot.localize`, or drive it back in view of the dock.
+
 Note: `spot.waypoint.save`/`spot.waypoint.update` can be called while not actively mapping; the
 adapter runs a temporary start/create/stop recording sequence.
 

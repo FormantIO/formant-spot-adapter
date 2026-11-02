@@ -220,6 +220,10 @@ parameters documented in the repository `README.md`.
   `target_waypoint_id`, `target_name`, target pose fields when available, plus current
   localization fields: `localized`, `current_waypoint_id`, `has_current_seed_pose`,
   `current_seed_x`, `current_seed_y`, `current_seed_z`, and `current_seed_yaw_rad`.
+- Result of the last `spot.localize` command or restart localization recovery:
+  `localize_result` (`ok`, `failed`, or empty if none yet), `localize_source` (`command` or
+  `restart_recovery`), `localize_waypoint_id`, `localize_detail` (GraphNav status and quality
+  check, or the error), and `localize_at_ms`.
 
 - `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
 - Key: `Can dock` (boolean)
@@ -429,6 +433,14 @@ parameters documented in the repository `README.md`.
 - Overrides active GraphNav navigation with a new goal at the robot's current localized pose.
 - Intended as the operator-facing hold-position override for map UIs.
 - No parameters.
+
+- `spot.localize` (command)
+- Localizes on the active map from "the robot is at this waypoint" without fiducials
+  (GraphNav SetLocalization, `FIDUCIAL_INIT_NO_FIDUCIAL`). Does not move the robot; no lease.
+- Parameter text: `<name>`, `name=<alias_or_label>` or `waypoint_id=<id>`.
+- Optional `map_uuid=<uuid>`, `max_distance=<m>` (default 0.5, max 3),
+  `max_yaw_deg=<deg>` (default 20).
+- Result is reported on `spot.nav.state` (`localize_*` fields) and `spot.adapter.log`.
 
 Command response behavior:
 - Formant command responses are terminal; success/failure is returned when the action reaches completion.
