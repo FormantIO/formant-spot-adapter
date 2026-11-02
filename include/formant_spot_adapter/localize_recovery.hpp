@@ -21,10 +21,27 @@ struct WaypointLocalizeLimits {
   double max_yaw_rad{0.3490658503988659};  // 20 degrees
 };
 
-// Hard bounds on operator-supplied limits. A very large search window lets
-// GraphNav match the wrong part of a repetitive map.
-constexpr double kMaxLocalizeDistanceM = 3.0;
-constexpr double kMaxLocalizeYawDeg = 180.0;
+// Hard bounds on operator-supplied limits. A large search window lets GraphNav
+// match the wrong part of a repetitive map.
+constexpr double kMaxLocalizeDistanceM = 1.5;
+constexpr double kMaxLocalizeYawDeg = 45.0;
+
+// Whether a SetLocalization answer may be trusted. GraphNav applies the
+// localization whenever the status is STATUS_OK, even when its own quality check
+// then reports a poor match or it suspects an ambiguous (for example rotated)
+// solution. Only STATUS_OK + QUALITY_CHECK_SUCCESS + no suspected ambiguity is
+// accepted.
+struct LocalizeAcceptance {
+  bool ok{false};
+  // GraphNav applied a localization (STATUS_OK). When `applied && !ok` the robot
+  // is now localized to a result that was rejected.
+  bool applied{false};
+  // Why the result was rejected, empty when ok.
+  std::string reason;
+};
+LocalizeAcceptance EvaluateWaypointLocalization(const std::string& status,
+                                                const std::string& quality_check,
+                                                bool suspected_ambiguity);
 
 // Parameters of the `spot.localize` command.
 struct LocalizeCommandParams {
@@ -113,6 +130,14 @@ struct WaypointRecoveryInputs {
   LastLocalization last;
   // The saved waypoint still exists in the restored map.
   bool last_waypoint_in_map{false};
+  // Wall-clock now, and how old a saved record may be. A limit of 0 or less
+  // turns recovery off.
+  long long now_ms{0};
+  long long max_record_age_ms{86400000LL};
+  // Time between the restore being scheduled and it running. A long delay (for
+  // example waiting for the lease) means the robot may have been moved.
+  long long restore_delay_ms{0};
+  long long max_restore_delay_ms{60000LL};
 };
 
 struct WaypointRecoveryPlan {
@@ -125,5 +150,36 @@ struct WaypointRecoveryPlan {
 // When that fails only because no fiducial is usable, it may try once more with the
 // last saved waypoint as the initial guess. It never moves the robot.
 WaypointRecoveryPlan DecideWaypointRecovery(const WaypointRecoveryInputs& in);
+
+// Tracks whether the current localization came from an automatic guess that a
+// person has not confirmed. While unconfirmed, GraphNav navigation commands are
+// refused, because a wrong guess sends the robot to the wrong place.
+class LocalizationConfirmation {
+ public:
+  bool confirmed() const { return confirmed_; }
+  // Why it is unconfirmed, empty when confirmed.
+  const std::string& pending_reason() const { return pending_reason_; }
+
+  // Automatic restart recovery left the robot localized at `waypoint_id`.
+  void OnAutomaticLocalization(const std::string& waypoint_id);
+  // GraphNav applied a localization that failed its quality or ambiguity check
+  // and it could not be cleared.
+  void OnRejectedLocalization(const std::string& waypoint_id, const std::string& reason);
+  // An operator ran spot.localize.confirm while the robot was localized.
+  void OnOperatorConfirm();
+  // A person chose the waypoint with spot.localize and it was accepted.
+  void OnOperatorLocalize();
+  // Fiducial localization succeeded; the dock tag fixes the pose independently.
+  void OnFiducialLocalization();
+  // The robot has no localization any more (graph cleared or re-uploaded).
+  void OnLocalizationCleared();
+
+  // Empty when `action` may run; otherwise an operator-facing refusal.
+  std::string NavigationBlockReason(const std::string& action) const;
+
+ private:
+  bool confirmed_{true};
+  std::string pending_reason_;
+};
 
 }  // namespace fsa

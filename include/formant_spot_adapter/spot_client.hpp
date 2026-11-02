@@ -165,11 +165,24 @@ class SpotClient {
     double max_distance_m{0.5};
     double max_yaw_rad{0.3490658503988659};
     bool refine_with_visual_features{true};
+    // Fail with STATUS_VISUAL_ALIGNMENT_FAILED instead of falling back to the
+    // point-cloud result when visual refinement fails.
+    bool verify_visual_refinement{true};
     bool do_ambiguity_check{true};
+    // Send the robot's current odom pose as ko_tform_body. Only correct when the
+    // guess is about the robot's pose right now; a guess saved before a reboot
+    // refers to an odom frame that no longer exists.
+    bool send_current_ko_tform_body{true};
   };
 
   struct WaypointLocalizeResult {
+    // STATUS_OK, QUALITY_CHECK_SUCCESS and no suspected ambiguity.
     bool ok{false};
+    // GraphNav applied a localization (STATUS_OK). `applied && !ok` means the
+    // robot is now localized to a result that was rejected.
+    bool applied{false};
+    // Why it was rejected, empty when ok.
+    std::string reason;
     // SetLocalizationResponse status name, e.g. STATUS_OK or STATUS_FAILED.
     std::string status;
     // QualityCheckResult name; GraphNav applies the localization even when poor.
@@ -271,8 +284,11 @@ class SpotClient {
   bool BuildGraphNavMapSnapshot(const StoredMap& map_data, GraphNavMapSnapshot* out_snapshot);
   bool UploadGraphMap(const StoredMap& map_data);
   bool ClearGraph();
+  // Number of waypoints in the graph currently loaded on the robot.
+  bool GetGraphWaypointCount(int* out_count);
   bool SetLocalizationFiducial();
-  // No lease needed. On failure LastError() names the STATUS_* value.
+  // No lease needed. Returns true only for an accepted result (see
+  // EvaluateWaypointLocalization). On failure LastError() gives the reason.
   bool SetLocalizationAtWaypoint(const WaypointLocalizeRequest& request,
                                  WaypointLocalizeResult* out_result);
   bool GetLocalizationWaypointId(std::string* out_waypoint_id);

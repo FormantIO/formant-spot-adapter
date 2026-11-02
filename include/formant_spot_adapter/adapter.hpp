@@ -95,6 +95,11 @@ class Adapter {
   bool WaitForGraphNavCommandResult(uint32_t command_id, long long timeout_ms);
   bool EnsureLocalizedForNavigation(const std::string& action_name);
   bool ExecuteLocalizeCommand(const v1::model::CommandRequest& request);
+  bool ExecuteLocalizeConfirmCommand();
+  bool EnsureLocalizationConfirmedForNavigation(const std::string& action_name);
+  void MaybeScheduleRestoreForEmptyRobotGraph(long long now);
+  bool ClearRejectedLocalization(const std::string& map_id, const SpotClient::StoredMap& map_data,
+                                 std::string* out_error);
   void RecordLocalizeResult(const std::string& source, bool ok, const std::string& waypoint_id,
                             const std::string& detail);
   std::string LastLocalizationPath() const;
@@ -429,6 +434,7 @@ class Adapter {
   std::string localize_waypoint_id_;
   std::string localize_detail_;
   long long localize_at_ms_{0};
+  LocalizationConfirmation localization_confirmation_;
   std::string nav_target_mode_;
   std::string nav_target_waypoint_id_;
   std::string nav_target_waypoint_name_;
@@ -456,6 +462,10 @@ class Adapter {
   std::atomic<long long> last_nav_state_pub_ms_{0};
   std::atomic<long long> last_localization_persist_poll_ms_{0};
   std::atomic<bool> waypoint_recovery_attempted_{false};
+  // When the pending map restore was scheduled (startup or empty robot graph).
+  std::atomic<long long> restore_scheduled_ms_{0};
+  std::atomic<bool> check_robot_graph_after_connect_{false};
+  std::atomic<long long> last_robot_graph_check_ms_{0};
   std::mutex last_localization_mu_;
   fsa::LastLocalizationThrottle last_localization_throttle_;
   std::atomic<long long> last_nav_hold_log_ms_{0};

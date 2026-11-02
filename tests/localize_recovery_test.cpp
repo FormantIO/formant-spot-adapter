@@ -77,6 +77,7 @@ void test_command_params() {
     const auto p = fsa::ParseLocalizeCommandParams(
         "{\"waypoint\": \"kitchen\", \"map_uuid\": \"u-1\", \"max_distance\": 1.5, "
         "\"max_yaw_deg\": 45}");
+    // 1.5 m and 45 deg are the caps, so they are still accepted.
     check(p.error.empty(), "JSON ok: " + p.error);
     check(p.waypoint_name == "kitchen", "JSON waypoint is read");
     check(p.map_uuid == "u-1", "JSON map_uuid is read");
@@ -93,8 +94,12 @@ void test_command_params() {
     check(contains(p.error, "missing waypoint"), "map_uuid alone is rejected: " + p.error);
   }
   {
-    const auto p = fsa::ParseLocalizeCommandParams("name=kitchen, max_distance=10");
-    check(contains(p.error, "max_distance"), "max_distance above the bound is rejected: " + p.error);
+    const auto p = fsa::ParseLocalizeCommandParams("name=kitchen, max_distance=1.6");
+    check(contains(p.error, "max_distance"), "max_distance above 1.5 m is rejected: " + p.error);
+  }
+  {
+    const auto p = fsa::ParseLocalizeCommandParams("name=kitchen, max_yaw_deg=46");
+    check(contains(p.error, "max_yaw_deg"), "max_yaw_deg above 45 is rejected: " + p.error);
   }
   {
     const auto p = fsa::ParseLocalizeCommandParams("name=kitchen, max_distance=abc");
@@ -236,7 +241,76 @@ fsa::WaypointRecoveryInputs walt_after_reboot() {
   in.has_last_localization = true;
   in.last = rec("demo_map", "wp-9m-from-dock");
   in.last_waypoint_in_map = true;
+  in.now_ms = in.last.updated_ms + 10LL * 60 * 1000;  // ten minutes later
+  in.max_record_age_ms = 24LL * 3600 * 1000;
+  in.restore_delay_ms = 5000;
+  in.max_restore_delay_ms = 60000;
   return in;
+}
+
+void test_acceptance() {
+  {
+    const auto a = fsa::EvaluateWaypointLocalization("STATUS_OK", "QUALITY_CHECK_SUCCESS", false);
+    check(a.ok && a.applied && a.reason.empty(), "OK + quality success + no ambiguity is accepted");
+  }
+  {
+    const auto a =
+        fsa::EvaluateWaypointLocalization("STATUS_OK", "QUALITY_CHECK_POOR_POINT_CLOUD_MATCH", false);
+    check(!a.ok && a.applied, "poor point cloud match is applied but rejected");
+    check(contains(a.reason, "POOR_POINT_CLOUD_MATCH"), "reason names the quality: " + a.reason);
+  }
+  {
+    const auto a = fsa::EvaluateWaypointLocalization("STATUS_OK", "QUALITY_CHECK_SKIPPED", false);
+    check(!a.ok && a.applied, "skipped quality check is rejected");
+  }
+  {
+    const auto a = fsa::EvaluateWaypointLocalization("STATUS_OK", "QUALITY_CHECK_UNKNOWN", false);
+    check(!a.ok && a.applied, "unknown quality check is rejected");
+  }
+  {
+    const auto a = fsa::EvaluateWaypointLocalization("STATUS_OK", "QUALITY_CHECK_SUCCESS", true);
+    check(!a.ok && a.applied && contains(a.reason, "ambiguous"),
+          "suspected ambiguity is rejected: " + a.reason);
+  }
+  {
+    const auto a =
+        fsa::EvaluateWaypointLocalization("STATUS_VISUAL_ALIGNMENT_FAILED", "QUALITY_CHECK_UNKNOWN", false);
+    check(!a.ok && !a.applied && contains(a.reason, "VISUAL_ALIGNMENT_FAILED"),
+          "visual alignment failure is a failure, not applied: " + a.reason);
+  }
+  {
+    const auto a = fsa::EvaluateWaypointLocalization("STATUS_FAILED", "", false);
+    check(!a.ok && !a.applied, "STATUS_FAILED is not applied");
+  }
+}
+
+void test_confirmation() {
+  fsa::LocalizationConfirmation c;
+  check(c.confirmed(), "starts confirmed");
+  check(c.NavigationBlockReason("spot.waypoint.goto").empty(), "confirmed: navigation allowed");
+  c.OnAutomaticLocalization("wp-1");
+  check(!c.confirmed(), "automatic recovery is unconfirmed");
+  const std::string reason = c.NavigationBlockReason("spot.return_and_dock");
+  check(contains(reason, "spot.return_and_dock refused"), "block names the action: " + reason);
+  check(contains(reason, "spot.localize.confirm"), "block says how to confirm: " + reason);
+  check(contains(reason, "wp-1"), "block names the waypoint: " + reason);
+  c.OnOperatorConfirm();
+  check(c.confirmed() && c.pending_reason().empty(), "operator confirm unblocks");
+
+  c.OnAutomaticLocalization("wp-1");
+  c.OnFiducialLocalization();
+  check(c.confirmed(), "fiducial localization unblocks");
+
+  c.OnAutomaticLocalization("wp-1");
+  c.OnOperatorLocalize();
+  check(c.confirmed(), "a successful operator spot.localize unblocks");
+
+  c.OnRejectedLocalization("wp-2", "GraphNav quality check QUALITY_CHECK_POOR_POINT_CLOUD_MATCH");
+  check(!c.confirmed(), "a rejected but applied localization blocks");
+  check(contains(c.NavigationBlockReason("spot.waypoint.goto"), "POOR_POINT_CLOUD_MATCH"),
+        "block carries the rejection reason");
+  c.OnLocalizationCleared();
+  check(c.confirmed(), "once cleared there is nothing left to confirm");
 }
 
 void test_recovery_decision() {
@@ -281,6 +355,46 @@ void test_recovery_decision() {
     check(!plan.attempt && contains(plan.reason, "not in the restored map"),
           "waypoint deleted from the map: no recovery");
   }
+  {
+    auto in = walt_after_reboot();
+    in.now_ms = in.last.updated_ms + 25LL * 3600 * 1000;
+    const auto plan = fsa::DecideWaypointRecovery(in);
+    check(!plan.attempt && contains(plan.reason, "s old"), "record older than 24 h: " + plan.reason);
+  }
+  {
+    auto in = walt_after_reboot();
+    in.now_ms = in.last.updated_ms + 23LL * 3600 * 1000;
+    check(fsa::DecideWaypointRecovery(in).attempt, "record just under 24 h is used");
+  }
+  {
+    auto in = walt_after_reboot();
+    in.max_record_age_ms = 0;
+    const auto plan = fsa::DecideWaypointRecovery(in);
+    check(!plan.attempt && contains(plan.reason, "turned off"), "age limit 0 turns recovery off");
+  }
+  {
+    auto in = walt_after_reboot();
+    in.last.updated_ms = 0;
+    check(!fsa::DecideWaypointRecovery(in).attempt, "record without a timestamp is not used");
+  }
+  {
+    auto in = walt_after_reboot();
+    in.now_ms = in.last.updated_ms - 10LL * 60 * 1000;
+    const auto plan = fsa::DecideWaypointRecovery(in);
+    check(!plan.attempt && contains(plan.reason, "future"), "record from the future: " + plan.reason);
+  }
+  {
+    auto in = walt_after_reboot();
+    in.restore_delay_ms = 61000;
+    const auto plan = fsa::DecideWaypointRecovery(in);
+    check(!plan.attempt && contains(plan.reason, "may have been moved"),
+          "restore delayed past 60 s (lease contention): " + plan.reason);
+  }
+  {
+    auto in = walt_after_reboot();
+    in.restore_delay_ms = 59000;
+    check(fsa::DecideWaypointRecovery(in).attempt, "restore within 60 s still recovers");
+  }
 }
 
 }  // namespace
@@ -291,6 +405,8 @@ int main() {
   test_file_io();
   test_throttle();
   test_fiducial_errors();
+  test_acceptance();
+  test_confirmation();
   test_recovery_decision();
 
   if (failures == 0) std::cout << "localize_recovery_test: all checks passed" << std::endl;

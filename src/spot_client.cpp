@@ -1,4 +1,5 @@
 #include "formant_spot_adapter/spot_client.hpp"
+#include "formant_spot_adapter/localize_recovery.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1563,6 +1564,15 @@ bool SpotClient::UploadGraphMap(const StoredMap& map_data) {
   return true;
 }
 
+bool SpotClient::GetGraphWaypointCount(int* out_count) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!out_count) return false;
+  ::bosdyn::api::graph_nav::Graph graph;
+  if (!DownloadCurrentGraph(&graph)) return false;
+  *out_count = graph.waypoints_size();
+  return true;
+}
+
 bool SpotClient::ClearGraph() {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!EnsureGraphNavClient()) return false;
@@ -1635,14 +1645,17 @@ bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& reques
   req.set_fiducial_init(SetLocalizationRequest::FIDUCIAL_INIT_NO_FIDUCIAL);
   req.set_do_ambiguity_check(request.do_ambiguity_check);
   if (request.refine_with_visual_features) {
-    // Without verify_refinement_quality a failed visual refinement falls back to
-    // the point-cloud result instead of failing the whole request.
-    req.mutable_refine_with_visual_features()->set_verify_refinement_quality(false);
+    // With verify_refinement_quality a failed visual refinement fails the request
+    // (STATUS_VISUAL_ALIGNMENT_FAILED); without it GraphNav falls back to the
+    // point-cloud result.
+    req.mutable_refine_with_visual_features()->set_verify_refinement_quality(
+        request.verify_visual_refinement);
   }
 
-  // Tell GraphNav where the robot was in odom when the guess was made, so a
-  // robot that shifts slightly during the call is still handled. Best effort.
-  if (EnsureRobotStateClient()) {
+  // ko_tform_body is the robot's odom pose at the moment the guess was made, so
+  // GraphNav can correct for motion between then and now. Only send it when the
+  // guess is about the robot's pose right now. Best effort.
+  if (request.send_current_ko_tform_body && EnsureRobotStateClient()) {
     auto state = robot_state_client_->GetRobotState();
     ::bosdyn::api::SE3Pose odom_tform_body;
     if (state.status &&
@@ -1659,17 +1672,25 @@ bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& reques
   result.quality_check =
       SetLocalizationResponse::QualityCheckResult_Name(r.response.quality_check_result());
   result.suspected_ambiguity = r.response.has_suspected_ambiguity();
-  if (status != SetLocalizationResponse::STATUS_OK) {
-    if (status == SetLocalizationResponse::STATUS_UNKNOWN && !r.status) {
-      SetLastError("SetLocalization(waypoint) rpc failed: " + r.status.DebugString());
-    } else {
-      SetLastError("SetLocalization(waypoint) failed status=" + result.status + " (" +
-                   std::to_string(static_cast<int>(status)) + ") waypoint_id=" +
-                   request.waypoint_id);
-    }
+  if (status == SetLocalizationResponse::STATUS_UNKNOWN && !r.status) {
+    result.reason = "rpc failed: " + r.status.DebugString();
+    SetLastError("SetLocalization(waypoint) " + result.reason);
     return finish(false);
   }
-  result.localized_waypoint_id = r.response.localization().waypoint_id();
+  if (status == SetLocalizationResponse::STATUS_OK) {
+    result.localized_waypoint_id = r.response.localization().waypoint_id();
+  }
+  // GraphNav applies a STATUS_OK localization even when its quality check fails,
+  // so the RPC succeeding is not enough.
+  const LocalizeAcceptance acceptance =
+      EvaluateWaypointLocalization(result.status, result.quality_check, result.suspected_ambiguity);
+  result.applied = acceptance.applied;
+  if (!acceptance.ok) {
+    result.reason = acceptance.reason;
+    SetLastError("SetLocalization(waypoint) rejected: " + acceptance.reason + " waypoint_id=" +
+                 request.waypoint_id + (acceptance.applied ? " (localization was applied)" : ""));
+    return finish(false);
+  }
   return finish(true);
 }
 

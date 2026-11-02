@@ -280,9 +280,98 @@ WaypointRecoveryPlan DecideWaypointRecovery(const WaypointRecoveryInputs& in) {
     plan.reason = "saved waypoint " + in.last.waypoint_id + " is not in the restored map";
     return plan;
   }
+  if (in.max_record_age_ms <= 0) {
+    plan.reason = "restart recovery is turned off (max record age is 0)";
+    return plan;
+  }
+  if (in.last.updated_ms <= 0) {
+    plan.reason = "saved localization has no timestamp";
+    return plan;
+  }
+  // Allow a little clock skew, but a record from the future means the clock moved.
+  if (in.last.updated_ms > in.now_ms + 60000LL) {
+    plan.reason = "saved localization is timestamped in the future; clock changed?";
+    return plan;
+  }
+  const long long age_ms = std::max(0LL, in.now_ms - in.last.updated_ms);
+  if (age_ms > in.max_record_age_ms) {
+    plan.reason = "saved localization is " + std::to_string(age_ms / 1000) +
+                  " s old, over the " + std::to_string(in.max_record_age_ms / 1000) + " s limit";
+    return plan;
+  }
+  if (in.max_restore_delay_ms > 0 && in.restore_delay_ms > in.max_restore_delay_ms) {
+    plan.reason = "map restore ran " + std::to_string(in.restore_delay_ms / 1000) +
+                  " s after it was scheduled, over the " +
+                  std::to_string(in.max_restore_delay_ms / 1000) +
+                  " s limit; the robot may have been moved";
+    return plan;
+  }
   plan.attempt = true;
   plan.reason = "no usable fiducial; trying saved waypoint " + in.last.waypoint_id;
   return plan;
+}
+
+LocalizeAcceptance EvaluateWaypointLocalization(const std::string& status,
+                                                const std::string& quality_check,
+                                                bool suspected_ambiguity) {
+  LocalizeAcceptance a;
+  if (status != "STATUS_OK") {
+    a.reason = "GraphNav status " + (status.empty() ? std::string("unknown") : status);
+    return a;
+  }
+  a.applied = true;
+  if (quality_check != "QUALITY_CHECK_SUCCESS") {
+    a.reason = "GraphNav quality check " +
+               (quality_check.empty() ? std::string("unknown") : quality_check);
+    return a;
+  }
+  if (suspected_ambiguity) {
+    a.reason = "GraphNav suspects an ambiguous localization (a similar-looking pose nearby)";
+    return a;
+  }
+  a.ok = true;
+  return a;
+}
+
+void LocalizationConfirmation::OnAutomaticLocalization(const std::string& waypoint_id) {
+  confirmed_ = false;
+  pending_reason_ = "localization at waypoint " + waypoint_id +
+                    " was set automatically after a restart and is not confirmed";
+}
+
+void LocalizationConfirmation::OnRejectedLocalization(const std::string& waypoint_id,
+                                                      const std::string& reason) {
+  confirmed_ = false;
+  pending_reason_ = "the robot holds a localization" +
+                    (waypoint_id.empty() ? std::string() : " at waypoint " + waypoint_id) +
+                    " that was rejected (" + reason + ")";
+}
+
+void LocalizationConfirmation::OnOperatorConfirm() {
+  confirmed_ = true;
+  pending_reason_.clear();
+}
+
+void LocalizationConfirmation::OnOperatorLocalize() {
+  confirmed_ = true;
+  pending_reason_.clear();
+}
+
+void LocalizationConfirmation::OnFiducialLocalization() {
+  confirmed_ = true;
+  pending_reason_.clear();
+}
+
+void LocalizationConfirmation::OnLocalizationCleared() {
+  confirmed_ = true;
+  pending_reason_.clear();
+}
+
+std::string LocalizationConfirmation::NavigationBlockReason(const std::string& action) const {
+  if (confirmed_) return "";
+  return action + " refused: " + pending_reason_ +
+         ". Check the robot's position on the map, then run spot.localize.confirm, or run "
+         "spot.localize at the right waypoint, or let it see the dock fiducial.";
 }
 
 }  // namespace fsa

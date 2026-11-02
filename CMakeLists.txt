@@ -149,6 +149,8 @@ target_link_libraries(formant-spot-adapter PRIVATE
 add_executable(image-pull-benchmark
   src/image_pull_benchmark.cpp
   src/config.cpp
+  src/command_params.cpp
+  src/localize_recovery.cpp
   src/spot_client.cpp
   src/spot_check_client.cpp
 )

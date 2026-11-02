@@ -220,10 +220,14 @@ parameters documented in the repository `README.md`.
   `target_waypoint_id`, `target_name`, target pose fields when available, plus current
   localization fields: `localized`, `current_waypoint_id`, `has_current_seed_pose`,
   `current_seed_x`, `current_seed_y`, `current_seed_z`, and `current_seed_yaw_rad`.
-- Result of the last `spot.localize` command or restart localization recovery:
-  `localize_result` (`ok`, `failed`, or empty if none yet), `localize_source` (`command` or
-  `restart_recovery`), `localize_waypoint_id`, `localize_detail` (GraphNav status and quality
-  check, or the error), and `localize_at_ms`.
+- Result of the last `spot.localize`, `spot.localize.confirm` or restart localization recovery:
+  `localize_result` (`ok`, `failed`, or empty if none yet), `localize_source` (`command`,
+  `confirm` or `restart_recovery`), `localize_waypoint_id`, `localize_detail` (GraphNav status and
+  quality check, or the reason it was rejected), and `localize_at_ms`.
+- `localize_confirmed`: false after an automatic restart recovery (or a rejected localization that
+  could not be cleared) until `spot.localize.confirm`, a successful `spot.localize`, or a fiducial
+  localization. GraphNav navigation commands are refused while it is false.
+  `localize_unconfirmed_reason` explains why.
 
 - `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
 - Key: `Can dock` (boolean)
@@ -438,9 +442,14 @@ parameters documented in the repository `README.md`.
 - Localizes on the active map from "the robot is at this waypoint" without fiducials
   (GraphNav SetLocalization, `FIDUCIAL_INIT_NO_FIDUCIAL`). Does not move the robot; no lease.
 - Parameter text: `<name>`, `name=<alias_or_label>` or `waypoint_id=<id>`.
-- Optional `map_uuid=<uuid>`, `max_distance=<m>` (default 0.5, max 3),
-  `max_yaw_deg=<deg>` (default 20).
+- Optional `map_uuid=<uuid>`, `max_distance=<m>` (default 0.5, max 1.5),
+  `max_yaw_deg=<deg>` (default 20, max 45).
+- Succeeds only with `STATUS_OK`, `QUALITY_CHECK_SUCCESS` and no suspected ambiguity.
 - Result is reported on `spot.nav.state` (`localize_*` fields) and `spot.adapter.log`.
+
+- `spot.localize.confirm` (command)
+- Operator confirms the current localization after an automatic restart recovery; clears the
+  navigation block (`localize_confirmed` becomes true). No parameters. Fails if not localized.
 
 Command response behavior:
 - Formant command responses are terminal; success/failure is returned when the action reaches completion.

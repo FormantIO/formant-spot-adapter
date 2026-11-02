@@ -229,6 +229,12 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   }
   if (j.has_dock_home_alias()) c->dock_home_alias = j.dock_home_alias().value();
   if (j.has_dock_preflight_wait_sec()) c->dock_preflight_wait_sec = j.dock_preflight_wait_sec().value();
+  if (j.has_localize_recovery_max_record_age_sec()) {
+    c->localize_recovery_max_record_age_sec = j.localize_recovery_max_record_age_sec().value();
+  }
+  if (j.has_localize_recovery_max_restore_delay_sec()) {
+    c->localize_recovery_max_restore_delay_sec = j.localize_recovery_max_restore_delay_sec().value();
+  }
   if (j.has_arm_raise_x()) c->arm_raise_x = j.arm_raise_x().value();
   if (j.has_arm_raise_y()) c->arm_raise_y = j.arm_raise_y().value();
   if (j.has_arm_raise_z()) c->arm_raise_z = j.arm_raise_z().value();
@@ -382,6 +388,10 @@ Config load_config_from_env() {
       getenv_double_or("DOCK_PREFLIGHT_MAX_DISTANCE_M", c.dock_preflight_max_distance_m);
   c.dock_home_alias = getenv_or("DOCK_HOME_ALIAS", c.dock_home_alias);
   c.dock_preflight_wait_sec = getenv_double_or("DOCK_PREFLIGHT_WAIT_SEC", c.dock_preflight_wait_sec);
+  c.localize_recovery_max_record_age_sec = getenv_double_or(
+      "LOCALIZE_RECOVERY_MAX_RECORD_AGE_SEC", c.localize_recovery_max_record_age_sec);
+  c.localize_recovery_max_restore_delay_sec = getenv_double_or(
+      "LOCALIZE_RECOVERY_MAX_RESTORE_DELAY_SEC", c.localize_recovery_max_restore_delay_sec);
   c.arm_raise_x = getenv_double_or("ARM_RAISE_X", c.arm_raise_x);
   c.arm_raise_y = getenv_double_or("ARM_RAISE_Y", c.arm_raise_y);
   c.arm_raise_z = getenv_double_or("ARM_RAISE_Z", c.arm_raise_z);

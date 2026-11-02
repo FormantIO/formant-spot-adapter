@@ -53,6 +53,8 @@ message AdapterConfig {
   google.protobuf.DoubleValue dock_preflight_max_distance_m = 103;
   google.protobuf.StringValue dock_home_alias = 104;
   google.protobuf.DoubleValue dock_preflight_wait_sec = 105;
+  google.protobuf.DoubleValue localize_recovery_max_record_age_sec = 106;
+  google.protobuf.DoubleValue localize_recovery_max_restore_delay_sec = 107;
   google.protobuf.DoubleValue arm_raise_x = 34;
   google.protobuf.DoubleValue arm_raise_y = 35;
   google.protobuf.DoubleValue arm_raise_z = 36;

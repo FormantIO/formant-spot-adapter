@@ -111,6 +111,13 @@ struct Config {
   // Waypoint alias kept equal to the dock-home after every successful dock.
   // Empty disables the sync.
   std::string dock_home_alias{"charging dock"};
+  // Restart localization recovery (see localize_recovery.hpp). A saved
+  // localization older than this is not reused. 0 or less turns recovery off.
+  double localize_recovery_max_record_age_sec{86400.0};
+  // Skip recovery when the map restore happens this long after it was scheduled
+  // (for example because another client held the lease); the robot may have
+  // been moved in the meantime.
+  double localize_recovery_max_restore_delay_sec{60.0};
 
   // Saved "raised" hand pose in body frame. Set in config JSON.
   double arm_raise_x{0.0};
