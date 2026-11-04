@@ -29,3 +29,5 @@ CMakeUserPresets.json
 
 *.swp
 *.swo
+# CI's SDK-free unit-test binaries (.github/workflows/ci.yml).
+build-unit/

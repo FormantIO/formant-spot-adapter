@@ -1,5 +1,6 @@
 #pragma once
 
+#include "formant_spot_adapter/localize_recovery.hpp"
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -142,6 +143,10 @@ class SpotClient {
     double waypoint_tform_body_x{0.0};
     double waypoint_tform_body_y{0.0};
     double waypoint_tform_body_z{0.0};
+    double waypoint_tform_body_qx{0.0};
+    double waypoint_tform_body_qy{0.0};
+    double waypoint_tform_body_qz{0.0};
+    double waypoint_tform_body_qw{1.0};
     bool has_seed_tform_body{false};
     double seed_tform_body_x{0.0};
     double seed_tform_body_y{0.0};
@@ -150,6 +155,41 @@ class SpotClient {
     double seed_tform_body_qy{0.0};
     double seed_tform_body_qz{0.0};
     double seed_tform_body_qw{1.0};
+  };
+
+  // Localize against the loaded map from a guess of "the robot is here relative
+  // to this waypoint", without using fiducials. See localize_recovery.hpp.
+  using WaypointLocalizeRequest = WaypointLocalizeSpec;
+
+  struct WaypointLocalizeResult {
+    // STATUS_OK, QUALITY_CHECK_SUCCESS and no suspected ambiguity.
+    bool ok{false};
+    // GraphNav applied a localization (STATUS_OK). `applied && !ok` means the
+    // robot is now localized to a result that was rejected.
+    bool applied{false};
+    // Why it was rejected, empty when ok.
+    std::string reason;
+    // SetLocalizationResponse status name, e.g. STATUS_OK or STATUS_FAILED.
+    std::string status;
+    // QualityCheckResult name; GraphNav applies the localization even when poor.
+    std::string quality_check;
+    bool suspected_ambiguity{false};
+    // Which check accepted the result (see LocalizeAcceptance::basis).
+    std::string basis;
+    // How far GraphNav moved the pose from the guess, when it kept the guessed
+    // waypoint as the reference.
+    bool has_correction{false};
+    double correction_m{0.0};  // horizontal (x, y)
+    double correction_z_m{0.0};
+    double correction_yaw_rad{0.0};
+    // The REQUEST asked for visual refinement and for its quality to be
+    // verified. Not a response fact: SetLocalizationResponse has no field
+    // saying the refinement ran, only STATUS_VISUAL_ALIGNMENT_FAILED when it
+    // did not work. Named for what it is, so acceptance rule 2 cannot be read
+    // as "the robot confirmed the alignment".
+    bool visual_verification_requested{false};
+    // Waypoint GraphNav ended up localized to.
+    std::string localized_waypoint_id;
   };
 
   struct OccupancyGridMapSnapshot {
@@ -244,7 +284,21 @@ class SpotClient {
   bool BuildGraphNavMapSnapshot(const StoredMap& map_data, GraphNavMapSnapshot* out_snapshot);
   bool UploadGraphMap(const StoredMap& map_data);
   bool ClearGraph();
+  // Number of waypoints in the graph currently loaded on the robot. Reads the
+  // recording service's map stats first (no graph download). A zero or missing
+  // count is cross-checked: a localization to a waypoint means the graph is not
+  // empty (count reported as 1); otherwise one DownloadGraph decides.
+  // `out_signal` names the check that decided: record_status,
+  // localization_state or download_graph.
+  bool GetGraphWaypointCount(int* out_count, std::string* out_signal = nullptr);
+  // Who holds the body lease right now; empty client name when nobody does.
+  bool GetBodyLeaseOwner(std::string* out_client_name);
   bool SetLocalizationFiducial();
+  // No lease needed. Returns true only for an accepted result (see
+  // EvaluateWaypointLocalization). On failure LastError() gives the reason.
+  bool SetLocalizationAtWaypoint(const WaypointLocalizeRequest& request,
+                                 const LocalizeAcceptancePolicy& policy,
+                                 WaypointLocalizeResult* out_result);
   bool GetLocalizationWaypointId(std::string* out_waypoint_id);
   bool GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot);
   bool GetLocalizationMapSnapshot(LocalizationMapSnapshot* out_snapshot);

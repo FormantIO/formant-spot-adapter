@@ -203,6 +203,95 @@ Additional non-GraphNav command-channel actions:
   - No parameters.
   - Requires a valid current localization and active lease.
 
+- `spot.localize`: localize on the active map from "the robot is at this waypoint", without
+  using fiducials. Use it when Spot is unlocalized away from the dock, for example after a reboot
+  where the only fiducial in the map (the dock tag) is out of view.
+  - Parameter examples: `kitchen`, `name=lights_out_04`, `waypoint_id=<id>`
+  - Optional: `map_uuid=<uuid>` (rejected if it is not the active map), `max_distance=<m>`
+    (search radius around the waypoint, default 0.5, max 1.5), `max_yaw_deg=<deg>` (default 20,
+    max 45).
+  - Calls GraphNav SetLocalization with `FIDUCIAL_INIT_NO_FIDUCIAL`, an initial guess of identity
+    `waypoint_tform_body` at that waypoint, the current `ko_tform_body`, `do_ambiguity_check`, and
+    `refine_with_visual_features` with `verify_refinement_quality`. If visual alignment fails
+    (`STATUS_VISUAL_ALIGNMENT_FAILED`, nothing applied) it retries once without verification.
+  - Acceptance. GraphNav applies a `STATUS_OK` localization even when its own point-cloud quality
+    check fails, and for a waypoint guess on Spot SDK 5.1 it can skip that check entirely
+    (`QUALITY_CHECK_SKIPPED`, seen on the robot). The 5.1 API has no request field that forces the
+    check to run: there is no refine algorithm option, and the only other refinement,
+    `refine_fiducial_result_with_icp`, needs a fiducial. So the adapter accepts a result when:
+    - the status is `STATUS_OK` and GraphNav reports no suspected ambiguity, and
+    - the quality check is `QUALITY_CHECK_SUCCESS`, or
+    - it is `QUALITY_CHECK_SKIPPED` and verified visual alignment passed, or
+    - (this command only, on the retry) it is `QUALITY_CHECK_SKIPPED`, the ambiguity check was
+      requested, GraphNav kept the guessed waypoint, and it moved the pose at most 25 cm
+      horizontally (x, y; height is reported but not bounded) and 10 deg from the guess. A result
+      accepted this way is left unconfirmed ("visual alignment failed; accepted on small
+      correction"), so navigation stays blocked until `spot.localize.confirm`.
+    Any other quality result is rejected. Trade-off of the last rule: a small correction does not
+    prove the point clouds matched, since a poorly constrained match can also stay near the guess.
+    It rests on the operator's statement that the robot is at that waypoint, with the ambiguity
+    check as the remaining automatic guard, and restart recovery never uses it.
+  - The log and `localize_detail` always carry `status`, `quality`, `accepted_by`
+    (`quality_check`, `visual_verification`, `operator_small_correction` or `none`),
+    `visual_verification` (whether verification was requested), `correction_m` (horizontal),
+    `correction_z_m` and `correction_deg` (`unknown` when GraphNav picked another waypoint).
+  - A rejected result that GraphNav applied is cleared the same way restart recovery does
+    (below). If it cannot be cleared, navigation stays blocked until it is confirmed or replaced.
+  - No lease needed for the localization itself and the robot does not move. Rejected while
+    navigating, mapping, while the map is still being restored, or while restart recovery runs.
+    The result is published on `spot.nav.state`.
+- `spot.localize.confirm`: an operator confirms the robot's current localization after checking
+  its position on the map. Clears the navigation block described below. Fails if the robot is not
+  localized or restart recovery is still running. A localization that failed GraphNav's own
+  checks and could not be cleared is only confirmed with `force=true`.
+
+Restart localization recovery:
+- The adapter saves the last confirmed localization (waypoint plus the robot's offset from it) to
+  `<graphnav_store_dir>/last_localization.txt`, at most every 5 s and only when the waypoint
+  changes or the robot moves 0.5 m / turns 15 deg. Nothing is saved while a restore is pending, a
+  map is recording, or the localization is unconfirmed.
+- The map restore runs at adapter start. It also runs while the adapter keeps running after a
+  reconnect (a Spot body reboot drops the connection) when Spot's GraphNav map stats show an empty
+  graph on two checks 5 s apart within 2 minutes of the reconnect and no other client holds the
+  body lease. A graph another client cleared on purpose without a reconnect is left alone.
+- If the restore's nearest-fiducial localization fails because no fiducial is usable
+  (`STATUS_NO_MATCHING_FIDUCIAL`, `FIDUCIAL_TOO_FAR_AWAY`, `FIDUCIAL_TOO_OLD`,
+  `FIDUCIAL_POSE_UNCERTAIN`), the adapter tries SetLocalization once at the saved waypoint and
+  offset, with visual refinement verification on and without `ko_tform_body` (the odom frame from
+  before the reboot no longer exists). It accepts only `QUALITY_CHECK_SUCCESS`, or
+  `QUALITY_CHECK_SKIPPED` with verified visual alignment, and never a suspected ambiguity. A map
+  without usable visual data therefore cannot be recovered automatically; use `spot.localize`. It is skipped when the saved record is for another map, its
+  waypoint is gone, it is older than `localize_recovery_max_record_age_sec` (default 1800, 0 turns
+  recovery off), or the restore ran more than `localize_recovery_max_restore_delay_sec` (default
+  60) after it could first start (scheduled, or Spot's API answering after a power cycle,
+  whichever is later), for example because another client held the lease.
+- From the moment the restore's fiducial localization fails until recovery has finished,
+  navigation, `spot.localize`, `spot.localize.confirm` and saving the localization are refused, so
+  nothing can act on a pose recovery has applied but not yet accepted or cleared. The same window
+  covers each `spot.localize` attempt.
+- Navigation is also refused while a map restore is pending ("map ... is still being restored to
+  the robot" in `spot.adapter.log`). The restore retries every 5 s and stays pending while the map
+  file under `<graphnav_store_dir>/maps/<map_id>` cannot be read, the upload fails, or another
+  client (for example the tablet) holds the body lease. To clear it, release the lease on the
+  other client, or fix or replace the map files, or load a different map with `spot.map.load`.
+  If none of these works, restart the adapter.
+- An accepted recovery leaves the localization unconfirmed (`localize_confirmed=false` on
+  `spot.nav.state`). A recovery result that fails the quality or ambiguity check is cleared:
+  GraphNav has no clear-localization call, so the adapter runs ClearGraph (which clears
+  localization) and re-uploads the same map, leaving the robot on its map but unlocalized. This
+  needs the body lease; if it cannot be taken, the localization stays and is marked unconfirmed
+  (confirming it then needs `force=true`). If the clear works but the re-upload fails, the normal
+  restore retries the upload without running recovery again.
+- While the localization is unconfirmed, GraphNav navigation (`spot.waypoint.goto`,
+  `spot.waypoint.goto_straight`, `spot.graphnav.goto_pose`, `spot.graphnav.goto_pose_straight`,
+  `spot.return_and_dock`, the teleop return-and-dock) is refused with a reason in the log. Each
+  refused request first tries a nearest-fiducial localization, so a robot that can see the dock tag
+  is unblocked automatically. `spot.localize.confirm`, a successful `spot.localize`, or any
+  successful fiducial localization also unblock it. `spot.graphnav.cancel` (hold position) is not
+  blocked.
+- Recovery never moves the robot. If it is skipped or fails, drive the robot to a known waypoint
+  and use `spot.localize`, or drive it back in view of the dock.
+
 Note: `spot.waypoint.save`/`spot.waypoint.update` can be called while not actively mapping; the
 adapter runs a temporary start/create/stop recording sequence.
 

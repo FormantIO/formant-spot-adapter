@@ -220,6 +220,17 @@ parameters documented in the repository `README.md`.
   `target_waypoint_id`, `target_name`, target pose fields when available, plus current
   localization fields: `localized`, `current_waypoint_id`, `has_current_seed_pose`,
   `current_seed_x`, `current_seed_y`, `current_seed_z`, and `current_seed_yaw_rad`.
+- Result of the last `spot.localize`, `spot.localize.confirm` or restart localization recovery:
+  `localize_result` (`ok`, `failed`, or empty if none yet), `localize_source` (`command`,
+  `confirm` or `restart_recovery`), `localize_waypoint_id`, `localize_detail` and `localize_at_ms`.
+  For a SetLocalization attempt `localize_detail` holds the rejection reason (if any) plus
+  `status`, `quality`, `accepted_by`, `visual_verification`, `correction_m` (horizontal),
+  `correction_z_m` and `correction_deg`.
+- `localize_confirmed`: false after an automatic restart recovery (or a rejected localization that
+  could not be cleared) until `spot.localize.confirm`, a successful `spot.localize`, or a fiducial
+  localization, and also false while restart recovery is running. GraphNav navigation commands
+  are refused while it is false.
+  `localize_unconfirmed_reason` explains why.
 
 - `spot.can_dock` (type: bitset, 0.2 Hz / every 5s)
 - Key: `Can dock` (boolean)
@@ -429,6 +440,25 @@ parameters documented in the repository `README.md`.
 - Overrides active GraphNav navigation with a new goal at the robot's current localized pose.
 - Intended as the operator-facing hold-position override for map UIs.
 - No parameters.
+
+- `spot.localize` (command)
+- Localizes on the active map from "the robot is at this waypoint" without fiducials
+  (GraphNav SetLocalization, `FIDUCIAL_INIT_NO_FIDUCIAL`). Does not move the robot; no lease.
+- Parameter text: `<name>`, `name=<alias_or_label>` or `waypoint_id=<id>`.
+- Optional `map_uuid=<uuid>`, `max_distance=<m>` (default 0.5, max 1.5),
+  `max_yaw_deg=<deg>` (default 20, max 45).
+- Needs `STATUS_OK` and no suspected ambiguity, plus `QUALITY_CHECK_SUCCESS`, or
+  `QUALITY_CHECK_SKIPPED` with verified visual alignment, or (operator retry without visual
+  verification) `QUALITY_CHECK_SKIPPED` with the pose moved at most 25 cm horizontally / 10 deg
+  from the guess; that last case leaves the localization unconfirmed until
+  `spot.localize.confirm`. See the README for the trade-off.
+- Result is reported on `spot.nav.state` (`localize_*` fields) and `spot.adapter.log`.
+
+- `spot.localize.confirm` (command)
+- Operator confirms the current localization after an automatic restart recovery; clears the
+  navigation block (`localize_confirmed` becomes true). Fails if not localized or while restart
+  recovery is running. Optional `force=true` is required to confirm a localization that failed
+  GraphNav's quality or ambiguity check and could not be cleared.
 
 Command response behavior:
 - Formant command responses are terminal; success/failure is returned when the action reaches completion.

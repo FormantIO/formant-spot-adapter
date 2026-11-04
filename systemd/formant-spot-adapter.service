@@ -3,8 +3,12 @@
 # current machine and local config paths.
 [Unit]
 Description=Formant Spot Adapter
-After=network-online.target
-Wants=network-online.target
+# time-sync too: restart localization recovery compares the saved record's
+# wall-clock stamp with now, and a Jetson with no RTC boots with a clock behind
+# the record, which reads as "timestamped in the future" and silently skips
+# recovery after a power cycle.
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 Type=simple

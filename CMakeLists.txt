@@ -130,6 +130,8 @@ add_executable(formant-spot-adapter
   src/spot_client.cpp
   src/spot_check_client.cpp
   src/dock_preflight.cpp
+  src/localize_recovery.cpp
+  src/localize_request.cpp
   src/adapter.cpp
 )
 
@@ -148,6 +150,9 @@ target_link_libraries(formant-spot-adapter PRIVATE
 add_executable(image-pull-benchmark
   src/image_pull_benchmark.cpp
   src/config.cpp
+  src/command_params.cpp
+  src/localize_recovery.cpp
+  src/localize_request.cpp
   src/spot_client.cpp
   src/spot_check_client.cpp
 )
@@ -214,6 +219,36 @@ target_include_directories(dock-preflight-test PRIVATE
 )
 
 add_test(NAME dock-preflight-test COMMAND dock-preflight-test)
+
+add_executable(localize-recovery-test
+  tests/localize_recovery_test.cpp
+  src/localize_recovery.cpp
+  src/command_params.cpp
+)
+
+target_include_directories(localize-recovery-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME localize-recovery-test COMMAND localize-recovery-test)
+
+add_executable(localize-request-test
+  tests/localize_request_test.cpp
+  src/localize_request.cpp
+  src/localize_recovery.cpp
+  src/command_params.cpp
+)
+
+target_include_directories(localize-request-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(localize-request-test PRIVATE
+  bosdyn_api_static
+  Threads::Threads
+)
+
+add_test(NAME localize-request-test COMMAND localize-request-test)
 
 # The supported service deployment path for a source checkout is scripts/deploy.sh,
 # which generates a checkout-specific unit file. Keep cmake --install limited to
