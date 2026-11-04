@@ -1,0 +1,96 @@
+name: CI
+
+# The repo had no CI: the six ctest targets only ever ran on a developer's
+# machine, so a PR could not show whether the logic tests passed. Two jobs:
+#
+#   unit-tests  the four test targets that need neither the Spot SDK nor gRPC,
+#               compiled straight with g++. About a minute, so it is the gate
+#               that gives fast feedback on the acceptance rules, parsing,
+#               throttle and the confirmation state machine.
+#   build       the real CMake build (SDK and all) plus the whole ctest suite,
+#               which is the only thing that proves adapter.cpp and
+#               spot_client.cpp still compile. Caches the SDK checkout and
+#               ccache, so a warm run is minutes rather than tens of them.
+#
+# Neither job talks to a robot. Hardware validation stays a manual checklist.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Unit tests (no SDK, no gRPC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run the SDK-free test targets
+        run: |
+          set -euo pipefail
+          mkdir -p build-unit
+          # Mirrors the CMake targets that link only our own sources and need
+          # no system gRPC. Keep in step with CMakeLists.txt: a target that
+          # starts needing gRPC or the SDK (as formant-agent-client-test and
+          # localize-request-test do) belongs in the `build` job below instead.
+          run_target() {
+            local name="$1"; shift
+            echo "::group::$name"
+            g++ -std=c++17 -Wall -Wextra -I include -o "build-unit/$name" "$@"
+            "./build-unit/$name"
+            echo "::endgroup::"
+          }
+          run_target command-params-test \
+            tests/command_params_test.cpp src/command_params.cpp
+          run_target graphnav-map-render-test \
+            tests/graphnav_map_render_test.cpp src/graphnav_map_render.cpp
+          run_target dock-preflight-test \
+            tests/dock_preflight_test.cpp src/dock_preflight.cpp
+          run_target localize-recovery-test \
+            tests/localize_recovery_test.cpp src/localize_recovery.cpp src/command_params.cpp
+
+  build:
+    name: Build and ctest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build ccache \
+            pkg-config git curl unzip python3 libopencv-dev libeigen3-dev \
+            libprotobuf-dev protobuf-compiler protobuf-compiler-grpc libgrpc++-dev
+      - name: Cache the Spot C++ SDK checkout
+        uses: actions/cache@v4
+        with:
+          path: third_party/spot-cpp-sdk
+          # The ref is pinned in scripts/build.sh (SPOT_SDK_REF), so the key
+          # only has to change when that does.
+          key: spot-cpp-sdk-${{ hashFiles('scripts/build.sh', 'scripts/ensure_spot_sdk.sh') }}
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+      - name: Build
+        run: ./scripts/build.sh
+      - name: ctest
+        working-directory: build
+        run: |
+          set -euo pipefail
+          # The test targets are not part of the default build (build.sh builds
+          # the adapter), so build them before running the suite.
+          ninja command-params-test graphnav-map-render-test \
+            formant-agent-client-test dock-preflight-test \
+            localize-recovery-test localize-request-test
+          ctest --output-on-failure
