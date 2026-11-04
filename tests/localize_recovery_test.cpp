@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 
 #include "formant_spot_adapter/localize_recovery.hpp"
@@ -56,6 +57,29 @@ void test_command_params() {
   {
     const auto p = fsa::ParseLocalizeCommandParams("  charging dock  ");
     check(p.waypoint_name == "charging dock", "bare name with spaces is trimmed");
+  }
+  {
+    // force is off unless asked for: a mistyped waypoint on a localized,
+    // confirmed robot must not be able to clear its localization.
+    const auto plain = fsa::ParseLocalizeCommandParams("kitchen");
+    check(!plain.force, "force defaults to false");
+    const auto forced = fsa::ParseLocalizeCommandParams("name=kitchen, force=true");
+    check(forced.error.empty() && forced.force, "force=true is read: " + forced.error);
+    check(!fsa::ParseLocalizeCommandParams("name=kitchen, force=false").force, "force=false is read");
+    check(fsa::ParseLocalizeCommandParams("name=kitchen, force=1").force, "force=1 is read");
+    const auto bad = fsa::ParseLocalizeCommandParams("name=kitchen, force=maybe");
+    check(!bad.error.empty(), "a non-boolean force is an error, not a silent true");
+  }
+  {
+    // Config values reach a long long cast, and these come from JSON or an env
+    // var, so NaN/inf/huge must not be undefined behaviour.
+    check(fsa::SecondsToMsClamped(1.5) == 1500, "seconds to ms");
+    check(fsa::SecondsToMsClamped(0.0) == 0, "zero stays zero");
+    check(fsa::SecondsToMsClamped(-5.0) == 0, "negative reads as no limit");
+    check(fsa::SecondsToMsClamped(std::nan("")) == 0, "NaN reads as no limit");
+    check(fsa::SecondsToMsClamped(std::numeric_limits<double>::infinity()) == 0,
+          "infinity reads as no limit, not a cast of inf");
+    check(fsa::SecondsToMsClamped(1e300) == 100LL * 24 * 60 * 60 * 1000, "1e300 is capped");
   }
   {
     const auto p = fsa::ParseLocalizeCommandParams("name=lights_out_04, map_uuid=abc-123");

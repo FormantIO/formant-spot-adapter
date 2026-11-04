@@ -261,7 +261,7 @@ Restart localization recovery:
   before the reboot no longer exists). It accepts only `QUALITY_CHECK_SUCCESS`, or
   `QUALITY_CHECK_SKIPPED` with verified visual alignment, and never a suspected ambiguity. A map
   without usable visual data therefore cannot be recovered automatically; use `spot.localize`. It is skipped when the saved record is for another map, its
-  waypoint is gone, it is older than `localize_recovery_max_record_age_sec` (default 86400, 0 turns
+  waypoint is gone, it is older than `localize_recovery_max_record_age_sec` (default 1800, 0 turns
   recovery off), or the restore ran more than `localize_recovery_max_restore_delay_sec` (default
   60) after it could first start (scheduled, or Spot's API answering after a power cycle,
   whichever is later), for example because another client held the lease.

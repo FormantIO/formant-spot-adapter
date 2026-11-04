@@ -11,8 +11,8 @@ CONFIG_PATH="${CONFIG_PATH:-${ROOT_DIR}/config/formant-spot-adapter.json}"
 sudo tee "${SERVICE_PATH}" >/dev/null <<EOF
 [Unit]
 Description=Formant Spot Adapter
-After=network-online.target
-Wants=network-online.target
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 Type=simple

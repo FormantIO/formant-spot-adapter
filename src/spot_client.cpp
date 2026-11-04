@@ -1685,7 +1685,7 @@ bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& reques
   }
   auto req = BuildWaypointSetLocalizationRequest(request, have_odom ? &odom_tform_body : nullptr);
 
-  result.visual_verification =
+  result.visual_verification_requested =
       request.refine_with_visual_features && request.verify_visual_refinement;
   auto r = graph_nav_client_->SetLocalization(req);
   const auto status = r.response.status();
@@ -1716,7 +1716,7 @@ bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& reques
   facts.quality_check = result.quality_check;
   facts.suspected_ambiguity = result.suspected_ambiguity;
   facts.ambiguity_check_requested = request.do_ambiguity_check;
-  facts.visual_verification_requested = result.visual_verification;
+  facts.visual_verification_requested = result.visual_verification_requested;
   facts.has_correction = result.has_correction;
   facts.correction_m = result.correction_m;
   facts.correction_z_m = result.correction_z_m;

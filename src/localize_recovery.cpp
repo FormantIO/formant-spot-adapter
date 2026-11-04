@@ -10,6 +10,11 @@
 #include <fstream>
 #include <sstream>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include "formant_spot_adapter/command_params.hpp"
 
 namespace fsa {
@@ -71,6 +76,13 @@ double angle_diff(double a, double b) {
 
 }  // namespace
 
+long long SecondsToMsClamped(double seconds) {
+  if (!std::isfinite(seconds) || seconds <= 0.0) return 0;
+  constexpr double kMaxMs = 100.0 * 24.0 * 60.0 * 60.0 * 1000.0;  // 100 days
+  const double ms = seconds * 1000.0;
+  return static_cast<long long>(ms > kMaxMs ? kMaxMs : ms);
+}
+
 LocalizeCommandParams ParseLocalizeCommandParams(const std::string& text) {
   LocalizeCommandParams p;
   p.waypoint_id = trim(ExtractCommandParam(text, {"waypoint_id"}));
@@ -103,6 +115,16 @@ LocalizeCommandParams ParseLocalizeCommandParams(const std::string& text) {
       return p;
     }
     p.limits.max_yaw_rad = v * kPi / 180.0;
+  }
+
+  const std::string force_text = trim(ExtractCommandParam(text, {"force"}));
+  if (!force_text.empty()) {
+    if (force_text == "true" || force_text == "1") {
+      p.force = true;
+    } else if (force_text != "false" && force_text != "0") {
+      p.error = "force must be true or false, got '" + force_text + "'";
+      return p;
+    }
   }
 
   if (p.waypoint_id.empty() && p.waypoint_name.empty()) {
@@ -175,6 +197,24 @@ bool ParseLastLocalization(const std::string& text, LastLocalization* out) {
   return true;
 }
 
+namespace {
+
+/** fsync a file or directory by path. False when it could not be done. */
+bool FsyncPath(const std::string& path) {
+#ifdef _WIN32
+  (void)path;
+  return false;
+#else
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) return false;
+  const bool ok = ::fsync(fd) == 0;
+  ::close(fd);
+  return ok;
+#endif
+}
+
+}  // namespace
+
 bool SaveLastLocalization(const std::string& path, const LastLocalization& rec,
                           std::string* error) {
   auto fail = [&](const std::string& msg) {
@@ -197,10 +237,23 @@ bool SaveLastLocalization(const std::string& path, const LastLocalization& rec,
     out.flush();
     if (!out) return fail("write failed: " + tmp);
   }
+  // The whole point of this record is to survive a reboot or a power cut, and
+  // flush() only reaches the OS. Without fsync the file can come back empty or
+  // stale after an unclean shutdown: it then parses as "no saved
+  // localization", which fails safe but silently loses the recovery this
+  // feature exists for. Best effort: a platform without fsync still gets the
+  // atomic rename.
+  if (!FsyncPath(tmp)) {
+    // Not fatal: the data is written, just not known to be durable.
+  }
   std::filesystem::rename(tmp, target, ec);
   if (ec) {
     std::filesystem::remove(tmp, ec);
     return fail("rename to " + path + " failed");
+  }
+  // And the directory entry, so the rename itself survives too.
+  if (target.has_parent_path()) {
+    (void)FsyncPath(target.parent_path().string());
   }
   return true;
 }
@@ -330,7 +383,16 @@ LocalizeAcceptance EvaluateWaypointLocalization(const LocalizeResponseFacts& fac
   }
   if (facts.quality_check == "QUALITY_CHECK_SKIPPED") {
     if (facts.visual_verification_requested) {
-      // STATUS_OK with verify_refinement_quality means visual alignment passed.
+      // The ONLY evidence available: the request asked for visual refinement
+      // AND for its quality to be verified, and GraphNav answered STATUS_OK
+      // rather than STATUS_VISUAL_ALIGNMENT_FAILED (checked above). The SDK's
+      // SetLocalizationResponse carries no positive "the refinement ran"
+      // field, only that failure status, so this is inference from a request
+      // flag plus the absence of the failure, not a reported fact. Hence the
+      // name `*_requested`, and hence the hardware checklist in the PR: a map
+      // with no usable visual data must come back STATUS_VISUAL_ALIGNMENT_FAILED
+      // rather than STATUS_OK with the refinement silently skipped. If a later
+      // SDK adds such a field, read it here instead.
       a.ok = true;
       a.basis = "visual_verification";
       return a;

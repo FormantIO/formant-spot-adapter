@@ -182,8 +182,12 @@ class SpotClient {
     double correction_m{0.0};  // horizontal (x, y)
     double correction_z_m{0.0};
     double correction_yaw_rad{0.0};
-    // The request asked for verified visual alignment.
-    bool visual_verification{false};
+    // The REQUEST asked for visual refinement and for its quality to be
+    // verified. Not a response fact: SetLocalizationResponse has no field
+    // saying the refinement ran, only STATUS_VISUAL_ALIGNMENT_FAILED when it
+    // did not work. Named for what it is, so acceptance rule 2 cannot be read
+    // as "the robot confirmed the alignment".
+    bool visual_verification_requested{false};
     // Waypoint GraphNav ended up localized to.
     std::string localized_waypoint_id;
   };

@@ -162,6 +162,16 @@ WaypointLocalizeSpec RecoveryLocalizeSpec(const LastLocalization& last);
 LocalizeAcceptancePolicy RecoveryAcceptancePolicy();
 
 // Parameters of the `spot.localize` command.
+/**
+ * Seconds (from config or an env var) as milliseconds, clamped.
+ *
+ * `getenv_double_or` and the JSON config both accept NaN, inf and absurd
+ * values, and a double-to-int64 cast out of range is undefined behaviour. A
+ * non-finite or negative value becomes 0, which every caller reads as "no
+ * limit set", and anything past 100 days is capped.
+ */
+long long SecondsToMsClamped(double seconds);
+
 struct LocalizeCommandParams {
   // Exactly one of these is set when `error` is empty.
   std::string waypoint_id;
@@ -169,13 +179,26 @@ struct LocalizeCommandParams {
   // Optional: the map the operator expects to be loaded.
   std::string map_uuid;
   WaypointLocalizeLimits limits;
+  /**
+   * `force=true`: relocalize even when the robot is already localized and
+   * confirmed.
+   *
+   * Without it, a mistyped waypoint on a healthy robot can strand it: GraphNav
+   * answers STATUS_OK with a quality or ambiguity rejection, and the recovery
+   * path then clears the graph and re-uploads the map, so the good
+   * (fiducial-derived) localization is destroyed and the robot is left
+   * unlocalized until a fiducial or another `spot.localize` succeeds. The
+   * robot still does not move either way; this is about not throwing away a
+   * localization nobody asked to replace.
+   */
+  bool force{false};
   // Why the parameters were rejected, written for an operator. Empty when ok.
   std::string error;
 };
 
 // Accepts `<name>`, `name=<name>`, `waypoint_id=<id>`, plus optional
-// `map_uuid=<uuid>`, `max_distance=<m>` and `max_yaw_deg=<deg>`, as key=value
-// pairs or a JSON object.
+// `map_uuid=<uuid>`, `max_distance=<m>`, `max_yaw_deg=<deg>` and
+// `force=true`, as key=value pairs or a JSON object.
 LocalizeCommandParams ParseLocalizeCommandParams(const std::string& text);
 
 // The last place the robot was localized, saved so a later restart can reuse it

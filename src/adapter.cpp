@@ -45,7 +45,7 @@ std::string localize_detail(const SpotClient::WaypointLocalizeResult& r) {
   f.status = r.status;
   f.quality_check = r.quality_check;
   f.accepted_by = r.ok ? r.basis : std::string();
-  f.visual_verification = r.visual_verification;
+  f.visual_verification = r.visual_verification_requested;
   f.has_correction = r.has_correction;
   f.correction_xy_m = r.correction_m;
   f.correction_z_m = r.correction_z_m;
@@ -5237,10 +5237,11 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
     }
   }
   in.now_ms = now;
-  in.max_record_age_ms =
-      static_cast<long long>(cfg_.localize_recovery_max_record_age_sec * 1000.0);
-  in.max_restore_delay_ms =
-      static_cast<long long>(cfg_.localize_recovery_max_restore_delay_sec * 1000.0);
+  // Clamped, not cast: these come from the JSON config or an env var, so NaN,
+  // inf or an absurd number is possible, and a double-to-int64 cast that is
+  // out of range is undefined behaviour.
+  in.max_record_age_ms = SecondsToMsClamped(cfg_.localize_recovery_max_record_age_sec);
+  in.max_restore_delay_ms = SecondsToMsClamped(cfg_.localize_recovery_max_restore_delay_sec);
   const long long scheduled = restore_scheduled_ms_.load();
   in.restore_delay_ms = scheduled > 0 ? std::max(0LL, now - scheduled) : 0;
   const WaypointRecoveryPlan plan = DecideWaypointRecovery(in);
@@ -5342,6 +5343,26 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
       return reject("", "map " + pending_restore_map_id_ + " is still being restored to the robot");
     }
   }
+  // A healthy localization is not replaced by accident. On a rejection this
+  // command's recovery path clears the graph and re-uploads the map, which
+  // destroys a good (for example dock-fiducial) localization and leaves the
+  // robot unlocalized until a fiducial or another spot.localize succeeds. So a
+  // mistyped waypoint on a localized, confirmed robot is refused unless the
+  // operator says force=true.
+  if (!params.force) {
+    bool confirmed = false;
+    {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      confirmed = localization_confirmation_.AllowsPersist();
+    }
+    std::string current_waypoint;
+    if (confirmed && spot_.GetLocalizationWaypointId(&current_waypoint) &&
+        !current_waypoint.empty()) {
+      return reject("", "the robot is already localized at waypoint " + current_waypoint +
+                            " and that localization is confirmed; relocalizing can clear it if "
+                            "the new guess is rejected. Pass force=true to relocalize anyway");
+    }
+  }
   std::string map_id;
   std::string map_uuid;
   if (!ValidateGraphNavCommandMapUuid(action, params.map_uuid, false, &map_id, &map_uuid)) {
@@ -5384,6 +5405,17 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
     if (!begun) return reject(waypoint_id, refusal);
   }
   LocalizeAttemptWindow attempt_window(&nav_state_mu_, &localization_confirmation_, true);
+  // Checked again now the window is open: the lease-retain thread can schedule
+  // a map restore (MaybeScheduleRestoreForEmptyRobotGraph) between the check
+  // above and here, and a restore running under a localize attempt would fight
+  // it. Narrow window, but the attempt window is what closes it.
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (!pending_restore_map_id_.empty()) {
+      return reject(waypoint_id,
+                    "map " + pending_restore_map_id_ + " is still being restored to the robot");
+    }
+  }
 
   SpotClient::WaypointLocalizeResult result;
   bool accepted = spot_.SetLocalizationAtWaypoint(req, OperatorAcceptancePolicy(), &result);
@@ -5436,7 +5468,7 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
   // Accepted only on a small correction after visual alignment failed: weaker
   // evidence, so a person still has to confirm before navigating.
   const bool needs_confirm =
-      OperatorAcceptNeedsConfirmation(result.basis, result.visual_verification);
+      OperatorAcceptNeedsConfirmation(result.basis, result.visual_verification_requested);
   {
     std::lock_guard<std::mutex> lk(nav_state_mu_);
     if (needs_confirm) {
