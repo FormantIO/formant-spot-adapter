@@ -59,7 +59,13 @@ jobs:
 
   build:
     name: Build and ctest
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest. The adapter ships on Ubuntu 20.04 (see the
+    # Dockerfile), and GitHub has retired the 20.04 runner, so 22.04 is the
+    # closest supported platform. 24.04 is not: its protobuf is built on
+    # abseil, so linking formant-spot-adapter there wants absl_synchronization
+    # on the link line, which the 20.04 and 22.04 target does not have and
+    # should not grow a dependency on.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
