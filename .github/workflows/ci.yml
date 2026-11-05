@@ -3,7 +3,7 @@ name: CI
 # The repo had no CI: the six ctest targets only ever ran on a developer's
 # machine, so a PR could not show whether the logic tests passed. Two jobs:
 #
-#   unit-tests  the four test targets that need neither the Spot SDK nor gRPC,
+#   unit-tests  the five test targets that need neither the Spot SDK nor gRPC,
 #               compiled straight with g++. About a minute, so it is the gate
 #               that gives fast feedback on the acceptance rules, parsing,
 #               throttle and the confirmation state machine.
@@ -56,6 +56,8 @@ jobs:
             tests/dock_preflight_test.cpp src/dock_preflight.cpp
           run_target localize-recovery-test \
             tests/localize_recovery_test.cpp src/localize_recovery.cpp src/command_params.cpp
+          run_target map-processing-guard-test \
+            tests/map_processing_guard_test.cpp src/map_processing_guard.cpp
 
   build:
     name: Build and ctest
@@ -98,5 +100,6 @@ jobs:
           # the adapter), so build them before running the suite.
           ninja command-params-test graphnav-map-render-test \
             formant-agent-client-test dock-preflight-test \
-            localize-recovery-test localize-request-test
+            localize-recovery-test localize-request-test \
+            map-processing-guard-test
           ctest --output-on-failure

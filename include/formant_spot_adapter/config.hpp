@@ -141,6 +141,10 @@ struct Config {
   std::string waypoint_text_stream{"spot.waypoints"};
   std::string maps_text_stream{"spot.maps"};
   int graphnav_command_timeout_sec{60};
+  // Run the robot's map processing (odometry + fiducial loop closure) on the
+  // live graph before a mapping session is committed. Without it a recorded
+  // map is a single chain and routes retrace the whole walk.
+  bool map_process_topology_on_commit{true};
   std::unordered_map<std::string, StreamControl> stream_controls;
 
   bool IsStreamEnabled(const std::string& stream) const {

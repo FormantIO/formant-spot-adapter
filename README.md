@@ -123,6 +123,10 @@ value in `streamControls`.
   changes, then republishes the cached JPEG at a stable output FPS. For camera-like playback in
   Formant, the `spot.localization.graphnav.image` stream also needs Formant-side video encoding/realtime
   stream configuration; otherwise the agent treats it as a throttled telemetry image stream.
+- If the hand camera source is missing or reports 0x0 at startup (the arm cameras come up after
+  the body after a reboot), `spot.hand.image` is not disabled for good: the adapter re-checks the
+  image sources every 30 s for 10 minutes, then every 5 minutes, and starts the stream when the
+  source is valid, logging `configured source available again`.
 - `spot.left.image`, `spot.right.image`, and `spot.back.image` use the same cached-frame publish
   pattern: the adapter polls Spot at a lower configured rate, then republishes the latest JPEG at a
   stable output FPS. The right camera is rotated 180 degrees by default.
@@ -185,7 +189,20 @@ Additional non-GraphNav command-channel actions:
 - `spot.map.delete`: delete saved map and map-scoped aliases.
   - Parameter examples: `map_id=warehouse_a`
 - `spot.map.start_mapping`: start GraphNav recording.
-- `spot.map.stop_mapping`: stop recording and persist current map to disk.
+- `spot.map.stop_mapping`: stop recording and persist current map to disk. Before the graph is
+  downloaded, the adapter runs the robot's map processing (odometry and fiducial loop closure) on
+  it, so the saved map has shortcut edges instead of one chain that every route has to retrace.
+  Turn this off with `mapProcessTopologyOnCommit: false`. If processing fails the map is still
+  committed as recorded and a warning is logged. Processing is skipped (same warning) while GraphNav
+  navigation, a dock/undock, a queued dock request or a map restore is in progress, and a dock
+  request that arrives during processing is ignored. The processing RPC (up to 45 s) does not hold
+  the adapter's robot API lock, so E-stop, velocity and lease calls are never delayed by it.
+- `spot.map.process_topology`: run the same loop closure on demand. While recording it only
+  processes the live graph (stop_mapping commits it). Otherwise it processes the active map loaded
+  on the robot and commits a new revision, which is how a map recorded before this change gets
+  its loop closures. No params. Rejected while navigation, a dock/undock or a map restore is in
+  progress. If processing fails, a mapping session the command opened is closed without a new
+  revision; a session that already existed (for example from a failed stop_mapping) is kept.
 - `spot.waypoint.save`: create waypoint at current pose and bind alias.
   - Parameter examples: `name=dock_entry`
 - `spot.waypoint.update`: same as save, but intended to rebind an existing alias name.
