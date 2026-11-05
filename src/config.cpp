@@ -247,6 +247,9 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
   if (j.has_graphnav_store_dir()) c->graphnav_store_dir = j.graphnav_store_dir().value();
   if (j.has_waypoint_text_stream()) c->waypoint_text_stream = j.waypoint_text_stream().value();
   if (j.has_maps_text_stream()) c->maps_text_stream = j.maps_text_stream().value();
+  if (j.has_map_process_topology_on_commit()) {
+    c->map_process_topology_on_commit = j.map_process_topology_on_commit().value();
+  }
   if (j.has_graphnav_command_timeout_sec()) {
     c->graphnav_command_timeout_sec = j.graphnav_command_timeout_sec().value();
   }
@@ -406,6 +409,8 @@ Config load_config_from_env() {
   c.maps_text_stream = getenv_or("MAPS_TEXT_STREAM", c.maps_text_stream);
   c.graphnav_command_timeout_sec =
       getenv_int_or("GRAPHNAV_COMMAND_TIMEOUT_SEC", c.graphnav_command_timeout_sec);
+  c.map_process_topology_on_commit =
+      getenv_bool_or("MAP_PROCESS_TOPOLOGY_ON_COMMIT", c.map_process_topology_on_commit);
   return c;
 }
 

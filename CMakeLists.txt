@@ -129,6 +129,7 @@ add_executable(formant-spot-adapter
   src/command_params.cpp
   src/spot_client.cpp
   src/spot_check_client.cpp
+  src/map_processing_client.cpp
   src/dock_preflight.cpp
   src/localize_recovery.cpp
   src/localize_request.cpp
@@ -155,6 +156,7 @@ add_executable(image-pull-benchmark
   src/localize_request.cpp
   src/spot_client.cpp
   src/spot_check_client.cpp
+  src/map_processing_client.cpp
 )
 
 target_include_directories(image-pull-benchmark PRIVATE

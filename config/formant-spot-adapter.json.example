@@ -94,5 +94,6 @@
     { "stream": "spot.nav.feedback", "enabled": true },
     { "stream": "spot.adapter.log", "enabled": true }
   ],
-  "graphnavCommandTimeoutSec": 60
+  "graphnavCommandTimeoutSec": 60,
+  "mapProcessTopologyOnCommit": true
 }

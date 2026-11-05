@@ -2457,15 +2457,23 @@ bool Adapter::Init() {
       std::cerr << "  - " << src.name << " (" << src.cols << "x" << src.rows << ")" << std::endl;
     }
 
-    const auto validate_configured_source = [&source_map, this](std::string* source, std::string* stream) {
+    // retry_later: instead of disabling the stream for the life of the
+    // process, hand it to a DeferredCameraLoop that keeps checking. Used for
+    // the hand camera, which reports 0x0 (or is not listed yet) when the
+    // adapter starts before the arm has finished booting.
+    const auto validate_configured_source = [&source_map, this](std::string* source, std::string* stream,
+                                                                bool retry_later) {
       if (!source || !stream) return;
       if (source->empty() || stream->empty()) return;
       const std::string src = *source;
       const std::string out_stream = *stream;
+      const char* disabled_note =
+          retry_later ? " (stream deferred, retrying source discovery)" : " (stream disabled)";
       auto it = source_map.find(src);
       if (it == source_map.end()) {
         std::cerr << "[camera] configured source missing: source=" << src
-                  << " stream=" << out_stream << " (stream disabled)" << std::endl;
+                  << " stream=" << out_stream << disabled_note << std::endl;
+        if (retry_later) deferred_camera_sources_.push_back({src, out_stream});
         source->clear();
         stream->clear();
         return;
@@ -2474,7 +2482,8 @@ bool Adapter::Init() {
         std::cerr << "[camera] configured source unavailable: source=" << src
                   << " stream=" << out_stream
                   << " size=" << it->second.cols << "x" << it->second.rows
-                  << " (stream disabled)" << std::endl;
+                  << disabled_note << std::endl;
+        if (retry_later) deferred_camera_sources_.push_back({src, out_stream});
         source->clear();
         stream->clear();
         return;
@@ -2482,10 +2491,11 @@ bool Adapter::Init() {
       std::cerr << "[camera] stream config: stream=" << out_stream << " source=" << src
                 << " size=" << it->second.cols << "x" << it->second.rows << std::endl;
     };
-    validate_configured_source(&cfg_.camera_source, &cfg_.camera_stream_name);
-    validate_configured_source(&cfg_.left_camera_source, &cfg_.left_camera_stream_name);
-    validate_configured_source(&cfg_.right_camera_source, &cfg_.right_camera_stream_name);
-    validate_configured_source(&cfg_.back_camera_source, &cfg_.back_camera_stream_name);
+    deferred_camera_sources_.clear();
+    validate_configured_source(&cfg_.camera_source, &cfg_.camera_stream_name, true);
+    validate_configured_source(&cfg_.left_camera_source, &cfg_.left_camera_stream_name, false);
+    validate_configured_source(&cfg_.right_camera_source, &cfg_.right_camera_stream_name, false);
+    validate_configured_source(&cfg_.back_camera_source, &cfg_.back_camera_stream_name, false);
 
     if (!cfg_.front_image_stream_name.empty()) {
       const auto left_it = source_map.find(cfg_.front_left_camera_source);
@@ -2703,6 +2713,7 @@ void Adapter::Run() {
                            "spot.reset_arm",
                            "spot.map.create", "spot.map.load", "spot.map.set_default", "spot.map.delete",
                            "spot.map.start_mapping", "spot.map.stop_mapping",
+                           "spot.map.process_topology",
                            "spot.waypoint.save",
                            "spot.waypoint.delete", "spot.waypoint.goto",
                            "spot.waypoint.goto_straight",
@@ -2727,6 +2738,10 @@ void Adapter::Run() {
   const int surround_output_fps = std::max(1, cfg_.surround_camera_fps);
   const int surround_poll_hz = std::max(1, cfg_.surround_camera_poll_hz);
   start_camera(cfg_.camera_source, cfg_.camera_stream_name, hand_fps, hand_fps, false, false, 75);
+  for (const auto& deferred : deferred_camera_sources_) {
+    camera_threads_.emplace_back(&Adapter::DeferredCameraLoop, this, deferred.source,
+                                 deferred.stream, hand_fps, hand_fps, false, false, 75);
+  }
   const bool have_surround_stream =
       (!cfg_.left_camera_source.empty() && !cfg_.left_camera_stream_name.empty()) ||
       (!cfg_.right_camera_source.empty() && !cfg_.right_camera_stream_name.empty()) ||
@@ -2961,6 +2976,44 @@ void Adapter::Stop() {
   app_config_cv_.notify_all();
   command_queue_cv_.notify_all();
   agent_.StopLoops();
+}
+
+void Adapter::DeferredCameraLoop(const std::string& source, const std::string& stream,
+                                 int output_fps, int poll_hz, bool rotate_180,
+                                 bool normalize_jpeg, int post_timeout_ms) {
+  // Check every 30 s for the first 10 min after startup (an arm normally comes
+  // up within a couple of minutes of the body), then every 5 min.
+  constexpr long long kFastRetryMs = 30 * 1000;
+  constexpr long long kFastRetryWindowMs = 10 * 60 * 1000;
+  constexpr long long kSlowRetryMs = 5 * 60 * 1000;
+  const long long started_ms = now_ms();
+  long long next_check_ms = started_ms + kFastRetryMs;
+  int checks = 0;
+
+  while (running_) {
+    if (now_ms() < next_check_ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      continue;
+    }
+    const long long now = now_ms();
+    next_check_ms =
+        now + ((now - started_ms) < kFastRetryWindowMs ? kFastRetryMs : kSlowRetryMs);
+    if (!SpotConnected()) continue;
+    ++checks;
+    std::vector<SpotClient::ImageSourceInfo> sources;
+    if (!spot_.ListImageSources(&sources)) continue;
+    for (const auto& info : sources) {
+      if (info.name != source || info.cols <= 0 || info.rows <= 0) continue;
+      EmitLog("[camera] configured source available again: source=" + source +
+              " stream=" + stream + " size=" + std::to_string(info.cols) + "x" +
+              std::to_string(info.rows) + " after_sec=" +
+              std::to_string((now_ms() - started_ms) / 1000) + " checks=" +
+              std::to_string(checks) + " (stream enabled)");
+      CameraLoop(source, stream, output_fps, poll_hz, rotate_180, normalize_jpeg,
+                 post_timeout_ms);
+      return;
+    }
+  }
 }
 
 void Adapter::CameraLoop(const std::string& source, const std::string& stream, int output_fps,
@@ -7712,8 +7765,42 @@ bool Adapter::ValidateMappingCandidate(const std::string& map_id,
   return true;
 }
 
-bool Adapter::FinalizeActiveMappingSession(const std::string& map_id) {
+bool Adapter::ProcessLiveGraphTopology(const std::string& context) {
+  SpotClient::MappingStatus before;
+  const bool have_before = spot_.GetMappingStatus(&before);
+  const long long started_ms = now_ms();
+  SpotClient::TopologyProcessResult result;
+  if (!spot_.ProcessMapTopology(&result)) {
+    EmitLog("[graphnav] " + context + " process_topology failed: " + spot_.LastError());
+    return false;
+  }
+  std::string msg = "[graphnav] " + context + " process_topology new_edges=" +
+                    std::to_string(result.new_edge_count) +
+                    " new_waypoints=" + std::to_string(result.new_waypoint_count) +
+                    " map_modified=" + (result.map_modified ? "true" : "false") +
+                    " timed_out=" + (result.timed_out ? "true" : "false") +
+                    " elapsed_ms=" + std::to_string(now_ms() - started_ms);
+  SpotClient::MappingStatus after;
+  if (have_before && spot_.GetMappingStatus(&after)) {
+    msg += " edges=" + std::to_string(before.edge_count) + "->" + std::to_string(after.edge_count);
+  }
+  EmitLog(msg);
+  return true;
+}
+
+bool Adapter::FinalizeActiveMappingSession(const std::string& map_id, bool process_topology) {
   if (map_id.empty()) return false;
+
+  // A recorded map is one chain of waypoints until loop closure runs, so a
+  // goal near the start can get a route that retraces the whole walk. Close
+  // loops on the robot before the graph is downloaded and persisted. A failure
+  // here is not a reason to lose the recording: warn and commit as recorded.
+  if (process_topology) {
+    if (!ProcessLiveGraphTopology("mapping commit map_id=" + map_id)) {
+      EmitLog("[graphnav] mapping commit warning: committing map_id=" + map_id +
+              " without loop closure");
+    }
+  }
 
   SpotClient::StoredMap candidate_map;
   if (!spot_.DownloadCurrentMap(&candidate_map)) {
@@ -8873,7 +8960,48 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       EmitLog("[graphnav] stop_mapping failed: missing mapping session");
       return false;
     }
-    return FinalizeActiveMappingSession(active_map);
+    return FinalizeActiveMappingSession(active_map, cfg_.map_process_topology_on_commit);
+  }
+
+  if (request.command() == "spot.map.process_topology") {
+    // Adds loop-closure edges to the active map. While recording, this only
+    // processes the live graph; stop_mapping commits it. Otherwise it opens a
+    // mapping session on the active map, processes, and commits a new
+    // revision through the same validation as stop_mapping.
+    if (!EnsureLeaseForCommand("spot.map.process_topology")) return false;
+    SpotClient::MappingStatus status;
+    if (spot_.GetMappingStatus(&status)) map_recording_active_ = status.is_recording;
+    if (map_recording_active_) {
+      return ProcessLiveGraphTopology("process_topology (recording)");
+    }
+    std::string active_map;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      if (active_map_id_.empty()) {
+        EmitLog("[graphnav] process_topology rejected: no active map");
+        return false;
+      }
+      if (!pending_restore_map_id_.empty()) {
+        EmitLog("[graphnav] process_topology rejected: map " + pending_restore_map_id_ +
+                " is still being restored to the robot");
+        return false;
+      }
+      active_map = active_map_id_;
+    }
+    if (!EnsureMappingSessionForActiveMap()) {
+      EmitLog("[graphnav] process_topology failed: unable to open mapping session");
+      return false;
+    }
+    if (!ProcessLiveGraphTopology("process_topology map_id=" + active_map)) {
+      // Nothing changed on the robot; close the session without a new revision.
+      {
+        std::lock_guard<std::mutex> lk(map_mu_);
+        ClearMappingSessionLocked();
+      }
+      (void)SaveAdapterMapState();
+      return false;
+    }
+    return FinalizeActiveMappingSession(active_map, false);
   }
 
   return false;

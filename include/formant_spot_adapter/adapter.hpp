@@ -63,6 +63,11 @@ class Adapter {
 
   void CameraLoop(const std::string& source, const std::string& stream, int output_fps,
                   int poll_hz, bool rotate_180, bool normalize_jpeg, int post_timeout_ms);
+  // Waits for a camera source that was missing or 0x0 at startup (the arm
+  // cameras come up after the rest of the robot after a reboot), then runs
+  // CameraLoop for it.
+  void DeferredCameraLoop(const std::string& source, const std::string& stream, int output_fps,
+                          int poll_hz, bool rotate_180, bool normalize_jpeg, int post_timeout_ms);
   void SurroundImageLoop(int output_fps, int poll_hz);
   void FrontImageLoop(const std::string& stream, int fps, int poll_hz);
   void LocalizationImageLoop(const std::string& stream, int fps, int poll_hz);
@@ -191,7 +196,12 @@ class Adapter {
   bool ValidateMappingCandidate(const std::string& map_id,
                                 const SpotClient::StoredMap& candidate_map,
                                 std::string* out_error);
-  bool FinalizeActiveMappingSession(const std::string& map_id);
+  // Runs the robot's loop closure on the live graph. Logs the result and
+  // returns false on failure (callers decide whether that is fatal).
+  bool ProcessLiveGraphTopology(const std::string& context);
+  // process_topology: run loop closure on the live graph before downloading
+  // and persisting it.
+  bool FinalizeActiveMappingSession(const std::string& map_id, bool process_topology);
   std::unordered_map<std::string, std::string> EffectiveWaypointAliasesForMapLocked(
       const std::string& map_id) const;
   std::string EffectiveDockWaypointForMapLocked(const std::string& map_id) const;
@@ -315,6 +325,13 @@ class Adapter {
   double last_sent_body_pitch_{0.0};
   long long last_sent_velocity_ms_{0};
 
+  struct DeferredCameraSource {
+    std::string source;
+    std::string stream;
+  };
+  // Hand camera sources that were unavailable at startup; Run() starts a
+  // DeferredCameraLoop for each.
+  std::vector<DeferredCameraSource> deferred_camera_sources_;
   std::vector<std::thread> camera_threads_;
   std::thread surround_image_thread_;
   std::thread front_image_thread_;

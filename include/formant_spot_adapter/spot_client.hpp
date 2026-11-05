@@ -22,6 +22,7 @@
 #include "bosdyn/client/time_sync/time_sync_helpers.h"
 #include "bosdyn/client/world_objects/world_object_client.h"
 #include "formant_spot_adapter/dock_preflight.hpp"
+#include "formant_spot_adapter/map_processing_client.hpp"
 #include "formant_spot_adapter/spot_check_client.hpp"
 
 namespace fsa {
@@ -95,6 +96,13 @@ class SpotClient {
     ::bosdyn::api::graph_nav::Graph graph;
     std::vector<::bosdyn::api::graph_nav::WaypointSnapshot> waypoint_snapshots;
     std::vector<::bosdyn::api::graph_nav::EdgeSnapshot> edge_snapshots;
+  };
+
+  struct TopologyProcessResult {
+    int new_edge_count{0};
+    int new_waypoint_count{0};
+    bool map_modified{false};
+    bool timed_out{false};
   };
 
   struct MappingStatus {
@@ -281,6 +289,11 @@ class SpotClient {
   bool DownloadCurrentGraph(::bosdyn::api::graph_nav::Graph* out_graph);
   bool DownloadCurrentMap(StoredMap* out_map);
   bool GetMappingStatus(MappingStatus* out_status);
+  // Runs the robot's map processing service (odometry + fiducial loop closure)
+  // on the graph currently loaded on the robot and writes the new edges into
+  // it (modify_map_on_server). Returns false on an RPC error or a non-OK
+  // processing status; a processing timeout is a partial success.
+  bool ProcessMapTopology(TopologyProcessResult* out_result);
   bool BuildGraphNavMapSnapshot(const StoredMap& map_data, GraphNavMapSnapshot* out_snapshot);
   bool UploadGraphMap(const StoredMap& map_data);
   bool ClearGraph();
@@ -339,6 +352,7 @@ class SpotClient {
   bool EnsureGraphNavClient();
   bool EnsureGraphNavRecordingClient();
   bool EnsureSpotCheckClient();
+  bool EnsureMapProcessingClient();
   bool EnsureRobotStateClient();
   bool EnsureWorldObjectClient();
   bool EnsurePowered();
@@ -356,6 +370,7 @@ class SpotClient {
   ::bosdyn::client::GraphNavClient* graph_nav_client_{nullptr};
   ::bosdyn::client::GraphNavRecordingClient* graph_nav_recording_client_{nullptr};
   ::bosdyn::client::SpotCheckClient* spot_check_client_{nullptr};
+  ::bosdyn::client::MapProcessingClient* map_processing_client_{nullptr};
   ::bosdyn::client::DockingClient* docking_client_{nullptr};
   ::bosdyn::client::RobotStateClient* robot_state_client_{nullptr};
   ::bosdyn::client::WorldObjectClient* world_object_client_{nullptr};

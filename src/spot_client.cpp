@@ -483,6 +483,7 @@ bool SpotClient::Connect(const std::string& host, const std::string& username, c
   graph_nav_client_ = nullptr;
   graph_nav_recording_client_ = nullptr;
   spot_check_client_ = nullptr;
+  map_processing_client_ = nullptr;
   docking_client_ = nullptr;
   robot_state_client_ = nullptr;
   world_object_client_ = nullptr;
@@ -1168,6 +1169,59 @@ bool SpotClient::StopGraphRecording() {
                    ::bosdyn::api::graph_nav::StopRecordingResponse::STATUS_NOT_READY_YET)) +
                " after retries");
   return false;
+}
+
+bool SpotClient::ProcessMapTopology(TopologyProcessResult* out_result) {
+  // Server-side processing budget. The service returns a partial result with
+  // timed_out set when it runs out; that still adds edges. The RPC deadline
+  // leaves room on top of it. The lock is held throughout like the other
+  // GraphNav calls, so other robot calls wait up to this long.
+  constexpr double kProcessingTimeoutSec = 30.0;
+  constexpr int kRpcTimeoutSec = 45;
+
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!EnsureMapProcessingClient()) return false;
+
+  ::bosdyn::api::graph_nav::ProcessTopologyRequest req;
+  auto* params = req.mutable_params();
+  params->mutable_do_odometry_loop_closure()->set_value(true);
+  params->mutable_do_fiducial_loop_closure()->set_value(true);
+  params->set_timeout_seconds(kProcessingTimeoutSec);
+  req.set_modify_map_on_server(true);
+
+  ::bosdyn::client::RPCParameters rpc_params;
+  rpc_params.timeout = std::chrono::seconds(kRpcTimeoutSec);
+  auto r = map_processing_client_->ProcessTopology(req, rpc_params);
+  if (!r.status) {
+    SetLastError(r.status.DebugString());
+    return false;
+  }
+  if (r.response.empty()) {
+    SetLastError("ProcessTopology returned no responses");
+    return false;
+  }
+
+  TopologyProcessResult result;
+  for (const auto& response : r.response) {
+    if (response.status() != ::bosdyn::api::graph_nav::ProcessTopologyResponse::STATUS_OK) {
+      std::string msg = "ProcessTopology failed status=" +
+                        std::to_string(static_cast<int>(response.status()));
+      if (response.missing_snapshot_ids_size() > 0) {
+        msg += " missing_snapshots=" + std::to_string(response.missing_snapshot_ids_size());
+      }
+      if (response.missing_waypoint_ids_size() > 0) {
+        msg += " missing_waypoints=" + std::to_string(response.missing_waypoint_ids_size());
+      }
+      SetLastError(msg);
+      return false;
+    }
+    result.new_edge_count += response.new_subgraph().edges_size();
+    result.new_waypoint_count += response.new_subgraph().waypoints_size();
+    result.map_modified = result.map_modified || response.map_on_server_was_modified();
+    result.timed_out = result.timed_out || response.timed_out();
+  }
+  if (out_result) *out_result = result;
+  return true;
 }
 
 bool SpotClient::CreateGraphWaypoint(const std::string& waypoint_name, std::string* out_waypoint_id) {
@@ -2399,6 +2453,20 @@ bool SpotClient::EnsureGraphNavRecordingClient() {
     return false;
   }
   graph_nav_recording_client_ = client.response;
+  return true;
+}
+
+bool SpotClient::EnsureMapProcessingClient() {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (map_processing_client_) return true;
+  if (!robot_) return false;
+  auto client = robot_->EnsureServiceClient<::bosdyn::client::MapProcessingClient>(
+      ::bosdyn::client::MapProcessingClient::GetDefaultServiceName());
+  if (!client.status) {
+    SetLastError(client.status.DebugString());
+    return false;
+  }
+  map_processing_client_ = client.response;
   return true;
 }
 
