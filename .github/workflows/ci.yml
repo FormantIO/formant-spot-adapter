@@ -100,5 +100,6 @@ jobs:
           # the adapter), so build them before running the suite.
           ninja command-params-test graphnav-map-render-test \
             formant-agent-client-test dock-preflight-test \
-            localize-recovery-test localize-request-test
+            localize-recovery-test localize-request-test \
+            map-processing-guard-test
           ctest --output-on-failure
