@@ -1,6 +1,7 @@
 #include "formant_spot_adapter/spot_client.hpp"
 #include "formant_spot_adapter/localize_recovery.hpp"
 #include "formant_spot_adapter/localize_request.hpp"
+#include "formant_spot_adapter/map_processing_guard.hpp"
 
 #include <algorithm>
 #include <array>
@@ -473,6 +474,12 @@ std::string SpotClient::LastError() const {
 
 bool SpotClient::Connect(const std::string& host, const std::string& username, const std::string& password) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (map_processing_in_flight_.load()) {
+    // Replacing robot_ would destroy the map processing client mid-RPC. The
+    // RPC is bounded (see ProcessMapTopology), so the caller's retry succeeds.
+    SetLastError("reconnect deferred: map processing RPC in flight");
+    return false;
+  }
   body_lease_.Clear();
   arm_presence_state_ = -1;
   robot_command_client_ = nullptr;
@@ -1174,13 +1181,26 @@ bool SpotClient::StopGraphRecording() {
 bool SpotClient::ProcessMapTopology(TopologyProcessResult* out_result) {
   // Server-side processing budget. The service returns a partial result with
   // timed_out set when it runs out; that still adds edges. The RPC deadline
-  // leaves room on top of it. The lock is held throughout like the other
-  // GraphNav calls, so other robot calls wait up to this long.
+  // leaves room on top of it.
   constexpr double kProcessingTimeoutSec = 30.0;
   constexpr int kRpcTimeoutSec = 45;
 
-  std::lock_guard<std::recursive_mutex> lk(api_mu_);
-  if (!EnsureMapProcessingClient()) return false;
+  std::lock_guard<std::mutex> processing_lk(map_processing_mu_);
+  ::bosdyn::client::MapProcessingClient* client = nullptr;
+  {
+    // api_mu_ only to resolve the client. The RPC below runs without it so
+    // EmergencyStop, velocity commands and lease retention are never blocked
+    // by map processing. Setting the in-flight flag under api_mu_ makes Connect
+    // (which also takes api_mu_) refuse to replace robot_ until we are done.
+    std::lock_guard<std::recursive_mutex> lk(api_mu_);
+    if (!EnsureMapProcessingClient()) return false;
+    client = map_processing_client_;
+    map_processing_in_flight_ = true;
+  }
+  struct InFlightReset {
+    std::atomic<bool>* flag;
+    ~InFlightReset() { *flag = false; }
+  } in_flight_reset{&map_processing_in_flight_};
 
   ::bosdyn::api::graph_nav::ProcessTopologyRequest req;
   auto* params = req.mutable_params();
@@ -1191,7 +1211,7 @@ bool SpotClient::ProcessMapTopology(TopologyProcessResult* out_result) {
 
   ::bosdyn::client::RPCParameters rpc_params;
   rpc_params.timeout = std::chrono::seconds(kRpcTimeoutSec);
-  auto r = map_processing_client_->ProcessTopology(req, rpc_params);
+  auto r = client->ProcessTopology(req, rpc_params);
   if (!r.status) {
     SetLastError(r.status.DebugString());
     return false;
@@ -1201,11 +1221,16 @@ bool SpotClient::ProcessMapTopology(TopologyProcessResult* out_result) {
     return false;
   }
 
-  TopologyProcessResult result;
+  // Same handling as the Python SDK (bosdyn/client/map_processing.py, 5.1.0):
+  // _process_topology_streamed_errors checks the status of every streamed
+  // response (unset STATUS_UNKNOWN and the three error statuses fail), and
+  // _get_streamed_topology_response MergeFrom()s the responses into one, whose
+  // new_subgraph holds all new edges and waypoints.
+  ::bosdyn::api::graph_nav::ProcessTopologyResponse merged;
   for (const auto& response : r.response) {
-    if (response.status() != ::bosdyn::api::graph_nav::ProcessTopologyResponse::STATUS_OK) {
-      std::string msg = "ProcessTopology failed status=" +
-                        std::to_string(static_cast<int>(response.status()));
+    const std::string status_error = ProcessTopologyStatusError(static_cast<int>(response.status()));
+    if (!status_error.empty()) {
+      std::string msg = "ProcessTopology failed: " + status_error;
       if (response.missing_snapshot_ids_size() > 0) {
         msg += " missing_snapshots=" + std::to_string(response.missing_snapshot_ids_size());
       }
@@ -1215,11 +1240,14 @@ bool SpotClient::ProcessMapTopology(TopologyProcessResult* out_result) {
       SetLastError(msg);
       return false;
     }
-    result.new_edge_count += response.new_subgraph().edges_size();
-    result.new_waypoint_count += response.new_subgraph().waypoints_size();
-    result.map_modified = result.map_modified || response.map_on_server_was_modified();
-    result.timed_out = result.timed_out || response.timed_out();
+    merged.MergeFrom(response);
   }
+
+  TopologyProcessResult result;
+  result.new_edge_count = merged.new_subgraph().edges_size();
+  result.new_waypoint_count = merged.new_subgraph().waypoints_size();
+  result.map_modified = merged.map_on_server_was_modified();
+  result.timed_out = merged.timed_out();
   if (out_result) *out_result = result;
   return true;
 }

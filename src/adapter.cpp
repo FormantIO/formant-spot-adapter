@@ -2,6 +2,7 @@
 #include "formant_spot_adapter/command_params.hpp"
 #include "formant_spot_adapter/graphnav_map_render.hpp"
 #include "formant_spot_adapter/localize_recovery.hpp"
+#include "formant_spot_adapter/map_processing_guard.hpp"
 
 #include <algorithm>
 #include <array>
@@ -6852,6 +6853,11 @@ void Adapter::DockLoop() {
     const bool return_and_dock = return_and_dock_requested_.exchange(false);
     const bool dock_requested = dock_requested_.exchange(false);
     if (!return_and_dock && !dock_requested) continue;
+    if (map_processing_active_) {
+      EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
+              " request ignored: map processing is rewriting the graph");
+      continue;
+    }
     if (docking_in_progress_) {
       EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
               " request ignored: dock already in progress");
@@ -7765,7 +7771,31 @@ bool Adapter::ValidateMappingCandidate(const std::string& map_id,
   return true;
 }
 
+std::string Adapter::MapProcessingBlockReasonNow() {
+  MapProcessingActivity activity;
+  activity.navigation_active = graphnav_navigation_active_.load();
+  activity.docking_in_progress = docking_in_progress_.load();
+  activity.dock_requested = dock_requested_.load() || return_and_dock_requested_.load();
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    activity.pending_restore_map_id = pending_restore_map_id_;
+  }
+  return MapProcessingBlockReason(activity);
+}
+
 bool Adapter::ProcessLiveGraphTopology(const std::string& context) {
+  // Raise the flag before checking, so a dock that DockLoop has not started
+  // yet sees it and waits its turn.
+  map_processing_active_ = true;
+  struct ActiveReset {
+    std::atomic<bool>* flag;
+    ~ActiveReset() { *flag = false; }
+  } active_reset{&map_processing_active_};
+  const std::string blocked = MapProcessingBlockReasonNow();
+  if (!blocked.empty()) {
+    EmitLog("[graphnav] " + context + " process_topology refused: " + blocked);
+    return false;
+  }
   SpotClient::MappingStatus before;
   const bool have_before = spot_.GetMappingStatus(&before);
   const long long started_ms = now_ms();
@@ -7796,6 +7826,9 @@ bool Adapter::FinalizeActiveMappingSession(const std::string& map_id, bool proce
   // loops on the robot before the graph is downloaded and persisted. A failure
   // here is not a reason to lose the recording: warn and commit as recorded.
   if (process_topology) {
+    // Refused (navigation, dock or restore in progress) or failed: the
+    // recording is still committed, just without loop closure; it can be
+    // fixed later with spot.map.process_topology.
     if (!ProcessLiveGraphTopology("mapping commit map_id=" + map_id)) {
       EmitLog("[graphnav] mapping commit warning: committing map_id=" + map_id +
               " without loop closure");
@@ -8988,17 +9021,31 @@ bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
       }
       active_map = active_map_id_;
     }
+    const std::string blocked = MapProcessingBlockReasonNow();
+    if (!blocked.empty()) {
+      EmitLog("[graphnav] process_topology rejected: " + blocked);
+      return false;
+    }
+    ProcessTopologySessionClaim claim;
+    {
+      std::lock_guard<std::mutex> lk(map_mu_);
+      claim.session_existed_before = MappingSessionAppliesToMapLocked(active_map);
+    }
     if (!EnsureMappingSessionForActiveMap()) {
       EmitLog("[graphnav] process_topology failed: unable to open mapping session");
       return false;
     }
+    claim.session_open_after = true;
     if (!ProcessLiveGraphTopology("process_topology map_id=" + active_map)) {
-      // Nothing changed on the robot; close the session without a new revision.
-      {
-        std::lock_guard<std::mutex> lk(map_mu_);
-        ClearMappingSessionLocked();
+      // Nothing was committed. Close the session only if this command opened
+      // it; a session left by an earlier stop_mapping keeps its staged edits.
+      if (ShouldDiscardSessionAfterFailedProcessing(claim)) {
+        {
+          std::lock_guard<std::mutex> lk(map_mu_);
+          ClearMappingSessionLocked();
+        }
+        (void)SaveAdapterMapState();
       }
-      (void)SaveAdapterMapState();
       return false;
     }
     return FinalizeActiveMappingSession(active_map, false);

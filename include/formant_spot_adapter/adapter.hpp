@@ -199,6 +199,8 @@ class Adapter {
   // Runs the robot's loop closure on the live graph. Logs the result and
   // returns false on failure (callers decide whether that is fatal).
   bool ProcessLiveGraphTopology(const std::string& context);
+  // Empty when loop closure may rewrite the live graph now; otherwise why not.
+  std::string MapProcessingBlockReasonNow();
   // process_topology: run loop closure on the live graph before downloading
   // and persisting it.
   bool FinalizeActiveMappingSession(const std::string& map_id, bool process_topology);
@@ -501,6 +503,9 @@ class Adapter {
   std::string current_waypoint_at_text_;
   std::atomic<bool> map_recording_active_{false};
   std::atomic<bool> graphnav_navigation_active_{false};
+  // Set while ProcessTopology may be rewriting the live graph; DockLoop does
+  // not start a dock or return_and_dock while it is set.
+  std::atomic<bool> map_processing_active_{false};
   std::atomic<bool> nav_auto_recovered_{false};
   std::atomic<uint32_t> last_graph_nav_command_id_{0};
   int graphnav_map_post_backoff_ms_{1000};

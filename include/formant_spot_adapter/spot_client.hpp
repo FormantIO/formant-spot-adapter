@@ -379,6 +379,12 @@ class SpotClient {
   std::atomic<int> arm_present_override_{-1};
   std::atomic<int> arm_presence_state_{-1};
   mutable std::recursive_mutex api_mu_;
+  // ProcessMapTopology runs its long RPC outside api_mu_ so E-stop, velocity
+  // and lease calls never wait on it. This mutex serializes map processing,
+  // and the in-flight flag makes Connect refuse (instead of destroying the
+  // robot and its clients) while the RPC is running.
+  std::mutex map_processing_mu_;
+  std::atomic<bool> map_processing_in_flight_{false};
   mutable std::mutex err_mu_;
   std::string last_error_;
 };

@@ -133,6 +133,7 @@ add_executable(formant-spot-adapter
   src/dock_preflight.cpp
   src/localize_recovery.cpp
   src/localize_request.cpp
+  src/map_processing_guard.cpp
   src/adapter.cpp
 )
 
@@ -157,6 +158,7 @@ add_executable(image-pull-benchmark
   src/spot_client.cpp
   src/spot_check_client.cpp
   src/map_processing_client.cpp
+  src/map_processing_guard.cpp
 )
 
 target_include_directories(image-pull-benchmark PRIVATE
@@ -221,6 +223,17 @@ target_include_directories(dock-preflight-test PRIVATE
 )
 
 add_test(NAME dock-preflight-test COMMAND dock-preflight-test)
+
+add_executable(map-processing-guard-test
+  tests/map_processing_guard_test.cpp
+  src/map_processing_guard.cpp
+)
+
+target_include_directories(map-processing-guard-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME map-processing-guard-test COMMAND map-processing-guard-test)
 
 add_executable(localize-recovery-test
   tests/localize_recovery_test.cpp

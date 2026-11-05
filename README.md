@@ -193,11 +193,16 @@ Additional non-GraphNav command-channel actions:
   downloaded, the adapter runs the robot's map processing (odometry and fiducial loop closure) on
   it, so the saved map has shortcut edges instead of one chain that every route has to retrace.
   Turn this off with `mapProcessTopologyOnCommit: false`. If processing fails the map is still
-  committed as recorded and a warning is logged.
+  committed as recorded and a warning is logged. Processing is skipped (same warning) while GraphNav
+  navigation, a dock/undock, a queued dock request or a map restore is in progress, and a dock
+  request that arrives during processing is ignored. The processing RPC (up to 45 s) does not hold
+  the adapter's robot API lock, so E-stop, velocity and lease calls are never delayed by it.
 - `spot.map.process_topology`: run the same loop closure on demand. While recording it only
   processes the live graph (stop_mapping commits it). Otherwise it processes the active map loaded
   on the robot and commits a new revision, which is how a map recorded before this change gets
-  its loop closures. No params.
+  its loop closures. No params. Rejected while navigation, a dock/undock or a map restore is in
+  progress. If processing fails, a mapping session the command opened is closed without a new
+  revision; a session that already existed (for example from a failed stop_mapping) is kept.
 - `spot.waypoint.save`: create waypoint at current pose and bind alias.
   - Parameter examples: `name=dock_entry`
 - `spot.waypoint.update`: same as save, but intended to rebind an existing alias name.
