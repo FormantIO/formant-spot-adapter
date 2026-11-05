@@ -477,9 +477,11 @@ bool SpotClient::Connect(const std::string& host, const std::string& username, c
   if (map_processing_in_flight_.load()) {
     // Replacing robot_ would destroy the map processing client mid-RPC. The
     // RPC is bounded (see ProcessMapTopology), so the caller's retry succeeds.
+    last_connect_deferred_ = true;
     SetLastError("reconnect deferred: map processing RPC in flight");
     return false;
   }
+  last_connect_deferred_ = false;
   body_lease_.Clear();
   arm_presence_state_ = -1;
   robot_command_client_ = nullptr;

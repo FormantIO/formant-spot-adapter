@@ -344,6 +344,9 @@ class SpotClient {
   bool Undock(int poll_ms, int command_timeout_sec);
   void RequestDockCancel();
   std::string LastError() const;
+  // True when the last Connect() was refused because a map processing RPC was
+  // in flight (not a connection failure).
+  bool LastConnectDeferred() const { return last_connect_deferred_.load(); }
 
  private:
   bool EnsureTimeSync();
@@ -385,6 +388,7 @@ class SpotClient {
   // robot and its clients) while the RPC is running.
   std::mutex map_processing_mu_;
   std::atomic<bool> map_processing_in_flight_{false};
+  std::atomic<bool> last_connect_deferred_{false};
   mutable std::mutex err_mu_;
   std::string last_error_;
 };

@@ -506,6 +506,10 @@ class Adapter {
   // Set while ProcessTopology may be rewriting the live graph; DockLoop does
   // not start a dock or return_and_dock while it is set.
   std::atomic<bool> map_processing_active_{false};
+  // Set by DockLoop from the moment it takes a dock request until that attempt
+  // ends. Handshake with map_processing_active_: each side sets its own flag
+  // (seq_cst) before reading the other's, so they can never both proceed.
+  std::atomic<bool> dock_loop_busy_{false};
   std::atomic<bool> nav_auto_recovered_{false};
   std::atomic<uint32_t> last_graph_nav_command_id_{0};
   int graphnav_map_post_backoff_ms_{1000};

@@ -6,6 +6,7 @@ std::string MapProcessingBlockReason(const MapProcessingActivity& activity) {
   if (activity.navigation_active) return "graphnav navigation in progress";
   if (activity.docking_in_progress) return "dock or undock in progress";
   if (activity.dock_requested) return "dock request pending";
+  if (activity.dock_loop_busy) return "dock or return_and_dock attempt in progress";
   if (!activity.pending_restore_map_id.empty()) {
     return "map " + activity.pending_restore_map_id + " is still being restored to the robot";
   }

@@ -33,6 +33,11 @@ void test_block_reason() {
   queued.dock_requested = true;
   check(contains(fsa::MapProcessingBlockReason(queued), "dock request"), "queued dock blocks");
 
+  fsa::MapProcessingActivity claimed;
+  claimed.dock_loop_busy = true;
+  check(contains(fsa::MapProcessingBlockReason(claimed), "dock"),
+        "a dock attempt claimed by DockLoop blocks before docking_in_progress is set");
+
   fsa::MapProcessingActivity restore;
   restore.pending_restore_map_id = "site_a";
   check(contains(fsa::MapProcessingBlockReason(restore), "site_a"), "pending restore blocks");

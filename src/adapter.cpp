@@ -4424,6 +4424,14 @@ void Adapter::ConnectionLoop() {
         SetSpotConnected();
         continue;
       }
+      if (spot_.LastConnectDeferred()) {
+        // Refused only because a map processing RPC is running. Not a failed
+        // attempt: keep the backoff where it was and retry soon.
+        spot_reconnect_attempt_ = attempt - 1;
+        next_spot_connect_attempt_ms_ = now + 1000;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      }
       const std::string err = spot_.LastError();
       SetSpotDisconnected(err);
       const int backoff_ms = std::min(30000, 1000 * (1 << std::min(5, std::max(0, attempt - 1))));
@@ -6853,6 +6861,13 @@ void Adapter::DockLoop() {
     const bool return_and_dock = return_and_dock_requested_.exchange(false);
     const bool dock_requested = dock_requested_.exchange(false);
     if (!return_and_dock && !dock_requested) continue;
+    // Claim before checking map processing (see dock_loop_busy_). Cleared on
+    // every path out of this attempt, since every path leaves this scope.
+    dock_loop_busy_ = true;
+    struct DockClaimReset {
+      std::atomic<bool>* flag;
+      ~DockClaimReset() { *flag = false; }
+    } dock_claim_reset{&dock_loop_busy_};
     if (map_processing_active_) {
       EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
               " request ignored: map processing is rewriting the graph");
@@ -7776,6 +7791,7 @@ std::string Adapter::MapProcessingBlockReasonNow() {
   activity.navigation_active = graphnav_navigation_active_.load();
   activity.docking_in_progress = docking_in_progress_.load();
   activity.dock_requested = dock_requested_.load() || return_and_dock_requested_.load();
+  activity.dock_loop_busy = dock_loop_busy_.load();
   {
     std::lock_guard<std::mutex> lk(map_mu_);
     activity.pending_restore_map_id = pending_restore_map_id_;

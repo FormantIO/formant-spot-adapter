@@ -12,6 +12,11 @@ struct MapProcessingActivity {
   bool navigation_active{false};
   bool docking_in_progress{false};  // dock or undock running
   bool dock_requested{false};       // dock / return_and_dock queued, not started yet
+  // DockLoop has taken a dock request and is working on it (preflight,
+  // return-to-dock navigation, docking). Set before DockLoop checks for map
+  // processing, so between this and the processing flag one side always sees
+  // the other.
+  bool dock_loop_busy{false};
   std::string pending_restore_map_id;
 };
 
