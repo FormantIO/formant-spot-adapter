@@ -54,6 +54,8 @@ jobs:
             tests/graphnav_map_render_test.cpp src/graphnav_map_render.cpp
           run_target dock-preflight-test \
             tests/dock_preflight_test.cpp src/dock_preflight.cpp
+          run_target autonomy-lease-hold-test \
+            tests/autonomy_lease_hold_test.cpp src/autonomy_lease_hold.cpp
           run_target localize-recovery-test \
             tests/localize_recovery_test.cpp src/localize_recovery.cpp src/command_params.cpp
           run_target map-processing-guard-test \
@@ -100,6 +102,7 @@ jobs:
           # the adapter), so build them before running the suite.
           ninja command-params-test graphnav-map-render-test \
             formant-agent-client-test dock-preflight-test \
+            autonomy-lease-hold-test \
             localize-recovery-test localize-request-test \
             map-processing-guard-test
           ctest --output-on-failure

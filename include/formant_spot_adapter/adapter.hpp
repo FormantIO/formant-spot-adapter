@@ -310,6 +310,13 @@ class Adapter {
   std::atomic<bool> can_dock_{false};
   std::atomic<bool> reboot_requested_{false};
   std::atomic<bool> command_action_in_progress_{false};
+  // Last time autonomy was seen running while teleop was inactive. 0 when no
+  // autonomy has run since the lease was taken or teleop last used it.
+  std::atomic<long long> last_autonomy_activity_ms_{0};
+  // Set by a dock that ends docked or by a sit, so the post-autonomy lease hold
+  // is skipped and the lease goes back right away.
+  std::atomic<bool> lease_release_requested_{false};
+  std::atomic<bool> autonomy_lease_hold_logged_{false};
   std::atomic<int> desired_motion_mode_{0};
   std::atomic<long long> last_lease_attempt_ms_{0};
   std::atomic<long long> dock_cooldown_until_ms_{0};

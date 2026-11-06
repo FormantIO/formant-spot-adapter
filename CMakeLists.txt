@@ -131,6 +131,7 @@ add_executable(formant-spot-adapter
   src/spot_check_client.cpp
   src/map_processing_client.cpp
   src/dock_preflight.cpp
+  src/autonomy_lease_hold.cpp
   src/localize_recovery.cpp
   src/localize_request.cpp
   src/map_processing_guard.cpp
@@ -223,6 +224,17 @@ target_include_directories(dock-preflight-test PRIVATE
 )
 
 add_test(NAME dock-preflight-test COMMAND dock-preflight-test)
+
+add_executable(autonomy-lease-hold-test
+  tests/autonomy_lease_hold_test.cpp
+  src/autonomy_lease_hold.cpp
+)
+
+target_include_directories(autonomy-lease-hold-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME autonomy-lease-hold-test COMMAND autonomy-lease-hold-test)
 
 add_executable(map-processing-guard-test
   tests/map_processing_guard_test.cpp

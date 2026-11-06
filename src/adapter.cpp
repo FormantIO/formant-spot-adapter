@@ -1,4 +1,5 @@
 #include "formant_spot_adapter/adapter.hpp"
+#include "formant_spot_adapter/autonomy_lease_hold.hpp"
 #include "formant_spot_adapter/command_params.hpp"
 #include "formant_spot_adapter/graphnav_map_render.hpp"
 #include "formant_spot_adapter/localize_recovery.hpp"
@@ -2806,6 +2807,13 @@ void Adapter::Run() {
       }
       last_logged_teleop_active = teleop_active;
     }
+    if (teleop_active) {
+      // Teleop keeps its old lease handling: once a teleop session has used
+      // the lease, ending it returns the lease without the autonomy hold.
+      last_autonomy_activity_ms_ = 0;
+      lease_release_requested_ = false;
+      autonomy_lease_hold_logged_ = false;
+    }
     if (teleop_active && !lease_owned_ && SpotConnected()) {
       if ((now - last_lease_attempt_ms_.load()) >= 1000) {
         last_lease_attempt_ms_ = now;
@@ -2820,12 +2828,33 @@ void Adapter::Run() {
       const bool keep_lease_for_autonomy =
           IsGraphNavNavigationActive() || docking_in_progress_.load() ||
           map_recording_active_.load() || command_action_in_progress_.load();
+      AutonomyLeaseHoldInput hold_input;
+      hold_input.now_ms = now;
+      hold_input.last_autonomy_activity_ms = last_autonomy_activity_ms_.load();
+      hold_input.hold_s = cfg_.autonomy_lease_hold_s;
+      hold_input.release_requested = lease_release_requested_.load();
       if (keep_lease_for_autonomy) {
+        last_autonomy_activity_ms_ = now;
+        autonomy_lease_hold_logged_ = false;
         if ((now - last_nav_hold_log_ms_.load()) >= 5000) {
           last_nav_hold_log_ms_ = now;
           EmitLog("[adapter] teleop inactive but autonomy command is active; keeping lease");
         }
+      } else if (!ShouldReturnBodyLeaseAfterAutonomy(hold_input)) {
+        if (!autonomy_lease_hold_logged_.exchange(true)) {
+          EmitLog("[adapter] autonomy idle; holding body lease for up to " +
+                  std::to_string(cfg_.autonomy_lease_hold_s) +
+                  " s (SPOT_AUTONOMY_LEASE_HOLD_S)");
+        }
       } else {
+        if (hold_input.release_requested) {
+          EmitLog("[adapter] docked or sit requested; returning body lease without hold");
+        } else if (hold_input.last_autonomy_activity_ms > 0 && cfg_.autonomy_lease_hold_s > 0) {
+          EmitLog("[adapter] autonomy lease hold expired");
+        }
+        last_autonomy_activity_ms_ = 0;
+        lease_release_requested_ = false;
+        autonomy_lease_hold_logged_ = false;
         EmitLog("[adapter] teleop inactive, stopping motion and returning body lease");
         spot_.ZeroVelocity(cfg_.zero_velocity_repeats);
         moving_ = false;
@@ -5035,6 +5064,9 @@ void Adapter::CommandExecutionLoop() {
 
     command_action_in_progress_ = true;
     const bool ok = ExecuteQueuedCommand(request);
+    // Stamp here too, so a command shorter than one main-loop tick still
+    // starts the post-autonomy lease hold.
+    last_autonomy_activity_ms_ = now_ms();
     command_action_in_progress_ = false;
     agent_.SendCommandResponse(request.id(), ok);
   }
@@ -6147,6 +6179,7 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
   }
   if (!return_and_dock) CommitDockWaypointCandidateOnSuccess();
   dock_cooldown_until_ms_ = now_ms() + 5000;
+  lease_release_requested_ = true;
   EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " success");
   return true;
 }
@@ -6375,6 +6408,8 @@ void Adapter::HandleButtonPress(const std::string& button_key, const std::string
 }
 
 bool Adapter::EnsureLeaseForCommand(const std::string& action_name) {
+  // A new command supersedes an earlier dock or sit release request.
+  lease_release_requested_ = false;
   if (lease_owned_.load()) {
     if (spot_.RetainLease()) return true;
     EmitLog(std::string("[command] ") + action_name +
@@ -6465,6 +6500,7 @@ bool Adapter::ExecuteSitAction(bool require_teleop, bool auto_acquire_lease) {
     return false;
   }
   EmitLog(require_teleop ? "[teleop] action sit sent" : "[command] spot.sit sent");
+  lease_release_requested_ = true;
   return true;
 }
 
@@ -6996,6 +7032,7 @@ void Adapter::DockLoop() {
       EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " success");
       if (!return_and_dock) CommitDockWaypointCandidateOnSuccess();
       dock_cooldown_until_ms_ = now_ms() + 5000;
+      lease_release_requested_ = true;
     }
     docking_in_progress_ = false;
   }
