@@ -379,6 +379,8 @@ Config load_config_from_env() {
       getenv_double_or("BODY_PITCH_RATE_LIMIT_RADPS", c.body_pitch_rate_limit_radps);
 
   c.lease_retain_hz = getenv_int_or("LEASE_RETAIN_HZ", c.lease_retain_hz);
+  c.autonomy_lease_hold_s =
+      getenv_int_or("SPOT_AUTONOMY_LEASE_HOLD_S", c.autonomy_lease_hold_s);
   c.heartbeat_timeout_ms = getenv_int_or("HEARTBEAT_TIMEOUT_MS", c.heartbeat_timeout_ms);
   c.zero_velocity_repeats = getenv_int_or("ZERO_VELOCITY_REPEATS", c.zero_velocity_repeats);
   c.dock_station_id = getenv_int_or("DOCK_STATION_ID", c.dock_station_id);

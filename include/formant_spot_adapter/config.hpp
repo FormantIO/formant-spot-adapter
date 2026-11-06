@@ -97,6 +97,9 @@ struct Config {
   double body_pitch_rate_limit_radps{0.5};
 
   int lease_retain_hz{2};
+  // Seconds to keep the body lease (and the robot standing) after the last
+  // autonomy activity when no teleop session is active. 0 returns it at once.
+  int autonomy_lease_hold_s{180};
   int heartbeat_timeout_ms{5000};
   int zero_velocity_repeats{3};
 
