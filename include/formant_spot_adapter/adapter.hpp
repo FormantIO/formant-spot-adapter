@@ -89,6 +89,12 @@ class Adapter {
   bool ExecuteResetArmAction(bool require_teleop, bool auto_acquire_lease);
   bool ExecuteRotateCommand(const v1::model::CommandRequest& request, bool left);
   bool ExecuteQueuedCommand(const v1::model::CommandRequest& request);
+  // How a command ended, in the mission response grammar, for the command
+  // response's datapoint: ARRIVED / DONE / STOPPED(reason) / ABORTED(reason).
+  std::string CommandResultText(const v1::model::CommandRequest& request,
+                                bool ok,
+                                uint32_t nav_completed_before);
+  uint32_t NavCompletedCommandId();
   void CommandExecutionLoop();
   bool ExecuteCameraCalibrateCommand();
   bool ExecuteWaypointGotoCommand(const v1::model::CommandRequest& request);
