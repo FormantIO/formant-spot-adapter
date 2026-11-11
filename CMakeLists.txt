@@ -186,6 +186,10 @@ target_include_directories(command-params-test PRIVATE
 
 add_test(NAME command-params-test COMMAND command-params-test)
 
+add_executable(command-result-test tests/command_result_test.cpp)
+target_include_directories(command-result-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_test(NAME command-result-test COMMAND command-result-test)
+
 add_executable(graphnav-map-render-test
   tests/graphnav_map_render_test.cpp
   src/graphnav_map_render.cpp

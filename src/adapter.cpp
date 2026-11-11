@@ -1,4 +1,5 @@
 #include "formant_spot_adapter/adapter.hpp"
+#include "formant_spot_adapter/command_result.hpp"
 #include "formant_spot_adapter/autonomy_lease_hold.hpp"
 #include "formant_spot_adapter/command_params.hpp"
 #include "formant_spot_adapter/graphnav_map_render.hpp"
@@ -5032,6 +5033,11 @@ void Adapter::HandleHeartbeat(const v1::agent::GetTeleopHeartbeatStreamResponse&
   MarkHeartbeat();
 }
 
+// Where each command's result goes, in the mission response grammar, posted
+// just before the plain command response: cortex's mission driver reads it
+// tied to that response's time (DEV-17716).
+static const char* const kCommandResultStream = "spot.command.result";
+
 void Adapter::HandleCommand(const v1::model::CommandRequest& request) {
   bool reject = false;
   {
@@ -5045,6 +5051,7 @@ void Adapter::HandleCommand(const v1::model::CommandRequest& request) {
   if (reject) {
     EmitLog("[command] queue full; auto-failing command=" + request.command() +
             " id=" + request.id());
+    (void)agent_.PostText(kCommandResultStream, "REJECTED(command queue full)");
     (void)agent_.SendCommandResponse(request.id(), false);
     return;
   }
@@ -5063,13 +5070,40 @@ void Adapter::CommandExecutionLoop() {
     }
 
     command_action_in_progress_ = true;
+    const uint32_t nav_completed_before = NavCompletedCommandId();
     const bool ok = ExecuteQueuedCommand(request);
     // Stamp here too, so a command shorter than one main-loop tick still
     // starts the post-autonomy lease hold.
     last_autonomy_activity_ms_ = now_ms();
     command_action_in_progress_ = false;
+    // The result text goes on its own stream first, then a plain response:
+    // a text the agent throttles is lost on its own, never the response.
+    (void)agent_.PostText(kCommandResultStream,
+                          CommandResultText(request, ok, nav_completed_before));
     agent_.SendCommandResponse(request.id(), ok);
   }
+}
+
+
+uint32_t Adapter::NavCompletedCommandId() {
+  std::lock_guard<std::mutex> lk(nav_state_mu_);
+  return nav_last_completed_command_id_;
+}
+
+std::string Adapter::CommandResultText(const v1::model::CommandRequest& request,
+                                       bool ok,
+                                       uint32_t nav_completed_before) {
+  NavOutcome nav;
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    nav.result = nav_terminal_result_;
+    nav.reason = nav_terminal_reason_;
+    nav.target = nav_target_waypoint_name_;
+    // This command's navigation ended only if a nav command completed while it ran.
+    nav.fresh = nav_last_completed_command_id_ != 0 &&
+                nav_last_completed_command_id_ != nav_completed_before;
+  }
+  return command_result_text(request.command(), ok, nav);
 }
 
 bool Adapter::ExecuteCameraCalibrateCommand() {

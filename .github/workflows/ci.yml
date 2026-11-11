@@ -50,6 +50,8 @@ jobs:
           }
           run_target command-params-test \
             tests/command_params_test.cpp src/command_params.cpp
+          run_target command-result-test \
+            tests/command_result_test.cpp
           run_target graphnav-map-render-test \
             tests/graphnav_map_render_test.cpp src/graphnav_map_render.cpp
           run_target dock-preflight-test \
@@ -100,7 +102,7 @@ jobs:
           set -euo pipefail
           # The test targets are not part of the default build (build.sh builds
           # the adapter), so build them before running the suite.
-          ninja command-params-test graphnav-map-render-test \
+          ninja command-params-test command-result-test graphnav-map-render-test \
             formant-agent-client-test dock-preflight-test \
             autonomy-lease-hold-test \
             localize-recovery-test localize-request-test \
