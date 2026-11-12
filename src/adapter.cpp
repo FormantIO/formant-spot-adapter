@@ -59,6 +59,13 @@ struct CommandImpairment {
   bool cancelled{false};
   // A cancel that found nothing to stop: no autonomy stamp afterwards.
   bool idle_noop{false};
+  // For a running spot.graphnav.cancel: it already ended queued walks.
+  bool cancel_stopped_queued{false};
+  // A cancel's stop could not be confirmed: the navigation is left active so
+  // hold position runs next.
+  bool stop_unconfirmed{false};
+  uint32_t unconfirmed_nav_id{0};
+  std::string unconfirmed_reason;
   // The result line when the command stopped itself for another reason, e.g.
   // STOPPED(operator action) from the dock step.
   std::string stopped_text;
@@ -5141,19 +5148,26 @@ void Adapter::HandleCommand(const v1::model::CommandRequest& request) {
       decision = decide_cancel(in);
       // Under the same lock as EnterDockPhase, so a cancel either lands before
       // docking starts (and the dock is skipped) or sees the dock phase.
-      if (decision.stop_running) running_cancel_requested_ = true;
+      if (decision.stop_running) {
+        running_cancel_requested_ = true;
+        // Answered once the stop is confirmed, not now.
+        pending_cancel_answers_.push_back(request.id());
+      }
+      if (decision.remember_target) cancelled_targets_.Add(in.target_id, now_ms());
       for (auto& queued : command_queue_) {
         if (std::find(decision.cancel_queued_ids.begin(), decision.cancel_queued_ids.end(),
                       queued.request.id()) != decision.cancel_queued_ids.end()) {
           queued.cancelled = true;
         }
       }
-      if (decision.enqueue) command_queue_.push_front({request, false});
+      if (decision.enqueue) {
+        command_queue_.push_front({request, false, false, !decision.cancel_queued_ids.empty()});
+      }
     }
     EmitLog(decision.log);
     if (decision.enqueue) {
       command_queue_cv_.notify_one();
-    } else {
+    } else if (!decision.stop_running) {
       (void)agent_.PostText(kCommandResultStream, decision.result_text);
       (void)agent_.SendCommandResponse(request.id(), decision.success);
     }
@@ -5184,13 +5198,22 @@ void Adapter::CommandExecutionLoop() {
   while (running_.load()) {
     v1::model::CommandRequest request;
     bool cancelled_while_queued = false;
+    bool internal = false;
+    bool stopped_queued = false;
+    bool cancelled_before_arrival = false;
     {
       std::unique_lock<std::mutex> lk(command_queue_mu_);
       command_queue_cv_.wait(lk, [this]() { return !running_.load() || !command_queue_.empty(); });
       if (!running_.load() && command_queue_.empty()) break;
       request = command_queue_.front().request;
       cancelled_while_queued = command_queue_.front().cancelled;
+      internal = command_queue_.front().internal;
+      stopped_queued = command_queue_.front().stopped_queued;
       command_queue_.pop_front();
+      // A targeted cancel can arrive before its target (a reconnect may
+      // deliver them in that order).
+      cancelled_before_arrival =
+          !internal && cancelled_targets_.Take(request.id(), now_ms());
       running_command_ = request.command();
       running_command_id_ = request.id();
       running_in_dock_phase_ = false;
@@ -5207,10 +5230,12 @@ void Adapter::CommandExecutionLoop() {
       }
     } running_command_reset{this};
 
-    // A walk or dock that a cancel ended while it was queued never starts.
-    if (cancelled_while_queued) {
+    // A walk or dock that a cancel ended while it was queued, or that a cancel
+    // named before it arrived, never starts.
+    if (cancelled_while_queued || cancelled_before_arrival) {
       EmitLog("[command] not starting command=" + request.command() + " id=" + request.id() +
-              ": a spot.graphnav.cancel ended it while queued");
+              (cancelled_while_queued ? ": a spot.graphnav.cancel ended it while queued"
+                                      : ": a spot.graphnav.cancel named it before it arrived"));
       (void)agent_.PostText(kCommandResultStream, stopped_by_cancel_result_text());
       agent_.SendCommandResponse(request.id(), false);
       continue;
@@ -5224,6 +5249,7 @@ void Adapter::CommandExecutionLoop() {
     const HoldWatch watch_at_start = CurrentHoldWatch();
     CommandImpairment impairment;
     impairment.operator_actions_at_start = watch_at_start.operator_actions;
+    impairment.cancel_stopped_queued = stopped_queued;
     tl_command_impairment = &impairment;
     uint32_t nav_completed_before = NavCompletedCommandId();
     // A cancel that arrived between taking the command and here: send nothing.
@@ -5295,10 +5321,38 @@ void Adapter::CommandExecutionLoop() {
     }
     // A cancel that ended this command (in its walk, its dock or its hold) is
     // reported as such, whatever the command was doing.
-    if (!ok && (impairment.cancelled || CancelRequested()) && stoppable_command(request.command())) {
+    if (!ok && impairment.stop_unconfirmed) {
+      result_text = "ABORTED(" + grammar_reason("stop not confirmed: " + impairment.unconfirmed_reason) + ")";
+    } else if (!ok && (impairment.cancelled || CancelRequested()) &&
+               stoppable_command(request.command())) {
       result_text = stopped_by_cancel_result_text();
     } else if (!ok && !impairment.stopped_text.empty()) {
       result_text = impairment.stopped_text;
+    }
+    if (impairment.stop_unconfirmed) {
+      // The robot may still be walking: the walk's caller cleared the active
+      // navigation on its way out, so restore it and hold position next,
+      // before anything else runs.
+      last_graph_nav_command_id_ = impairment.unconfirmed_nav_id;
+      graphnav_navigation_active_ = true;
+      v1::model::CommandRequest hold;
+      hold.set_command("spot.graphnav.cancel");
+      hold.set_id("adapter-hold-after-unconfirmed-stop");
+      {
+        std::lock_guard<std::mutex> lk(command_queue_mu_);
+        command_queue_.push_front({hold, false, true, false});
+      }
+      command_queue_cv_.notify_one();
+      EmitLog("[command] stop not confirmed for command=" + request.command() + " id=" + request.id() +
+              " (" + impairment.unconfirmed_reason + "); holding position next");
+    }
+    // Cancels that arrived while this command ran and were not answered by a
+    // stop: the command ended on its own first, or was stopped without a walk
+    // to stop (in its hold, before sending anything).
+    {
+      const bool stopped = !ok && !impairment.stop_unconfirmed &&
+                           (impairment.cancelled || CancelRequested());
+      AnswerPendingCancels(stopped, stopped ? cancel_done_text() : cancel_ignored_finished_text());
     }
     tl_command_impairment = nullptr;
     // Stamp here too, so a command shorter than one main-loop tick still
@@ -5307,6 +5361,11 @@ void Adapter::CommandExecutionLoop() {
     if (!impairment.idle_noop) last_autonomy_activity_ms_ = now_ms();
     command_action_in_progress_ = false;
     if (result_text.empty()) result_text = CommandResultText(request, ok, nav_completed_before);
+    if (internal) {
+      EmitLog("[command] adapter hold position after an unconfirmed stop " +
+              std::string(ok ? "done" : "failed"));
+      continue;
+    }
     // The result text goes on its own stream first, then a plain response:
     // a text the agent throttles is lost on its own, never the response.
     (void)agent_.PostText(kCommandResultStream, result_text);
@@ -5346,17 +5405,61 @@ void Adapter::LeaveDockPhase() {
   running_in_dock_phase_ = false;
 }
 
-void Adapter::StopForCancel(const std::string& what, uint32_t nav_command_id) {
+bool Adapter::StopForCancel(const std::string& what, uint32_t nav_command_id) {
+  using Resp = ::bosdyn::api::graph_nav::NavigationFeedbackResponse;
   if (tl_command_impairment) tl_command_impairment->cancelled = true;
   EmitLog("[command] spot.graphnav.cancel: stopping " + what + " now");
-  if (!spot_.StopMotion()) {
-    EmitLog(std::string("[command] stop command failed: ") + spot_.LastError());
+  StopConfirmHooks hooks;
+  hooks.stop = [this](std::string* error) {
+    if (spot_.StopMotion()) return true;
+    if (error) *error = spot_.LastError();
+    return false;
+  };
+  hooks.feedback = [this, nav_command_id]() {
+    StopFeedback fb;
+    SpotClient::NavigationFeedbackSnapshot snap;
+    if (nav_command_id != 0 && spot_.GetNavigationFeedbackSnapshot(nav_command_id, &snap)) {
+      fb.read_ok = true;
+      fb.following = snap.status == Resp::STATUS_FOLLOWING_ROUTE;
+    }
+    return fb;
+  };
+  hooks.sleep_ms = [](long long ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+  const StopConfirmation confirmation = confirm_stop(3, 200, hooks);
+  if (confirmation.confirmed) {
+    EmitLog("[command] spot.graphnav.cancel: stop confirmed after " +
+            std::to_string(confirmation.attempts) + " attempt(s)");
+    {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      if (nav_command_id != 0) {
+        MarkGraphNavNavigationTerminalLocked(nav_command_id, last_nav_status_,
+                                             last_nav_remaining_route_m_, "interrupted",
+                                             "Cancelled by spot.graphnav.cancel.", now_ms());
+      }
+    }
+    AnswerPendingCancels(true, cancel_done_text());
+    return true;
   }
-  std::lock_guard<std::mutex> lk(nav_state_mu_);
-  if (nav_command_id != 0) {
-    MarkGraphNavNavigationTerminalLocked(nav_command_id, last_nav_status_,
-                                         last_nav_remaining_route_m_, "interrupted",
-                                         "Cancelled by spot.graphnav.cancel.", now_ms());
+  EmitLog("[command] spot.graphnav.cancel: stop NOT confirmed after " +
+          std::to_string(confirmation.attempts) + " attempt(s): " + confirmation.reason);
+  if (tl_command_impairment) {
+    tl_command_impairment->stop_unconfirmed = true;
+    tl_command_impairment->unconfirmed_nav_id = nav_command_id;
+    tl_command_impairment->unconfirmed_reason = confirmation.reason;
+  }
+  AnswerPendingCancels(false, cancel_not_confirmed_text(confirmation.reason));
+  return false;
+}
+
+void Adapter::AnswerPendingCancels(bool success, const std::string& result_text) {
+  std::vector<std::string> ids;
+  {
+    std::lock_guard<std::mutex> lk(command_queue_mu_);
+    ids.swap(pending_cancel_answers_);
+  }
+  for (const auto& id : ids) {
+    (void)agent_.PostText(kCommandResultStream, result_text);
+    (void)agent_.SendCommandResponse(id, success);
   }
 }
 
@@ -6484,9 +6587,17 @@ bool Adapter::ExecuteGraphNavCancelCommand() {
       last_graph_nav_command_id_.load() != 0 || graphnav_navigation_active_.load();
   const CancelExecutionPlan plan = plan_cancel_execution(navigation_active);
   if (!plan.act) {
-    if (tl_command_impairment) tl_command_impairment->idle_noop = true;
-    EmitLog("[graphnav] spot.graphnav.cancel ignored: no active navigation command");
-    return true;
+    // Success only if this cancel already ended queued walks or docks;
+    // otherwise it stopped nothing and says so.
+    const bool stopped_queued =
+        tl_command_impairment && tl_command_impairment->cancel_stopped_queued;
+    if (tl_command_impairment) {
+      tl_command_impairment->idle_noop = true;
+      if (!stopped_queued) tl_command_impairment->stopped_text = cancel_ignored_nothing_text();
+    }
+    EmitLog("[graphnav] spot.graphnav.cancel ignored: no active navigation command" +
+            std::string(stopped_queued ? " (queued walks were cancelled)" : ""));
+    return stopped_queued;
   }
   // Something is live: hold position with the lease we have, or one nobody
   // holds. Never take it over.

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "formant_spot_adapter/camera_discovery.hpp"
+#include "formant_spot_adapter/command_cancel.hpp"
 #include "formant_spot_adapter/config.hpp"
 #include "formant_spot_adapter/formant_agent_client.hpp"
 #include "formant_spot_adapter/impaired_retry.hpp"
@@ -133,9 +134,14 @@ class Adapter {
   bool EnterDockPhase();
   void LeaveDockPhase();
   // Stops the robot for a cancel (a Spot stop command, which preempts GraphNav
-  // and docking without powering anything on), marks the navigation
-  // interrupted and the running command cancelled.
-  void StopForCancel(const std::string& what, uint32_t nav_command_id);
+  // without powering anything on, retried up to three times) and confirms from
+  // navigation feedback that the navigation is no longer following its route.
+  // Confirmed: marks it interrupted and answers the pending cancels with
+  // success. Not confirmed: answers them with failure and leaves the
+  // navigation marked active so hold position runs next. Returns confirmed.
+  bool StopForCancel(const std::string& what, uint32_t nav_command_id);
+  // Posts the answer for every cancel waiting on the running command's stop.
+  void AnswerPendingCancels(bool success, const std::string& result_text);
   // Spends the command's one impaired self-right (none on the retry pass).
   // Always true off the command thread, which keeps its old behaviour.
   bool TakeSelfRightBudget();
@@ -416,6 +422,11 @@ class Adapter {
   struct QueuedCommand {
     v1::model::CommandRequest request;
     bool cancelled{false};
+    // Queued by the adapter itself (hold position after a stop that was not
+    // confirmed): run it, but post no answer.
+    bool internal{false};
+    // An untargeted cancel that already ended queued walks or docks.
+    bool stopped_queued{false};
   };
   std::mutex command_queue_mu_;
   std::condition_variable command_queue_cv_;
@@ -429,6 +440,12 @@ class Adapter {
   // Set (under command_queue_mu_) when a cancel stops the running command;
   // cleared when the next command starts.
   std::atomic<bool> running_cancel_requested_{false};
+  // Cancels waiting for the running command's stop to be confirmed; answered
+  // by AnswerPendingCancels. Guarded by command_queue_mu_.
+  std::vector<std::string> pending_cancel_answers_;
+  // Targets of cancels that arrived before their command. Guarded by
+  // command_queue_mu_.
+  CancelledTargets cancelled_targets_;
 
   mutable std::mutex hb_mu_;
   long long last_heartbeat_ms_{0};

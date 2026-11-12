@@ -95,7 +95,7 @@ int main() {
   // Untargeted (operator) cancel during a walk: stop it and the queued walk.
   {
     const auto d = fsa::decide_cancel(walking(""));
-    check(d.stop_running && d.enqueue, "untargeted stops the running walk and runs");
+    check(d.stop_running && !d.enqueue, "untargeted stops the running walk, answered after the stop");
     check(has(d.cancel_queued_ids, "walk-2") && !has(d.cancel_queued_ids, "map-1"),
           "untargeted cancels queued walks, not bookkeeping");
     expect_eq(d.log,
@@ -134,23 +134,25 @@ int main() {
   // Targeted at the running walk: stop it, answer at once.
   {
     const auto d = fsa::decide_cancel(walking("walk-1"));
-    check(d.stop_running && !d.enqueue && d.success, "targeted stops its walk");
+    check(d.stop_running && !d.enqueue, "targeted stops its walk");
+    check(d.result_text.empty(), "targeted at a running walk is not answered before the stop");
     check(d.cancel_queued_ids.empty(), "targeted leaves other queued walks alone");
-    expect_eq(d.result_text, "DONE: spot.graphnav.cancel", "targeted result");
   }
   // Targeted at a queued walk: only that one.
   {
     const auto d = fsa::decide_cancel(walking("walk-2"));
     check(!d.stop_running && !d.enqueue && has(d.cancel_queued_ids, "walk-2"), "targeted queued walk");
+    check(d.success, "ending a queued walk counts as stopping something");
+    expect_eq(d.result_text, "DONE: spot.graphnav.cancel", "queued target result");
   }
   // Targeted at a command that already finished, while a new walk runs: nothing.
   {
     const auto d = fsa::decide_cancel(walking("walk-0-finished"));
-    check(!d.stop_running && !d.enqueue && d.cancel_queued_ids.empty() && d.success,
-          "finished target does nothing");
-    expect_eq(d.result_text, "DONE: spot.graphnav.cancel ignored, target not running", "ignored result");
-    expect_eq(d.log, "[command] spot.graphnav.cancel target=walk-0-finished ignored: target not running",
-              "ignored log");
+    check(!d.stop_running && !d.enqueue && d.cancel_queued_ids.empty(), "finished target does nothing");
+    check(!d.success, "stopping nothing answers success=false");
+    check(d.remember_target, "an unknown target is remembered in case it arrives later");
+    expect_eq(d.result_text, "REJECTED(ignored: target not running)", "ignored result");
+    check(d.log.find("ignored: target not running") != std::string::npos, "ignored log");
   }
   // Targeted at a return_and_dock that is docking: refused, docking continues.
   {
@@ -171,6 +173,102 @@ int main() {
     in.running_command = "spot.map.load";
     const auto d = fsa::decide_cancel(in);
     check(!d.stop_running && !d.success, "targeted non-walk refused");
+  }
+
+  // A targeted cancel that arrives before its target: remembered, then the
+  // target does not start; entries expire after 10 minutes and are bounded.
+  {
+    fsa::CancelledTargets targets;
+    targets.Add("goto-7", 1000);
+    check(!targets.Take("goto-8", 2000), "other ids start");
+    check(targets.Take("goto-7", 5000), "the remembered target does not start");
+    check(!targets.Take("goto-7", 6000), "taken once");
+    targets.Add("goto-9", 0);
+    check(!targets.Take("goto-9", 10 * 60 * 1000 + 1), "expired after 10 minutes");
+    fsa::CancelledTargets small(10 * 60 * 1000, 3);
+    for (int i = 0; i < 5; ++i) small.Add("id-" + std::to_string(i), 100 + i);
+    check(small.size() == 3, "bounded size");
+    check(!small.Take("id-0", 200) && small.Take("id-4", 200), "oldest dropped first");
+    targets.Add("", 0);
+    check(!targets.Take("", 0), "empty id ignored");
+  }
+
+  // Untargeted cancel with nothing running: queued; when it then finds nothing
+  // live it answers the ignored text with success=false (adapter side).
+  expect_eq(fsa::cancel_ignored_nothing_text(), "REJECTED(ignored: nothing running)", "nothing text");
+  expect_eq(fsa::cancel_ignored_finished_text(), "REJECTED(ignored: command ended before the stop)",
+            "finished-before-stop text");
+  expect_eq(fsa::cancel_not_confirmed_text("still following route"),
+            "STOPPED not confirmed: still following route", "not confirmed text");
+
+  // Confirming the stop.
+  {
+    struct FakeStop {
+      int stop_calls{0};
+      int fail_stops{0};          // the first N stop commands fail
+      int following_reads{0};     // the first N feedback reads say FOLLOWING_ROUTE
+      bool reads_fail{false};
+      long long slept{0};
+      fsa::StopConfirmHooks hooks() {
+        fsa::StopConfirmHooks h;
+        h.stop = [this](std::string* error) {
+          ++stop_calls;
+          if (stop_calls <= fail_stops) {
+            *error = "RobotCommand failed: lease error";
+            return false;
+          }
+          return true;
+        };
+        h.feedback = [this]() {
+          fsa::StopFeedback fb;
+          fb.read_ok = !reads_fail;
+          if (following_reads > 0) {
+            --following_reads;
+            fb.following = true;
+          }
+          return fb;
+        };
+        h.sleep_ms = [this](long long ms) { slept += ms; };
+        return h;
+      }
+    };
+    {
+      FakeStop f;
+      const auto r = fsa::confirm_stop(3, 200, f.hooks());
+      check(r.confirmed && r.attempts == 1 && f.slept == 200, "confirmed on the first try within 0.2 s");
+    }
+    {
+      FakeStop f;
+      f.fail_stops = 100;  // StopMotion always fails
+      const auto r = fsa::confirm_stop(3, 200, f.hooks());
+      check(!r.confirmed && f.stop_calls == 3, "a failing StopMotion is retried, then not confirmed");
+      expect_eq(r.reason, "stop command failed: RobotCommand failed: lease error", "failing stop reason");
+    }
+    {
+      FakeStop f;
+      f.fail_stops = 1;
+      const auto r = fsa::confirm_stop(3, 200, f.hooks());
+      check(r.confirmed && r.attempts == 2, "a stop that fails once is confirmed on the retry");
+    }
+    {
+      FakeStop f;
+      f.following_reads = 100;
+      const auto r = fsa::confirm_stop(3, 200, f.hooks());
+      check(!r.confirmed, "still FOLLOWING_ROUTE is not confirmed");
+      expect_eq(r.reason, "still following route", "following reason");
+    }
+    {
+      FakeStop f;
+      f.following_reads = 1;
+      check(fsa::confirm_stop(3, 200, f.hooks()).confirmed, "stops after a second stop command");
+    }
+    {
+      FakeStop f;
+      f.reads_fail = true;
+      const auto r = fsa::confirm_stop(3, 200, f.hooks());
+      check(!r.confirmed, "unreadable feedback is not confirmed");
+      expect_eq(r.reason, "navigation feedback unavailable", "feedback reason");
+    }
   }
 
   // The cancel command when it runs: with nothing live it must not touch the

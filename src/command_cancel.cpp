@@ -25,7 +25,6 @@ CancelDecision decide_cancel(const CancelInput& in) {
 
   if (in.target_id.empty()) {
     // An operator's cancel: stop the running walk or dock and every queued one.
-    d.enqueue = true;
     for (const auto& q : in.queued) {
       if (stoppable_command(q.command)) d.cancel_queued_ids.push_back(q.id);
     }
@@ -42,6 +41,7 @@ CancelDecision decide_cancel(const CancelInput& in) {
       d.stop_running = true;
       d.log = prefix + " received: stopping the running " + in.running_command + " now" +
               queued_note;
+      return d;
     } else if (stoppable_command(in.running_command)) {
       d.log = prefix + " received while " + in.running_command +
               " is docking onto the dock; docking is not interrupted" + queued_note;
@@ -50,6 +50,9 @@ CancelDecision decide_cancel(const CancelInput& in) {
               " runs; that command is not a walk or dock, so the cancel runs after it" +
               queued_note;
     }
+    // Nothing running to flag: run the cancel from the queue (it holds
+    // position if some other navigation is live, otherwise it is ignored).
+    d.enqueue = true;
     return d;
   }
 
@@ -58,7 +61,6 @@ CancelDecision decide_cancel(const CancelInput& in) {
   if (!in.running_id.empty() && in.running_id == in.target_id) {
     if (cancel_may_interrupt(in.running_command, in.running_in_dock_phase)) {
       d.stop_running = true;
-      d.result_text = "DONE: spot.graphnav.cancel";
       d.log = prefix + target + ": stopping the running " + in.running_command + " now";
     } else if (stoppable_command(in.running_command)) {
       d.success = false;
@@ -76,7 +78,8 @@ CancelDecision decide_cancel(const CancelInput& in) {
     if (q.id != in.target_id) continue;
     if (stoppable_command(q.command)) {
       d.cancel_queued_ids.push_back(q.id);
-      d.result_text = "DONE: spot.graphnav.cancel";
+      d.success = true;
+      d.result_text = cancel_done_text();
       d.log = prefix + target + ": queued " + q.command + " will not start";
     } else {
       d.success = false;
@@ -85,9 +88,64 @@ CancelDecision decide_cancel(const CancelInput& in) {
     }
     return d;
   }
-  d.result_text = "DONE: spot.graphnav.cancel ignored, target not running";
-  d.log = prefix + target + " ignored: target not running";
+  // Not running and not queued: it already finished, or it has not arrived
+  // yet. Remember it so it does not start if it arrives later.
+  d.remember_target = true;
+  d.success = false;
+  d.result_text = cancel_ignored_target_text();
+  d.log = prefix + target + " ignored: target not running (remembered for 10 min in case it arrives later)";
   return d;
+}
+
+void CancelledTargets::Expire(long long now_ms) {
+  while (!entries_.empty() && now_ms - entries_.front().at_ms > ttl_ms_) entries_.pop_front();
+}
+
+void CancelledTargets::Add(const std::string& id, long long now_ms) {
+  if (id.empty()) return;
+  Expire(now_ms);
+  entries_.push_back({id, now_ms});
+  while (entries_.size() > max_size_) entries_.pop_front();
+}
+
+bool CancelledTargets::Take(const std::string& id, long long now_ms) {
+  Expire(now_ms);
+  for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+    if (it->id != id) continue;
+    entries_.erase(it);
+    return true;
+  }
+  return false;
+}
+
+StopConfirmation confirm_stop(int max_attempts, long long settle_ms, const StopConfirmHooks& hooks) {
+  StopConfirmation result;
+  for (int attempt = 1; attempt <= std::max(1, max_attempts); ++attempt) {
+    result.attempts = attempt;
+    std::string error;
+    if (!hooks.stop(&error)) {
+      result.reason = "stop command failed: " + (error.empty() ? std::string("unknown error") : error);
+      hooks.sleep_ms(settle_ms);
+      continue;
+    }
+    hooks.sleep_ms(settle_ms);
+    const StopFeedback fb = hooks.feedback();
+    if (!fb.read_ok) {
+      result.reason = "navigation feedback unavailable";
+      continue;
+    }
+    if (!fb.following) {
+      result.confirmed = true;
+      result.reason.clear();
+      return result;
+    }
+    result.reason = "still following route";
+  }
+  return result;
+}
+
+std::string cancel_not_confirmed_text(const std::string& reason) {
+  return "STOPPED not confirmed: " + reason;
 }
 
 CancelExecutionPlan plan_cancel_execution(bool navigation_active) {

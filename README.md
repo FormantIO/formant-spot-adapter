@@ -225,18 +225,27 @@ Additional non-GraphNav command-channel actions:
   Now a cancel is decided the moment it arrives and is accepted even when the queue is full.
   - Parameter text, optional: `command_id=<formant command id>`, for example
     `command_id=3f2c9a52-6d1e-4b8a-9c0f-1a2b3c4d5e6f`. With it, only that walk or dock command is
-    stopped, whether it is running or still queued, and the cancel is answered at once
-    (`DONE: spot.graphnav.cancel`). If that command already finished or is unknown nothing happens
-    and the answer is `DONE: spot.graphnav.cancel ignored, target not running`. Mission drivers
-    should always send it, so a late cancel never stops the next walk.
+    stopped, whether it is running or still queued. If that command is neither running nor queued
+    nothing is stopped and the answer is `REJECTED(ignored: target not running)` with
+    success=false; the id is remembered for 10 minutes (up to 64 ids), so if that command arrives
+    later (a reconnect can deliver the cancel first) it does not start and ends `STOPPED(cancelled)`.
+    Mission drivers should always send `command_id`, so a late cancel never stops the next walk.
   - Without `command_id` (an operator's cancel) the running walk or dock and every queued walk or
-    dock are stopped, and the cancel then runs from the front of the queue: it holds position if a
-    navigation that is not a queued command (the teleop return-and-dock) is still live.
-  - The running walk, dock or impaired hold sees the cancel within 100 ms, sends Spot a stop command
-    (the robot stops in place; nothing is powered on), marks the navigation interrupted and ends
-    with `STOPPED(cancelled)` and a failed response. A queued one never starts (also
-    `STOPPED(cancelled)`). Nothing is sent after the cancel arrives: no relocalization, no
-    self-right, no NavigateTo.
+    dock are stopped. With nothing running, the cancel runs from the front of the queue: it holds
+    position if a navigation that is not a queued command (the teleop return-and-dock) is live,
+    and otherwise answers `REJECTED(ignored: nothing running)` with success=false (success if it
+    ended queued walks).
+  - The running walk, dock or impaired hold sees the cancel within 100 ms and sends Spot a stop
+    command (the robot stops in place; nothing is powered on), up to three times, each followed by
+    a 200 ms wait and a navigation feedback read. The stop is confirmed once the navigation is no
+    longer following its route. Only then is the cancel answered, `DONE: spot.graphnav.cancel` with
+    success, and the walk ends `STOPPED(cancelled)`. If it cannot be confirmed, the cancel answers
+    `STOPPED not confirmed: <reason>` with success=false, the walk ends
+    `ABORTED(stop not confirmed: <reason>)`, the navigation is left marked active, and the adapter
+    holds position at once, before any other command. A cancel that ends a walk or dock that had
+    not sent anything yet (in its impaired hold, or before its first NavigateTo) answers success.
+    A queued one never starts (`STOPPED(cancelled)`). Nothing is sent after the cancel arrives: no
+    relocalization, no self-right, no NavigateTo.
   - A robot that has started docking onto the dock (AutoDock) is never interrupted:
     `spot.return_and_dock` can be stopped only while it walks to the dock waypoint, and a targeted
     cancel of a docking robot answers `REJECTED(docking in progress)`. Teleop and the E-Stop remain
@@ -244,7 +253,7 @@ Additional non-GraphNav command-channel actions:
   - Not stopped by a cancel: `spot.undock`, `spot.rotate_left`, `spot.rotate_right`, and any other
     command that is not a walk or dock.
   - With nothing to stop, the cancel logs `spot.graphnav.cancel ignored: no active navigation
-    command` and succeeds without touching the body lease (someone may be driving with the
+    command` and answers as above without touching the body lease (someone may be driving with the
     tablet), without starting the autonomy lease hold and without clearing a pending release. When
     it does have to hold position it uses the lease the adapter has, or one nobody holds; it never
     takes the lease over.
@@ -254,7 +263,9 @@ Additional non-GraphNav command-channel actions:
   teleop button or twist was used since the command started and that the motors were not turned
   off (the Formant estop button is a safe power off). Otherwise it does not dock and ends with
   `STOPPED(operator action)`. A robot whose motors were off when the dock command started is still
-  powered on by the dock, as before.
+  powered on by the dock, as before. Any teleop twist above the deadband counts as an operator
+  action, so joystick drift while a teleop session is open can turn a dock into
+  `STOPPED(operator action)`.
 - `spot.rotate_left`: rotate left in place by a requested angle. Parameter: `degrees`.
 - `spot.rotate_right`: rotate right in place by a requested angle. Parameter: `degrees`.
 - `spot.reset_arm`: explicit arm reset/stow; command path does not require active teleop heartbeat.

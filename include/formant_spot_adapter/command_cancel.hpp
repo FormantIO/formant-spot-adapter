@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <deque>
 #include <functional>
 #include <string>
 #include <vector>
@@ -59,15 +60,21 @@ struct CancelInput {
 };
 
 struct CancelDecision {
-  // Flag the running command so it stops itself.
+  // Flag the running command so it stops itself. The cancel is then answered
+  // by the command thread once the stop is confirmed (or not), never before.
   bool stop_running{false};
   // Queued commands to end without starting them.
   std::vector<std::string> cancel_queued_ids;
-  // Queue the cancel command itself (untargeted: it also stops a navigation
-  // that is not a queued command, such as the teleop return-and-dock). When
-  // false, the cancel is answered at once with success and result_text.
+  // Queue the cancel command itself (untargeted, nothing to flag: it holds
+  // position if a navigation that is not a queued command is live).
   bool enqueue{false};
-  bool success{true};
+  // Remember target_id for a while: a targeted cancel that arrives before
+  // its target (a reconnect can deliver them in that order) must still stop
+  // it from starting (see CancelledTargets).
+  bool remember_target{false};
+  // Answer at once with these when neither stop_running nor enqueue.
+  // success is true only when something was actually stopped or held.
+  bool success{false};
   std::string result_text;
   std::string log;
 };
@@ -97,6 +104,58 @@ DockStart decide_dock_start(unsigned long long operator_actions_at_start,
                             unsigned long long operator_actions_now,
                             const std::string& motor_power_at_start,
                             const std::string& motor_power_now);
+
+// Ids of commands a targeted cancel named before they arrived. A command whose
+// id is here does not start. Entries expire after ttl_ms; at most max_size are
+// kept (the oldest go first).
+class CancelledTargets {
+ public:
+  explicit CancelledTargets(long long ttl_ms = 10 * 60 * 1000, size_t max_size = 64)
+      : ttl_ms_(ttl_ms), max_size_(max_size) {}
+  void Add(const std::string& id, long long now_ms);
+  // True (and the entry is removed) if id was cancelled within ttl_ms.
+  bool Take(const std::string& id, long long now_ms);
+  size_t size() const { return entries_.size(); }
+
+ private:
+  void Expire(long long now_ms);
+  struct Entry {
+    std::string id;
+    long long at_ms{0};
+  };
+  std::deque<Entry> entries_;
+  long long ttl_ms_;
+  size_t max_size_;
+};
+
+// Confirming that a stop took: send Spot's stop command, wait settle_ms, and
+// read navigation feedback; the stop is confirmed once the navigation is no
+// longer FOLLOWING_ROUTE. Up to max_attempts tries.
+struct StopFeedback {
+  bool read_ok{false};
+  bool following{false};
+};
+struct StopConfirmHooks {
+  std::function<bool(std::string* error)> stop;  // send the stop; false + error on failure
+  std::function<StopFeedback()> feedback;
+  std::function<void(long long)> sleep_ms;
+};
+struct StopConfirmation {
+  bool confirmed{false};
+  int attempts{0};
+  std::string reason;  // why it is not confirmed, from the last attempt
+};
+StopConfirmation confirm_stop(int max_attempts, long long settle_ms, const StopConfirmHooks& hooks);
+
+// Answers for a cancel that ends up stopping nothing, in the mission grammar.
+inline const char* cancel_ignored_target_text() { return "REJECTED(ignored: target not running)"; }
+inline const char* cancel_ignored_nothing_text() { return "REJECTED(ignored: nothing running)"; }
+inline const char* cancel_ignored_finished_text() {
+  return "REJECTED(ignored: command ended before the stop)";
+}
+inline const char* cancel_done_text() { return "DONE: spot.graphnav.cancel"; }
+// The answer when the stop could not be confirmed.
+std::string cancel_not_confirmed_text(const std::string& reason);
 
 // The command-result line for a command a stop ended.
 inline const char* stopped_by_cancel_result_text() { return "STOPPED(cancelled)"; }
