@@ -242,7 +242,12 @@ Additional non-GraphNav command-channel actions:
     success, and the walk ends `STOPPED(cancelled)`. If it cannot be confirmed, the cancel answers
     `STOPPED not confirmed: <reason>` with success=false, the walk ends
     `ABORTED(stop not confirmed: <reason>)`, the navigation is left marked active, and the adapter
-    holds position at once, before any other command. A cancel that ends a walk or dock that had
+    holds position at once, before any other command. `spot.nav.state` reports it with
+    `stop_unconfirmed`, `stop_unconfirmed_command_id` and `stop_unconfirmed_reason` until a stop or
+    a hold-position settles it; if that hold fails, the walk stays marked active rather than idle.
+    A later cancel that finds no live navigation still sends the stop command again when that walk
+    reads `FOLLOWING_ROUTE` or its feedback cannot be read, and answers by whether that stop is
+    confirmed. A cancel that ends a walk or dock that had
     not sent anything yet (in its impaired hold, or before its first NavigateTo) answers success.
     A queued one never starts (`STOPPED(cancelled)`). Nothing is sent after the cancel arrives: no
     relocalization, no self-right, no NavigateTo.

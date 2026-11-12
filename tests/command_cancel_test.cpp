@@ -271,6 +271,30 @@ int main() {
     }
   }
 
+  // A cancel that finds no live navigation still stops a walk whose earlier
+  // stop was not confirmed, if it may still be walking.
+  {
+    using fsa::UnconfirmedWalk;
+    const auto following = fsa::plan_cancel_execution(false, UnconfirmedWalk::kFollowing);
+    check(!following.act && following.stop_unconfirmed_walk, "unconfirmed walk still following: stop it");
+    check(!following.allow_lease_takeover && !following.stamp_autonomy && !following.clear_release_request,
+          "stopping it does not touch the lease");
+    const auto unreadable = fsa::plan_cancel_execution(false, UnconfirmedWalk::kUnreadable);
+    check(unreadable.stop_unconfirmed_walk, "unconfirmed walk unreadable: stop it");
+    const auto stopped = fsa::plan_cancel_execution(false, UnconfirmedWalk::kNotFollowing);
+    check(!stopped.act && !stopped.stop_unconfirmed_walk && stopped.clear_unconfirmed,
+          "unconfirmed walk now stopped: nothing to do, forget it");
+    const auto none = fsa::plan_cancel_execution(false, UnconfirmedWalk::kNone);
+    check(!none.act && !none.stop_unconfirmed_walk && !none.clear_unconfirmed, "nothing at all");
+    const auto live = fsa::plan_cancel_execution(true, UnconfirmedWalk::kFollowing);
+    check(live.act && !live.stop_unconfirmed_walk, "a live navigation is held as before");
+  }
+  // The internal hold's log: superseded, not FAILED, when there was nothing left.
+  check(fsa::internal_hold_outcome(true, false) == fsa::InternalHoldOutcome::kDone, "hold done");
+  check(fsa::internal_hold_outcome(false, true) == fsa::InternalHoldOutcome::kSuperseded,
+        "nothing left to hold: superseded");
+  check(fsa::internal_hold_outcome(false, false) == fsa::InternalHoldOutcome::kFailed, "hold failed");
+
   // The background poll never recovers or re-sends a cancelled navigation.
   check(fsa::poll_may_auto_recover(41, 0, false, false), "an impaired teleop navigation may be recovered once");
   check(!fsa::poll_may_auto_recover(41, 41, false, false), "a cancelled navigation is never recovered");

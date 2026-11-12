@@ -154,13 +154,31 @@ bool poll_may_auto_recover(uint32_t command_id, uint32_t cancelled_command_id,
   return command_id == 0 || command_id != cancelled_command_id;
 }
 
-CancelExecutionPlan plan_cancel_execution(bool navigation_active) {
+CancelExecutionPlan plan_cancel_execution(bool navigation_active, UnconfirmedWalk unconfirmed) {
   CancelExecutionPlan plan;
-  if (!navigation_active) return plan;
-  plan.act = true;
-  plan.stamp_autonomy = true;
-  plan.clear_release_request = true;
+  if (navigation_active) {
+    plan.act = true;
+    plan.stamp_autonomy = true;
+    plan.clear_release_request = true;
+    return plan;
+  }
+  switch (unconfirmed) {
+    case UnconfirmedWalk::kFollowing:
+    case UnconfirmedWalk::kUnreadable:
+      plan.stop_unconfirmed_walk = true;
+      break;
+    case UnconfirmedWalk::kNotFollowing:
+      plan.clear_unconfirmed = true;
+      break;
+    case UnconfirmedWalk::kNone:
+      break;
+  }
   return plan;
+}
+
+InternalHoldOutcome internal_hold_outcome(bool ok, bool found_nothing_to_hold) {
+  if (ok) return InternalHoldOutcome::kDone;
+  return found_nothing_to_hold ? InternalHoldOutcome::kSuperseded : InternalHoldOutcome::kFailed;
 }
 
 DockStart decide_dock_start(unsigned long long operator_actions_at_start,

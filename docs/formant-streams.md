@@ -447,7 +447,8 @@ parameters documented in the repository `README.md`.
   operator's cancel) the running walk or dock and every queued one are stopped.
 - A cancel of a running walk is answered only after the stop is confirmed from navigation
   feedback: `DONE: spot.graphnav.cancel` with success, or `STOPPED not confirmed: <reason>` with
-  success=false (the adapter then holds position). A cancel that stops nothing answers
+  success=false (the adapter then holds position, and `spot.nav.state` reports
+  `stop_unconfirmed` until a later stop or hold settles it). A cancel that stops nothing answers
   success=false with `ignored` in the text.
 - A robot already docking onto the dock is not interrupted (`spot.return_and_dock` can be stopped
   only while it walks to the dock waypoint). `spot.undock` and `spot.rotate_left`/`right` are not

@@ -82,17 +82,37 @@ struct CancelDecision {
 
 CancelDecision decide_cancel(const CancelInput& in);
 
-// What the cancel command does when it runs from the queue, given whether a
-// GraphNav navigation is still live. With nothing live it must not touch the
-// body lease (another client may be driving), stamp autonomy activity (which
-// would keep the lease for the autonomy hold) or clear a pending release.
+// A walk whose stop a cancel could not confirm, as its navigation feedback
+// reads now. kNone when there is no such walk.
+enum class UnconfirmedWalk { kNone, kFollowing, kUnreadable, kNotFollowing };
+
+// What the cancel command does when it runs from the queue.
+// - A live GraphNav navigation: hold position (act), with the lease the
+//   adapter has or one nobody holds.
+// - No live navigation, but a walk whose stop was not confirmed still reads
+//   FOLLOWING_ROUTE or cannot be read: send Spot's stop command again and
+//   answer by whether that stop is confirmed (stop_unconfirmed_walk). This does
+//   not touch the lease either.
+// - No live navigation and nothing unconfirmed (or it reads stopped): nothing
+//   to do. It must not touch the body lease (another client may be driving),
+//   stamp autonomy activity (which would keep the lease for the autonomy hold)
+//   or clear a pending release. clear_unconfirmed when the walk reads stopped.
 struct CancelExecutionPlan {
   bool act{false};
+  bool stop_unconfirmed_walk{false};
+  bool clear_unconfirmed{false};
   bool allow_lease_takeover{false};  // never: acquire only if nobody holds it
   bool stamp_autonomy{false};
   bool clear_release_request{false};
 };
-CancelExecutionPlan plan_cancel_execution(bool navigation_active);
+CancelExecutionPlan plan_cancel_execution(bool navigation_active,
+                                          UnconfirmedWalk unconfirmed = UnconfirmedWalk::kNone);
+
+// How the adapter's own hold-position after an unconfirmed stop ended.
+// kSuperseded: by the time it ran there was nothing left to hold (an
+// operator's cancel that jumped ahead of it already held the robot).
+enum class InternalHoldOutcome { kDone, kSuperseded, kFailed };
+InternalHoldOutcome internal_hold_outcome(bool ok, bool found_nothing_to_hold);
 
 // Whether a dock command may call AutoDock (which powers the motors on).
 enum class DockStart { kStart, kStopOperatorAction, kStopPoweredOff };

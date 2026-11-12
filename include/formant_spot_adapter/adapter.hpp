@@ -140,6 +140,9 @@ class Adapter {
   // success. Not confirmed: answers them with failure and leaves the
   // navigation marked active so hold position runs next. Returns confirmed.
   bool StopForCancel(const std::string& what, uint32_t nav_command_id);
+  // Sends Spot's stop command (up to three times) and confirms from the
+  // feedback of nav_command_id that it is no longer following its route.
+  StopConfirmation StopAndConfirm(uint32_t nav_command_id);
   // Posts the answer for every cancel waiting on the running command's stop.
   void AnswerPendingCancels(bool success, const std::string& result_text);
   // Spends the command's one impaired self-right (none on the retry pass).
@@ -551,6 +554,11 @@ class Adapter {
   // An impaired command being held (DEV-17754), published on spot.nav.state so
   // a mission driver can see why the command has not answered yet. Guarded by
   // nav_state_mu_.
+  // A walk whose cancel stop could not be confirmed (it may still be moving):
+  // reported on spot.nav.state, and stopped again by the next cancel.
+  // Guarded by nav_state_mu_.
+  uint32_t stop_unconfirmed_nav_id_{0};
+  std::string stop_unconfirmed_reason_;
   bool command_hold_active_{false};
   std::string command_hold_command_;
   std::string command_hold_fault_;

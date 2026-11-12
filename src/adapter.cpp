@@ -59,6 +59,8 @@ struct CommandImpairment {
   bool cancelled{false};
   // A cancel that found nothing to stop: no autonomy stamp afterwards.
   bool idle_noop{false};
+  // A cancel that found nothing live and nothing unconfirmed to stop.
+  bool nothing_to_hold{false};
   // For a running spot.graphnav.cancel: it already ended queued walks.
   bool cancel_stopped_queued{false};
   // A cancel's stop could not be confirmed: the navigation is left active so
@@ -5369,15 +5371,23 @@ void Adapter::CommandExecutionLoop() {
     command_action_in_progress_ = impairment.stop_unconfirmed;
     if (result_text.empty()) result_text = CommandResultText(request, ok, nav_completed_before);
     if (internal) {
-      if (!ok) {
-        // The hold could not run (no localization, no free lease): leave
-        // nothing owning the cancelled walk, so nothing re-sends it.
-        last_graph_nav_command_id_ = 0;
-        graphnav_navigation_active_ = false;
-        EmitLog("[command] adapter hold position after an unconfirmed stop FAILED; navigation "
-                "state cleared, nothing will resume the cancelled walk; check the robot");
-      } else {
-        EmitLog("[command] adapter hold position after an unconfirmed stop done");
+      switch (internal_hold_outcome(ok, impairment.nothing_to_hold)) {
+        case InternalHoldOutcome::kDone:
+          EmitLog("[command] adapter hold position after an unconfirmed stop done");
+          break;
+        case InternalHoldOutcome::kSuperseded:
+          EmitLog("[command] adapter hold position after an unconfirmed stop superseded: an "
+                  "earlier cancel already held the robot, nothing left to hold");
+          break;
+        case InternalHoldOutcome::kFailed:
+          // Keep the navigation marked active and the stop marked unconfirmed:
+          // spot.nav.state must not say idle while the robot may be walking,
+          // and the next cancel retries. The poll will not resume it
+          // (poll_may_auto_recover).
+          EmitLog("[command] adapter hold position after an unconfirmed stop FAILED; the walk "
+                  "stays marked active with its stop unconfirmed; the next spot.graphnav.cancel "
+                  "retries; check the robot");
+          break;
       }
       continue;
     }
@@ -5420,13 +5430,8 @@ void Adapter::LeaveDockPhase() {
   running_in_dock_phase_ = false;
 }
 
-bool Adapter::StopForCancel(const std::string& what, uint32_t nav_command_id) {
+StopConfirmation Adapter::StopAndConfirm(uint32_t nav_command_id) {
   using Resp = ::bosdyn::api::graph_nav::NavigationFeedbackResponse;
-  if (tl_command_impairment) tl_command_impairment->cancelled = true;
-  // Whatever happens next, the background poll must not resume this walk.
-  if (nav_command_id != 0) cancelled_nav_command_id_ = nav_command_id;
-  nav_auto_recovered_ = true;
-  EmitLog("[command] spot.graphnav.cancel: stopping " + what + " now");
   StopConfirmHooks hooks;
   hooks.stop = [this](std::string* error) {
     if (spot_.StopMotion()) return true;
@@ -5443,7 +5448,16 @@ bool Adapter::StopForCancel(const std::string& what, uint32_t nav_command_id) {
     return fb;
   };
   hooks.sleep_ms = [](long long ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
-  const StopConfirmation confirmation = confirm_stop(3, 200, hooks);
+  return confirm_stop(3, 200, hooks);
+}
+
+bool Adapter::StopForCancel(const std::string& what, uint32_t nav_command_id) {
+  if (tl_command_impairment) tl_command_impairment->cancelled = true;
+  // Whatever happens next, the background poll must not resume this walk.
+  if (nav_command_id != 0) cancelled_nav_command_id_ = nav_command_id;
+  nav_auto_recovered_ = true;
+  EmitLog("[command] spot.graphnav.cancel: stopping " + what + " now");
+  const StopConfirmation confirmation = StopAndConfirm(nav_command_id);
   if (confirmation.confirmed) {
     EmitLog("[command] spot.graphnav.cancel: stop confirmed after " +
             std::to_string(confirmation.attempts) + " attempt(s)");
@@ -5454,12 +5468,21 @@ bool Adapter::StopForCancel(const std::string& what, uint32_t nav_command_id) {
                                              last_nav_remaining_route_m_, "interrupted",
                                              "Cancelled by spot.graphnav.cancel.", now_ms());
       }
+      if (stop_unconfirmed_nav_id_ == nav_command_id) {
+        stop_unconfirmed_nav_id_ = 0;
+        stop_unconfirmed_reason_.clear();
+      }
     }
     AnswerPendingCancels(true, cancel_done_text());
     return true;
   }
   EmitLog("[command] spot.graphnav.cancel: stop NOT confirmed after " +
           std::to_string(confirmation.attempts) + " attempt(s): " + confirmation.reason);
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    stop_unconfirmed_nav_id_ = nav_command_id;
+    stop_unconfirmed_reason_ = confirmation.reason;
+  }
   if (tl_command_impairment) {
     tl_command_impairment->stop_unconfirmed = true;
     tl_command_impairment->unconfirmed_nav_id = nav_command_id;
@@ -6603,7 +6626,61 @@ bool Adapter::ExecuteGraphNavCancelCommand() {
   // activity or clear a pending release (DEV-17754).
   const bool navigation_active =
       last_graph_nav_command_id_.load() != 0 || graphnav_navigation_active_.load();
-  const CancelExecutionPlan plan = plan_cancel_execution(navigation_active);
+  // A walk whose earlier cancel stop was not confirmed may still be moving
+  // even with no live navigation recorded: read its feedback.
+  uint32_t unconfirmed_id = 0;
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    unconfirmed_id = stop_unconfirmed_nav_id_;
+  }
+  UnconfirmedWalk unconfirmed = UnconfirmedWalk::kNone;
+  if (!navigation_active && unconfirmed_id != 0) {
+    SpotClient::NavigationFeedbackSnapshot snap;
+    if (!spot_.GetNavigationFeedbackSnapshot(unconfirmed_id, &snap)) {
+      unconfirmed = UnconfirmedWalk::kUnreadable;
+    } else {
+      unconfirmed = snap.status == ::bosdyn::api::graph_nav::NavigationFeedbackResponse::STATUS_FOLLOWING_ROUTE
+                        ? UnconfirmedWalk::kFollowing
+                        : UnconfirmedWalk::kNotFollowing;
+    }
+  }
+  const CancelExecutionPlan plan = plan_cancel_execution(navigation_active, unconfirmed);
+  if (plan.clear_unconfirmed) {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    if (stop_unconfirmed_nav_id_ == unconfirmed_id) {
+      stop_unconfirmed_nav_id_ = 0;
+      stop_unconfirmed_reason_.clear();
+    }
+  }
+  if (plan.stop_unconfirmed_walk) {
+    // No lease is taken: the stop command uses the lease the adapter has.
+    if (tl_command_impairment) tl_command_impairment->idle_noop = true;
+    EmitLog("[graphnav] spot.graphnav.cancel: walk cmd_id=" + std::to_string(unconfirmed_id) +
+            " had an unconfirmed stop and may still be moving; stopping it again");
+    const StopConfirmation confirmation = StopAndConfirm(unconfirmed_id);
+    if (confirmation.confirmed) {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      MarkGraphNavNavigationTerminalLocked(unconfirmed_id, last_nav_status_,
+                                           last_nav_remaining_route_m_, "interrupted",
+                                           "Cancelled by spot.graphnav.cancel.", now_ms());
+      if (stop_unconfirmed_nav_id_ == unconfirmed_id) {
+        stop_unconfirmed_nav_id_ = 0;
+        stop_unconfirmed_reason_.clear();
+      }
+      EmitLog("[graphnav] spot.graphnav.cancel: stop of the earlier walk confirmed");
+      return true;
+    }
+    {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      stop_unconfirmed_reason_ = confirmation.reason;
+    }
+    EmitLog("[graphnav] spot.graphnav.cancel: stop of the earlier walk still NOT confirmed: " +
+            confirmation.reason);
+    if (tl_command_impairment) {
+      tl_command_impairment->stopped_text = cancel_not_confirmed_text(confirmation.reason);
+    }
+    return false;
+  }
   if (!plan.act) {
     // Success only if this cancel already ended queued walks or docks;
     // otherwise it stopped nothing and says so.
@@ -6611,6 +6688,7 @@ bool Adapter::ExecuteGraphNavCancelCommand() {
         tl_command_impairment && tl_command_impairment->cancel_stopped_queued;
     if (tl_command_impairment) {
       tl_command_impairment->idle_noop = true;
+      tl_command_impairment->nothing_to_hold = true;
       if (!stopped_queued) tl_command_impairment->stopped_text = cancel_ignored_nothing_text();
     }
     EmitLog("[graphnav] spot.graphnav.cancel ignored: no active navigation command" +
@@ -6691,7 +6769,14 @@ bool Adapter::ExecuteGraphNavCancelCommand() {
       command_id, static_cast<long long>(std::max(15, cfg_.graphnav_command_timeout_sec)) * 1000LL);
   graphnav_navigation_active_ = false;
   last_graph_nav_command_id_ = 0;
-  if (ok) EmitLog("[graphnav] spot.graphnav.cancel hold-position success");
+  if (ok) {
+    EmitLog("[graphnav] spot.graphnav.cancel hold-position success");
+    // Holding position overrides any earlier walk, so a stop that was not
+    // confirmed is settled now.
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    stop_unconfirmed_nav_id_ = 0;
+    stop_unconfirmed_reason_.clear();
+  }
   return ok;
 }
 
@@ -9319,6 +9404,8 @@ std::string Adapter::BuildGraphNavNavStateJson(
   long long localize_at_ms = 0;
   bool localize_confirmed = true;
   std::string localize_unconfirmed_reason;
+  uint32_t unconfirmed_stop_id = 0;
+  std::string unconfirmed_stop_reason;
   bool hold_active = false;
   std::string hold_command;
   std::string hold_fault;
@@ -9367,6 +9454,8 @@ std::string Adapter::BuildGraphNavNavStateJson(
     localize_at_ms = localize_at_ms_;
     localize_confirmed = localization_confirmation_.confirmed();
     localize_unconfirmed_reason = localization_confirmation_.pending_reason();
+    unconfirmed_stop_id = stop_unconfirmed_nav_id_;
+    unconfirmed_stop_reason = stop_unconfirmed_reason_;
     hold_active = command_hold_active_;
     hold_command = command_hold_command_;
     hold_fault = command_hold_fault_;
@@ -9405,6 +9494,9 @@ std::string Adapter::BuildGraphNavNavStateJson(
       << ",\"has_current_seed_pose\":" << (has_current_seed_pose ? "true" : "false")
       << ",\"has_seed_goal\":" << (has_seed_goal ? "true" : "false")
       << ",\"has_waypoint_goal\":" << (has_waypoint_goal ? "true" : "false")
+      << ",\"stop_unconfirmed\":" << (unconfirmed_stop_id != 0 ? "true" : "false")
+      << ",\"stop_unconfirmed_command_id\":" << unconfirmed_stop_id
+      << ",\"stop_unconfirmed_reason\":\"" << json_escape(unconfirmed_stop_reason) << "\""
       << ",\"command_hold_active\":" << (hold_active ? "true" : "false")
       << ",\"command_hold_command\":\"" << json_escape(hold_command) << "\""
       << ",\"command_hold_remaining_ms\":" << hold_remaining_ms
