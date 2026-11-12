@@ -50,9 +50,8 @@ struct HoldWatch {
   // Bumped on every teleop button press and every teleop twist that asks for
   // motion, whether or not the adapter acted on it.
   unsigned long long operator_actions{0};
-  // Bumped when a spot.graphnav.cancel arrives (see command_cancel.hpp). For
-  // the command-start watch it is the value when the command was queued.
-  unsigned long long stop_seq{0};
+  // A spot.graphnav.cancel for the held command arrived (see command_cancel.hpp).
+  bool cancelled{false};
   std::vector<std::string> queued_commands;
 };
 

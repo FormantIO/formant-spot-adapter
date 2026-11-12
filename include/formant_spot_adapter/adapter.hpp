@@ -122,9 +122,16 @@ class Adapter {
   // causes. A no-op on any other thread, so background navigation (the
   // lease-retain poll, the teleop dock loop) can never mark or clear it.
   void NoteCommandImpaired(const std::string& detail, const std::vector<std::string>& cause_ids);
-  // True on the command thread once a spot.graphnav.cancel arrived after the
-  // running command was queued.
+  // True on the command thread once a spot.graphnav.cancel stopped the running
+  // command.
   bool CancelRequested() const;
+  // On the command thread: if a cancel stopped this command, marks it
+  // cancelled, logs that nothing is sent for `what`, and returns true.
+  bool AbortIfCancelled(const std::string& what);
+  // Marks the running dock command as docking onto the dock (no cancel from
+  // here on). False if a cancel already arrived, in which case it must not dock.
+  bool EnterDockPhase();
+  void LeaveDockPhase();
   // Stops the robot for a cancel (a Spot stop command, which preempts GraphNav
   // and docking without powering anything on), marks the navigation
   // interrupted and the running command cancelled.
@@ -404,19 +411,24 @@ class Adapter {
   bool app_config_thread_stop_{false};
   std::string app_config_refresh_reason_;
 
-  // A queued command and the stop counter when it was queued (see
-  // command_cancel.hpp).
+  // A queued command; cancelled when a spot.graphnav.cancel ended it before it
+  // started (see command_cancel.hpp).
   struct QueuedCommand {
     v1::model::CommandRequest request;
-    unsigned long long stop_seq{0};
+    bool cancelled{false};
   };
   std::mutex command_queue_mu_;
   std::condition_variable command_queue_cv_;
   std::deque<QueuedCommand> command_queue_;
-  // The queued command running now ("" when none); guarded by command_queue_mu_.
+  // The queued command running now ("" when none), its Formant command id, and
+  // whether it has started docking onto the dock (AutoDock), which a cancel
+  // never interrupts. Guarded by command_queue_mu_.
   std::string running_command_;
-  // Bumped (under command_queue_mu_) when a spot.graphnav.cancel arrives.
-  std::atomic<unsigned long long> stop_seq_{0};
+  std::string running_command_id_;
+  bool running_in_dock_phase_{false};
+  // Set (under command_queue_mu_) when a cancel stops the running command;
+  // cleared when the next command starts.
+  std::atomic<bool> running_cancel_requested_{false};
 
   mutable std::mutex hb_mu_;
   long long last_heartbeat_ms_{0};

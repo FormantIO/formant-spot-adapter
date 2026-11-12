@@ -52,11 +52,16 @@ struct CommandImpairment {
   bool impaired{false};
   std::string detail;
   std::vector<std::string> cause_ids;
-  // stop_seq_ when this command was queued; a different stop_seq_ means a
-  // spot.graphnav.cancel arrived since (see command_cancel.hpp).
-  unsigned long long stop_seq_at_enqueue{0};
+  // The operator-action counter when the command started; the dock step
+  // does not call AutoDock if it changed (decide_dock_start).
+  unsigned long long operator_actions_at_start{0};
   // Set when a cancel stopped this command.
   bool cancelled{false};
+  // A cancel that found nothing to stop: no autonomy stamp afterwards.
+  bool idle_noop{false};
+  // The result line when the command stopped itself for another reason, e.g.
+  // STOPPED(operator action) from the dock step.
+  std::string stopped_text;
   // Self-rights this command may still do after an impaired refusal: one on
   // the first pass, none on the retry.
   int self_right_budget{1};
@@ -5118,31 +5123,53 @@ static const char* const kCommandResultStream = "spot.command.result";
 
 void Adapter::HandleCommand(const v1::model::CommandRequest& request) {
   // Runs on the agent's command stream thread, not the command thread, so a
-  // stop takes effect while a walk is still running (DEV-17754).
-  const bool stop = is_stop_command(request.command());
+  // cancel takes effect while a walk is still running (DEV-17754).
+  if (is_stop_command(request.command())) {
+    std::string text;
+    (void)ExtractCommandText(request, &text);
+    CancelInput in;
+    in.target_id = Trim(ExtractCommandParam(text, {"command_id"}));
+    CancelDecision decision;
+    {
+      std::lock_guard<std::mutex> lk(command_queue_mu_);
+      in.running_id = running_command_id_;
+      in.running_command = running_command_;
+      in.running_in_dock_phase = running_in_dock_phase_;
+      for (const auto& queued : command_queue_) {
+        in.queued.push_back({queued.request.id(), queued.request.command()});
+      }
+      decision = decide_cancel(in);
+      // Under the same lock as EnterDockPhase, so a cancel either lands before
+      // docking starts (and the dock is skipped) or sees the dock phase.
+      if (decision.stop_running) running_cancel_requested_ = true;
+      for (auto& queued : command_queue_) {
+        if (std::find(decision.cancel_queued_ids.begin(), decision.cancel_queued_ids.end(),
+                      queued.request.id()) != decision.cancel_queued_ids.end()) {
+          queued.cancelled = true;
+        }
+      }
+      if (decision.enqueue) command_queue_.push_front({request, false});
+    }
+    EmitLog(decision.log);
+    if (decision.enqueue) {
+      command_queue_cv_.notify_one();
+    } else {
+      (void)agent_.PostText(kCommandResultStream, decision.result_text);
+      (void)agent_.SendCommandResponse(request.id(), decision.success);
+    }
+    return;
+  }
+
   bool reject = false;
-  std::string running;
   {
     std::lock_guard<std::mutex> lk(command_queue_mu_);
-    // The counter moves under the queue lock, so every command queued before
-    // the stop sees a different value than the one it was queued with.
-    if (stop) ++stop_seq_;
-    switch (admit_command(request.command(), command_queue_.size(), kMaxCommandQueueDepth)) {
-      case QueueAdmission::kReject:
-        reject = true;
-        break;
-      case QueueAdmission::kFront:
-        command_queue_.push_front({request, stop_seq_.load()});
-        break;
-      case QueueAdmission::kBack:
-        command_queue_.push_back({request, stop_seq_.load()});
-        break;
+    if (admit_command(request.command(), command_queue_.size(), kMaxCommandQueueDepth) ==
+        QueueAdmission::kReject) {
+      reject = true;
+    } else {
+      command_queue_.push_back({request, false});
     }
-    running = running_command_;
   }
-  // The running walk or dock sees the new stop counter within 100 ms (a dock
-  // within one feedback poll) and stops the robot itself.
-  if (stop) EmitLog(stop_arrival_log(request.command(), running));
   if (reject) {
     EmitLog("[command] queue full; auto-failing command=" + request.command() +
             " id=" + request.id());
@@ -5156,28 +5183,34 @@ void Adapter::HandleCommand(const v1::model::CommandRequest& request) {
 void Adapter::CommandExecutionLoop() {
   while (running_.load()) {
     v1::model::CommandRequest request;
-    unsigned long long stop_seq_at_enqueue = 0;
+    bool cancelled_while_queued = false;
     {
       std::unique_lock<std::mutex> lk(command_queue_mu_);
       command_queue_cv_.wait(lk, [this]() { return !running_.load() || !command_queue_.empty(); });
       if (!running_.load() && command_queue_.empty()) break;
       request = command_queue_.front().request;
-      stop_seq_at_enqueue = command_queue_.front().stop_seq;
+      cancelled_while_queued = command_queue_.front().cancelled;
       command_queue_.pop_front();
       running_command_ = request.command();
+      running_command_id_ = request.id();
+      running_in_dock_phase_ = false;
+      running_cancel_requested_ = false;
     }
     struct RunningCommandReset {
       Adapter* self;
       ~RunningCommandReset() {
         std::lock_guard<std::mutex> lk(self->command_queue_mu_);
         self->running_command_.clear();
+        self->running_command_id_.clear();
+        self->running_in_dock_phase_ = false;
+        self->running_cancel_requested_ = false;
       }
     } running_command_reset{this};
 
-    // A walk or dock queued before a spot.graphnav.cancel never starts.
-    if (stopped_since_enqueue(request.command(), stop_seq_at_enqueue, stop_seq_.load())) {
+    // A walk or dock that a cancel ended while it was queued never starts.
+    if (cancelled_while_queued) {
       EmitLog("[command] not starting command=" + request.command() + " id=" + request.id() +
-              ": a spot.graphnav.cancel arrived after it was queued");
+              ": a spot.graphnav.cancel ended it while queued");
       (void)agent_.PostText(kCommandResultStream, stopped_by_cancel_result_text());
       agent_.SendCommandResponse(request.id(), false);
       continue;
@@ -5188,19 +5221,22 @@ void Adapter::CommandExecutionLoop() {
     // press, a lease change or a reconnect during that attempt also stops a
     // later retry.
     command_action_in_progress_ = true;
-    HoldWatch watch_at_start = CurrentHoldWatch();
-    watch_at_start.stop_seq = stop_seq_at_enqueue;
+    const HoldWatch watch_at_start = CurrentHoldWatch();
     CommandImpairment impairment;
-    impairment.stop_seq_at_enqueue = stop_seq_at_enqueue;
+    impairment.operator_actions_at_start = watch_at_start.operator_actions;
     tl_command_impairment = &impairment;
     uint32_t nav_completed_before = NavCompletedCommandId();
-    bool ok = ExecuteQueuedCommand(request);
+    // A cancel that arrived between taking the command and here: send nothing.
+    bool ok = stoppable_command(request.command()) && AbortIfCancelled(request.command())
+                  ? false
+                  : ExecuteQueuedCommand(request);
     std::string result_text;
     // Spot refused a walk or dock because a critical fault is active (DEV-17754).
     // Such faults often clear within seconds (a body camera re-enumerating), so
     // hold the command and retry it once when the fault clears; otherwise the
     // result names the fault.
-    if (!ok && !impairment.cancelled && !CancelRequested() && impairment.impaired &&
+    if (!ok && !impairment.cancelled && !CancelRequested() && impairment.stopped_text.empty() &&
+        impairment.impaired &&
         impaired_retry_applies(request.command()) && cfg_.impaired_retry_window_sec > 0) {
       std::string other_motion;
       if (last_graph_nav_command_id_.load() != 0 || graphnav_navigation_active_.load()) {
@@ -5241,7 +5277,7 @@ void Adapter::CommandExecutionLoop() {
           impairment.self_right_budget = 0;
           impairment.no_lease_takeover = true;
           nav_completed_before = NavCompletedCommandId();
-          ok = ExecuteQueuedCommand(request);
+          ok = AbortIfCancelled("the impaired retry") ? false : ExecuteQueuedCommand(request);
           if (!ok && impairment.impaired) {
             const ImpairmentSample now_state = SampleImpairment(impairment.cause_ids);
             const std::string fault =
@@ -5261,11 +5297,14 @@ void Adapter::CommandExecutionLoop() {
     // reported as such, whatever the command was doing.
     if (!ok && (impairment.cancelled || CancelRequested()) && stoppable_command(request.command())) {
       result_text = stopped_by_cancel_result_text();
+    } else if (!ok && !impairment.stopped_text.empty()) {
+      result_text = impairment.stopped_text;
     }
     tl_command_impairment = nullptr;
     // Stamp here too, so a command shorter than one main-loop tick still
-    // starts the post-autonomy lease hold.
-    last_autonomy_activity_ms_ = now_ms();
+    // starts the post-autonomy lease hold. Not for a cancel that found nothing
+    // to stop: that must not make the adapter keep a lease (DEV-17754).
+    if (!impairment.idle_noop) last_autonomy_activity_ms_ = now_ms();
     command_action_in_progress_ = false;
     if (result_text.empty()) result_text = CommandResultText(request, ok, nav_completed_before);
     // The result text goes on its own stream first, then a plain response:
@@ -5285,7 +5324,26 @@ void Adapter::NoteCommandImpaired(const std::string& detail,
 }
 
 bool Adapter::CancelRequested() const {
-  return tl_command_impairment && tl_command_impairment->stop_seq_at_enqueue != stop_seq_.load();
+  return tl_command_impairment && running_cancel_requested_.load();
+}
+
+bool Adapter::AbortIfCancelled(const std::string& what) {
+  if (!CancelRequested()) return false;
+  tl_command_impairment->cancelled = true;
+  EmitLog("[command] spot.graphnav.cancel: not sending " + what);
+  return true;
+}
+
+bool Adapter::EnterDockPhase() {
+  std::lock_guard<std::mutex> lk(command_queue_mu_);
+  if (running_cancel_requested_.load()) return false;
+  running_in_dock_phase_ = true;
+  return true;
+}
+
+void Adapter::LeaveDockPhase() {
+  std::lock_guard<std::mutex> lk(command_queue_mu_);
+  running_in_dock_phase_ = false;
 }
 
 void Adapter::StopForCancel(const std::string& what, uint32_t nav_command_id) {
@@ -5319,7 +5377,7 @@ HoldWatch Adapter::CurrentHoldWatch() {
   watch.connect_generation = spot_connect_generation_.load();
   watch.lease_epoch = lease_epoch_.load();
   watch.operator_actions = operator_actions_.load();
-  watch.stop_seq = stop_seq_.load();
+  watch.cancelled = running_cancel_requested_.load();
   std::lock_guard<std::mutex> lk(command_queue_mu_);
   for (const auto& queued : command_queue_) {
     watch.queued_commands.push_back(queued.request.command());
@@ -6051,6 +6109,9 @@ bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
                                         double waypoint_goal_x,
                                         double waypoint_goal_y,
                                         double waypoint_goal_yaw_rad) {
+  // A cancel for this command that arrived before any of the steps below
+  // means nothing is sent (no relocalization, no self-right, no NavigateTo).
+  if (AbortIfCancelled(action_name + " navigation")) return false;
   // Holding position (spot.graphnav.cancel) targets the robot's own current pose,
   // which is safe even if the map alignment is wrong; everything else needs a
   // confirmed localization.
@@ -6058,11 +6119,13 @@ bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
       !EnsureLocalizationConfirmedForNavigation(action_name)) {
     return false;
   }
+  if (AbortIfCancelled(action_name + " navigation")) return false;
   if (!EnsureLocalizedForNavigation(action_name)) return false;
 
   bool retried_localization = false;
   bool retried_recover = false;
   for (;;) {
+    if (AbortIfCancelled(action_name + " NavigateTo")) return false;
     uint32_t command_id = 0;
     const bool nav_ok = has_waypoint_goal
                             ? (straight ? spot_.NavigateToWaypointPoseStraight(
@@ -6099,10 +6162,12 @@ bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
     if (is_not_localized_error_text(nav_error) && !retried_localization) {
       retried_localization = true;
       EmitLog("[graphnav] " + action_name + " navigate failed: not localized; relocalizing");
+      if (AbortIfCancelled(action_name + " relocalization")) return false;
       if (!EnsureLocalizedForNavigation(action_name)) return false;
       continue;
     }
     if (impaired && !retried_recover && TakeSelfRightBudget()) {
+      if (AbortIfCancelled(action_name + " self-right")) return false;
       retried_recover = true;
       EmitLog("[graphnav] " + action_name + " navigate detected robot impairment, auto-recovering");
       if (!spot_.RecoverSelfRight()) {
@@ -6412,13 +6477,23 @@ bool Adapter::ExecuteGraphNavGotoPoseCommand(const v1::model::CommandRequest& re
 
 bool Adapter::ExecuteGraphNavCancelCommand() {
   const std::string action_name = "spot.graphnav.cancel";
-  if (!EnsureLeaseForCommand(action_name)) return false;
-
-  const uint32_t active_command_id = last_graph_nav_command_id_.load();
-  if (active_command_id == 0 && !graphnav_navigation_active_.load()) {
+  // Decide before touching the lease: with nothing to stop, a cancel must not
+  // take the lease from a client that is driving (the tablet), stamp autonomy
+  // activity or clear a pending release (DEV-17754).
+  const bool navigation_active =
+      last_graph_nav_command_id_.load() != 0 || graphnav_navigation_active_.load();
+  const CancelExecutionPlan plan = plan_cancel_execution(navigation_active);
+  if (!plan.act) {
+    if (tl_command_impairment) tl_command_impairment->idle_noop = true;
     EmitLog("[graphnav] spot.graphnav.cancel ignored: no active navigation command");
     return true;
   }
+  // Something is live: hold position with the lease we have, or one nobody
+  // holds. Never take it over.
+  if (tl_command_impairment) {
+    tl_command_impairment->no_lease_takeover = !plan.allow_lease_takeover;
+  }
+  if (!EnsureLeaseForCommand(action_name)) return false;
 
   SpotClient::LocalizationSnapshot localization;
   if (!SpotConnected() || !spot_.GetLocalizationSnapshot(&localization)) {
@@ -6501,6 +6576,12 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
     EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " failed: robot unavailable");
     return false;
   }
+  // Motor power when this dock command started, for decide_dock_start.
+  std::string motor_power_at_start;
+  {
+    SpotClient::RobotStateSnapshot snap;
+    if (spot_.GetRobotStateSnapshot(&snap)) motor_power_at_start = snap.motor_power_state;
+  }
   if (!EnsureLeaseForCommand(return_and_dock ? "spot.return_and_dock" : "spot.dock")) return false;
 
   if (return_and_dock) {
@@ -6570,31 +6651,51 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
     return false;
   }
 
-  if (CancelRequested()) {
-    StopForCancel(std::string(return_and_dock ? "return_and_dock" : "dock") + " before docking", 0);
-    if (!return_and_dock) {
-      std::lock_guard<std::mutex> lk(map_mu_);
-      ClearDockWaypointCandidateLocked();
+  const char* const tag = return_and_dock ? "[return_and_dock]" : "[dock]";
+  const auto clear_candidate = [this, return_and_dock]() {
+    if (return_and_dock) return;
+    std::lock_guard<std::mutex> lk(map_mu_);
+    ClearDockWaypointCandidateLocked();
+  };
+  // AutoDock powers the motors on. If an operator acted since the command
+  // started (the Formant estop button is a safe power off), or the motors
+  // were on and are now off, the dock must not undo that (DEV-17754).
+  if (tl_command_impairment) {
+    std::string motor_power_now;
+    SpotClient::RobotStateSnapshot snap;
+    if (spot_.GetRobotStateSnapshot(&snap)) motor_power_now = snap.motor_power_state;
+    const DockStart start =
+        decide_dock_start(tl_command_impairment->operator_actions_at_start, operator_actions_.load(),
+                          motor_power_at_start, motor_power_now);
+    if (start != DockStart::kStart) {
+      EmitLog(std::string(tag) + " not docking: " +
+              (start == DockStart::kStopOperatorAction
+                   ? "an operator used teleop or a button since the command started"
+                   : "the motors were turned off since the command started (power=" +
+                         motor_power_now + ")"));
+      tl_command_impairment->stopped_text = stopped_by_operator_result_text();
+      clear_candidate();
+      return false;
     }
+  }
+  // From here a cancel no longer interrupts: the robot is docking onto the dock.
+  if (!EnterDockPhase()) {
+    if (tl_command_impairment) tl_command_impairment->cancelled = true;
+    EmitLog(std::string(tag) + " spot.graphnav.cancel arrived before docking; not docking");
+    clear_candidate();
     return false;
   }
+  struct DockPhaseReset {
+    Adapter* self;
+    ~DockPhaseReset() { self->LeaveDockPhase(); }
+  } dock_phase_reset{this};
   docking_in_progress_ = true;
   moving_ = false;
   spot_.ZeroVelocity(1);
   ResetTeleopSlewState();
   const int dock_poll_ms = std::max(1000, cfg_.dock_poll_ms);
-  const bool ok = spot_.AutoDock(dock_id, cfg_.dock_attempts, dock_poll_ms, cfg_.dock_command_timeout_sec,
-                                 [this]() { return CancelRequested(); });
+  const bool ok = spot_.AutoDock(dock_id, cfg_.dock_attempts, dock_poll_ms, cfg_.dock_command_timeout_sec);
   docking_in_progress_ = false;
-  if (!ok && CancelRequested()) {
-    // HandleCommand asked AutoDock to give up; stop the docking motion too.
-    StopForCancel(std::string(return_and_dock ? "return_and_dock" : "dock") + " docking", 0);
-    if (!return_and_dock) {
-      std::lock_guard<std::mutex> lk(map_mu_);
-      ClearDockWaypointCandidateLocked();
-    }
-    return false;
-  }
   if (!ok) {
     const std::string error = spot_.LastError();
     const bool lost_lease = ErrorSuggestsLostLease(error);

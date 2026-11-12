@@ -222,19 +222,39 @@ Additional non-GraphNav command-channel actions:
   call), so a mission that wants to stop a held command must send `spot.graphnav.cancel`.
 - `spot.graphnav.cancel` takes effect on arrival. Commands run one at a time, and a walk or dock
   occupies the queue until it ends, so a cancel used to wait behind the walk it was meant to stop.
-  Now a cancel goes to the front of the queue, is accepted even when the queue is full, and the
-  running walk, dock or impaired hold checks for it every 100 ms (a dock at its next feedback
-  poll). The running command then sends Spot a stop command (the robot stops in place; nothing is
-  powered on), marks the navigation interrupted, and ends with `STOPPED(cancelled)` on
-  `spot.command.result` and a failed response. A walk or dock that was queued before the cancel and
-  has not started never starts (also `STOPPED(cancelled)`). The cancel itself then runs as before:
-  with nothing left to stop it logs `spot.graphnav.cancel ignored: no active navigation command`
-  and succeeds, and a navigation that is not a queued command (the teleop return-and-dock) is
-  stopped by holding position. `spot.sit` is not treated this way: a sit queued after a goto by a
-  driver that does not wait for the goto's result must not cancel it. The teleop sit and estop
-  buttons already act at once.
-  `<fault>` is the first critical fault from the robot state, e.g. `camera_server: right camera
-  failed to initialize`, GraphNav's named cause, or the refusal itself when neither is known.
+  Now a cancel is decided the moment it arrives and is accepted even when the queue is full.
+  - Parameter text, optional: `command_id=<formant command id>`, for example
+    `command_id=3f2c9a52-6d1e-4b8a-9c0f-1a2b3c4d5e6f`. With it, only that walk or dock command is
+    stopped, whether it is running or still queued, and the cancel is answered at once
+    (`DONE: spot.graphnav.cancel`). If that command already finished or is unknown nothing happens
+    and the answer is `DONE: spot.graphnav.cancel ignored, target not running`. Mission drivers
+    should always send it, so a late cancel never stops the next walk.
+  - Without `command_id` (an operator's cancel) the running walk or dock and every queued walk or
+    dock are stopped, and the cancel then runs from the front of the queue: it holds position if a
+    navigation that is not a queued command (the teleop return-and-dock) is still live.
+  - The running walk, dock or impaired hold sees the cancel within 100 ms, sends Spot a stop command
+    (the robot stops in place; nothing is powered on), marks the navigation interrupted and ends
+    with `STOPPED(cancelled)` and a failed response. A queued one never starts (also
+    `STOPPED(cancelled)`). Nothing is sent after the cancel arrives: no relocalization, no
+    self-right, no NavigateTo.
+  - A robot that has started docking onto the dock (AutoDock) is never interrupted:
+    `spot.return_and_dock` can be stopped only while it walks to the dock waypoint, and a targeted
+    cancel of a docking robot answers `REJECTED(docking in progress)`. Teleop and the E-Stop remain
+    the tools that stop everything.
+  - Not stopped by a cancel: `spot.undock`, `spot.rotate_left`, `spot.rotate_right`, and any other
+    command that is not a walk or dock.
+  - With nothing to stop, the cancel logs `spot.graphnav.cancel ignored: no active navigation
+    command` and succeeds without touching the body lease (someone may be driving with the
+    tablet), without starting the autonomy lease hold and without clearing a pending release. When
+    it does have to hold position it uses the lease the adapter has, or one nobody holds; it never
+    takes the lease over.
+  - `spot.sit` is not treated this way: a sit queued after a goto by a driver that does not wait for
+    the goto's result must not cancel it. The teleop sit and estop buttons already act at once.
+- Before a dock command calls AutoDock (which powers the motors on), the adapter checks that no
+  teleop button or twist was used since the command started and that the motors were not turned
+  off (the Formant estop button is a safe power off). Otherwise it does not dock and ends with
+  `STOPPED(operator action)`. A robot whose motors were off when the dock command started is still
+  powered on by the dock, as before.
 - `spot.rotate_left`: rotate left in place by a requested angle. Parameter: `degrees`.
 - `spot.rotate_right`: rotate right in place by a requested angle. Parameter: `degrees`.
 - `spot.reset_arm`: explicit arm reset/stow; command path does not require active teleop heartbeat.
