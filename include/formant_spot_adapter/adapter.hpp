@@ -122,6 +122,13 @@ class Adapter {
   // causes. A no-op on any other thread, so background navigation (the
   // lease-retain poll, the teleop dock loop) can never mark or clear it.
   void NoteCommandImpaired(const std::string& detail, const std::vector<std::string>& cause_ids);
+  // True on the command thread once a spot.graphnav.cancel arrived after the
+  // running command was queued.
+  bool CancelRequested() const;
+  // Stops the robot for a cancel (a Spot stop command, which preempts GraphNav
+  // and docking without powering anything on), marks the navigation
+  // interrupted and the running command cancelled.
+  void StopForCancel(const std::string& what, uint32_t nav_command_id);
   // Spends the command's one impaired self-right (none on the retry pass).
   // Always true off the command thread, which keeps its old behaviour.
   bool TakeSelfRightBudget();
@@ -397,9 +404,19 @@ class Adapter {
   bool app_config_thread_stop_{false};
   std::string app_config_refresh_reason_;
 
+  // A queued command and the stop counter when it was queued (see
+  // command_cancel.hpp).
+  struct QueuedCommand {
+    v1::model::CommandRequest request;
+    unsigned long long stop_seq{0};
+  };
   std::mutex command_queue_mu_;
   std::condition_variable command_queue_cv_;
-  std::deque<v1::model::CommandRequest> command_queue_;
+  std::deque<QueuedCommand> command_queue_;
+  // The queued command running now ("" when none); guarded by command_queue_mu_.
+  std::string running_command_;
+  // Bumped (under command_queue_mu_) when a spot.graphnav.cancel arrives.
+  std::atomic<unsigned long long> stop_seq_{0};
 
   mutable std::mutex hb_mu_;
   long long last_heartbeat_ms_{0};

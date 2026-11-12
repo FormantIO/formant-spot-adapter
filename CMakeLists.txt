@@ -136,6 +136,7 @@ add_executable(formant-spot-adapter
   src/localize_request.cpp
   src/map_processing_guard.cpp
   src/impaired_retry.cpp
+  src/command_cancel.cpp
   src/camera_discovery.cpp
   src/adapter.cpp
 )
@@ -274,6 +275,18 @@ target_include_directories(camera-discovery-test PRIVATE
 )
 
 add_test(NAME camera-discovery-test COMMAND camera-discovery-test)
+
+add_executable(command-cancel-test
+  tests/command_cancel_test.cpp
+  src/command_cancel.cpp
+  src/impaired_retry.cpp
+)
+
+target_include_directories(command-cancel-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME command-cancel-test COMMAND command-cancel-test)
 
 add_executable(localize-recovery-test
   tests/localize_recovery_test.cpp

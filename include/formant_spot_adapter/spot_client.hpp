@@ -2,6 +2,7 @@
 
 #include "formant_spot_adapter/localize_recovery.hpp"
 #include <atomic>
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -274,6 +275,9 @@ class SpotClient {
   bool Stand();
   bool Sit();
   bool EmergencyStop();
+  // A Spot stop command: the robot stops in place, preempting GraphNav and
+  // docking. Does not power the motors on.
+  bool StopMotion();
   bool RecoverSelfRight();
   bool RebootRobotBody();
   bool StartCameraCalibration();
@@ -359,7 +363,10 @@ class SpotClient {
   // Returns false only if the query itself failed; a tag that is not listed is
   // reported as found=false.
   bool GetDockFiducialSighting(int dock_id, DockFiducialSighting* out_sighting);
-  bool AutoDock(int dock_id, int attempts, int poll_ms, int command_timeout_sec);
+  // should_cancel, when given, is checked with the dock cancel flag on every
+  // attempt and feedback poll (a spot.graphnav.cancel for this dock).
+  bool AutoDock(int dock_id, int attempts, int poll_ms, int command_timeout_sec,
+                const std::function<bool()>& should_cancel = nullptr);
   bool Undock(int poll_ms, int command_timeout_sec);
   void RequestDockCancel();
   std::string LastError() const;

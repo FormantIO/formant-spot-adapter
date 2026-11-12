@@ -220,6 +220,19 @@ Additional non-GraphNav command-channel actions:
   handles navigation impairment; the background navigation poll does not recover or re-send it.
   Formant's command cancellation is not visible to the adapter (the agent API has no cancel
   call), so a mission that wants to stop a held command must send `spot.graphnav.cancel`.
+- `spot.graphnav.cancel` takes effect on arrival. Commands run one at a time, and a walk or dock
+  occupies the queue until it ends, so a cancel used to wait behind the walk it was meant to stop.
+  Now a cancel goes to the front of the queue, is accepted even when the queue is full, and the
+  running walk, dock or impaired hold checks for it every 100 ms (a dock at its next feedback
+  poll). The running command then sends Spot a stop command (the robot stops in place; nothing is
+  powered on), marks the navigation interrupted, and ends with `STOPPED(cancelled)` on
+  `spot.command.result` and a failed response. A walk or dock that was queued before the cancel and
+  has not started never starts (also `STOPPED(cancelled)`). The cancel itself then runs as before:
+  with nothing left to stop it logs `spot.graphnav.cancel ignored: no active navigation command`
+  and succeeds, and a navigation that is not a queued command (the teleop return-and-dock) is
+  stopped by holding position. `spot.sit` is not treated this way: a sit queued after a goto by a
+  driver that does not wait for the goto's result must not cancel it. The teleop sit and estop
+  buttons already act at once.
   `<fault>` is the first critical fault from the robot state, e.g. `camera_server: right camera
   failed to initialize`, GraphNav's named cause, or the refusal itself when neither is known.
 - `spot.rotate_left`: rotate left in place by a requested angle. Parameter: `degrees`.

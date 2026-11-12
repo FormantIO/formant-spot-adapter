@@ -50,6 +50,7 @@ bool error_text_says_robot_impaired(const std::string& error_text) {
 }
 
 std::string hold_cancel_reason(const HoldWatch& at_command_start, const HoldWatch& now) {
+  if (now.stop_seq != at_command_start.stop_seq) return "cancelled by spot.graphnav.cancel";
   if (!now.running) return "adapter stopping";
   if (!now.connected) return "Spot connection lost";
   if (now.connect_generation != at_command_start.connect_generation) return "Spot reconnected";

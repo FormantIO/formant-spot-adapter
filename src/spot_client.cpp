@@ -729,6 +729,19 @@ bool SpotClient::EmergencyStop() {
   return r.status;
 }
 
+bool SpotClient::StopMotion() {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!robot_command_client_) {
+    SetLastError("Robot command client unavailable");
+    return false;
+  }
+  if (!EnsureTimeSync()) return false;
+  auto cmd = ::bosdyn::client::StopCommand();
+  auto r = robot_command_client_->RobotCommand(cmd);
+  if (!r.status) SetLastError(r.status.DebugString());
+  return r.status;
+}
+
 bool SpotClient::RecoverSelfRight() {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!robot_command_client_) return false;
@@ -2280,7 +2293,8 @@ bool SpotClient::GetDockingStatus(int* out_status) {
   return true;
 }
 
-bool SpotClient::AutoDock(int dock_id, int attempts, int poll_ms, int command_timeout_sec) {
+bool SpotClient::AutoDock(int dock_id, int attempts, int poll_ms, int command_timeout_sec,
+                          const std::function<bool()>& should_cancel) {
   if (dock_id <= 0) return false;
   if (!EnsureDockingClient()) return false;
   if (!EnsureTimeSync()) return false;
@@ -2293,7 +2307,7 @@ bool SpotClient::AutoDock(int dock_id, int attempts, int poll_ms, int command_ti
   std::string last_err;
 
   for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-    if (cancel_docking_.load()) {
+    if (cancel_docking_.load() || (should_cancel && should_cancel())) {
       SetLastError("Docking canceled");
       return false;
     }
@@ -2335,7 +2349,7 @@ bool SpotClient::AutoDock(int dock_id, int attempts, int poll_ms, int command_ti
     const uint32_t cmd_id = start.response.docking_command_id();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(command_timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
-      if (cancel_docking_.load()) {
+      if (cancel_docking_.load() || (should_cancel && should_cancel())) {
         SetLastError("Docking canceled");
         return false;
       }
