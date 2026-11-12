@@ -4856,7 +4856,11 @@ void Adapter::PollGraphNavNavigation(long long now) {
       last_nav_remaining_route_m_ = fb.remaining_route_length;
       return;
     }
-    const bool already_recovered = nav_auto_recovered_.exchange(true);
+    // A navigation a cancel stopped is never recovered or re-sent here; it is
+    // marked failed below like one that was already recovered once.
+    const bool already_recovered =
+        !poll_may_auto_recover(command_id, cancelled_nav_command_id_.load(), false,
+                               nav_auto_recovered_.exchange(true));
     std::string waypoint_name;
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
@@ -5359,11 +5363,22 @@ void Adapter::CommandExecutionLoop() {
     // starts the post-autonomy lease hold. Not for a cancel that found nothing
     // to stop: that must not make the adapter keep a lease (DEV-17754).
     if (!impairment.idle_noop) last_autonomy_activity_ms_ = now_ms();
-    command_action_in_progress_ = false;
+    // After an unconfirmed stop, stay "in progress" until the internal hold
+    // (queued at the front) has run, so no background loop owns the cancelled
+    // navigation in between.
+    command_action_in_progress_ = impairment.stop_unconfirmed;
     if (result_text.empty()) result_text = CommandResultText(request, ok, nav_completed_before);
     if (internal) {
-      EmitLog("[command] adapter hold position after an unconfirmed stop " +
-              std::string(ok ? "done" : "failed"));
+      if (!ok) {
+        // The hold could not run (no localization, no free lease): leave
+        // nothing owning the cancelled walk, so nothing re-sends it.
+        last_graph_nav_command_id_ = 0;
+        graphnav_navigation_active_ = false;
+        EmitLog("[command] adapter hold position after an unconfirmed stop FAILED; navigation "
+                "state cleared, nothing will resume the cancelled walk; check the robot");
+      } else {
+        EmitLog("[command] adapter hold position after an unconfirmed stop done");
+      }
       continue;
     }
     // The result text goes on its own stream first, then a plain response:
@@ -5408,6 +5423,9 @@ void Adapter::LeaveDockPhase() {
 bool Adapter::StopForCancel(const std::string& what, uint32_t nav_command_id) {
   using Resp = ::bosdyn::api::graph_nav::NavigationFeedbackResponse;
   if (tl_command_impairment) tl_command_impairment->cancelled = true;
+  // Whatever happens next, the background poll must not resume this walk.
+  if (nav_command_id != 0) cancelled_nav_command_id_ = nav_command_id;
+  nav_auto_recovered_ = true;
   EmitLog("[command] spot.graphnav.cancel: stopping " + what + " now");
   StopConfirmHooks hooks;
   hooks.stop = [this](std::string* error) {

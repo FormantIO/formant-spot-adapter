@@ -271,6 +271,14 @@ int main() {
     }
   }
 
+  // The background poll never recovers or re-sends a cancelled navigation.
+  check(fsa::poll_may_auto_recover(41, 0, false, false), "an impaired teleop navigation may be recovered once");
+  check(!fsa::poll_may_auto_recover(41, 41, false, false), "a cancelled navigation is never recovered");
+  check(!fsa::poll_may_auto_recover(41, 41, false, true), "cancelled and already recovered: no");
+  check(fsa::poll_may_auto_recover(42, 41, false, false), "a later navigation is not blocked by an old cancel");
+  check(!fsa::poll_may_auto_recover(42, 0, true, false), "never while a queued command runs");
+  check(!fsa::poll_may_auto_recover(42, 0, false, true), "never twice");
+
   // The cancel command when it runs: with nothing live it must not touch the
   // lease, stamp autonomy activity or clear a pending release.
   {

@@ -148,6 +148,12 @@ std::string cancel_not_confirmed_text(const std::string& reason) {
   return "STOPPED not confirmed: " + reason;
 }
 
+bool poll_may_auto_recover(uint32_t command_id, uint32_t cancelled_command_id,
+                           bool command_in_progress, bool already_recovered) {
+  if (command_in_progress || already_recovered) return false;
+  return command_id == 0 || command_id != cancelled_command_id;
+}
+
 CancelExecutionPlan plan_cancel_execution(bool navigation_active) {
   CancelExecutionPlan plan;
   if (!navigation_active) return plan;

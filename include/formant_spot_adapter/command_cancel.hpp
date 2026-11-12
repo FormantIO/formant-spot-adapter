@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <string>
@@ -156,6 +157,14 @@ inline const char* cancel_ignored_finished_text() {
 inline const char* cancel_done_text() { return "DONE: spot.graphnav.cancel"; }
 // The answer when the stop could not be confirmed.
 std::string cancel_not_confirmed_text(const std::string& reason);
+
+// Whether the background navigation poll (PollGraphNavNavigation) may
+// self-right and re-send an impaired navigation. Never while a queued command
+// runs (its thread owns the navigation), never twice, and never for a
+// navigation a cancel stopped: re-sending it would resume a walk someone asked
+// to stop.
+bool poll_may_auto_recover(uint32_t command_id, uint32_t cancelled_command_id,
+                           bool command_in_progress, bool already_recovered);
 
 // The command-result line for a command a stop ended.
 inline const char* stopped_by_cancel_result_text() { return "STOPPED(cancelled)"; }

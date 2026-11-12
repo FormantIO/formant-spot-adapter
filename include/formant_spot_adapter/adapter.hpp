@@ -440,6 +440,9 @@ class Adapter {
   // Set (under command_queue_mu_) when a cancel stops the running command;
   // cleared when the next command starts.
   std::atomic<bool> running_cancel_requested_{false};
+  // The last navigation a cancel stopped (or tried to). PollGraphNavNavigation
+  // never self-rights or re-sends it.
+  std::atomic<uint32_t> cancelled_nav_command_id_{0};
   // Cancels waiting for the running command's stop to be confirmed; answered
   // by AnswerPendingCancels. Guarded by command_queue_mu_.
   std::vector<std::string> pending_cancel_answers_;
