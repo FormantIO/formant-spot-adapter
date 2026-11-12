@@ -43,6 +43,22 @@ long long now_ms() {
   return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+// Impairment state of the command the command thread is running (DEV-17754).
+// CommandExecutionLoop points tl_command_impairment at a local for each
+// command; every other thread sees nullptr, so background navigation (the
+// lease-retain poll, the teleop dock loop) can never mark, clear or spend it.
+struct CommandImpairment {
+  bool impaired{false};
+  std::string detail;
+  std::vector<std::string> cause_ids;
+  // Self-rights this command may still do after an impaired refusal: one on
+  // the first pass, none on the retry.
+  int self_right_budget{1};
+  // On the retry, take the body lease only if nobody else holds it.
+  bool no_lease_takeover{false};
+};
+thread_local CommandImpairment* tl_command_impairment = nullptr;
+
 // localize_detail for one SetLocalization attempt (see FormatLocalizeDetail).
 std::string localize_detail(const SpotClient::WaypointLocalizeResult& r) {
   LocalizeDetailFields f;
@@ -2062,8 +2078,7 @@ const char* nav_status_name(int status) {
 }
 
 bool is_robot_impaired_error_text(const std::string& error_text) {
-  return error_text.find("ROBOT_IMPAIRED") != std::string::npos ||
-         error_text.find("status=5") != std::string::npos;
+  return error_text_says_robot_impaired(error_text);
 }
 
 bool is_not_localized_error_text(const std::string& error_text) {
@@ -2817,6 +2832,7 @@ void Adapter::Run() {
           EmitLog(std::string("[adapter] failed returning body lease: ") + spot_.LastError());
         }
         lease_owned_ = false;
+        ++lease_epoch_;
         desired_twist_valid_ = false;
         active_motion_source_ = kMotionSourceNone;
         {
@@ -2984,7 +3000,14 @@ void Adapter::CameraDiscoveryLoop() {
     const bool connected = SpotConnected();
     if (!connected || !spot_.ListImageSources(&sources)) {
       const std::string error = connected ? spot_.LastError() : std::string("robot unavailable");
-      discovery.OnListFailed(now);
+      const std::vector<CameraWant> fallback = discovery.OnListFailed(now);
+      if (!fallback.empty()) {
+        EmitLog("[camera] Spot has not listed image sources " +
+                std::to_string((now - started_ms) / 1000) +
+                " s after startup; starting the configured camera streams without the list");
+        StartReadyCameraStreams(fallback, now - started_ms, unready_logged, &threads);
+        continue;
+      }
       const int streak = discovery.unanswered_streak();
       // Log the 1st, 2nd, 4th, 8th ... failure, so a long boot is visible
       // without a line every few seconds.
@@ -4291,6 +4314,7 @@ void Adapter::SetSpotDisconnected(const std::string& reason) {
   const bool was_connected = SpotConnected();
   spot_connection_state_ = 0;
   lease_owned_ = false;
+  ++lease_epoch_;
   spot_.InvalidateBodyLease();
   moving_ = false;
   ResetTeleopSlewState();
@@ -4805,6 +4829,15 @@ void Adapter::PollGraphNavNavigation(long long now) {
   }
 
   if (status == Resp::STATUS_ROBOT_IMPAIRED) {
+    if (command_action_in_progress_.load()) {
+      // A queued command is running and its thread handles this impairment
+      // (WaitForGraphNavCommandResult, then the impaired hold). Recovering here
+      // too would start a second navigation behind its back (DEV-17754).
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      last_nav_status_ = status;
+      last_nav_remaining_route_m_ = fb.remaining_route_length;
+      return;
+    }
     const bool already_recovered = nav_auto_recovered_.exchange(true);
     std::string waypoint_name;
     {
@@ -5108,8 +5141,14 @@ void Adapter::CommandExecutionLoop() {
       command_queue_.pop_front();
     }
 
+    // Marked in progress first (so the idle lease return cannot run between
+    // the two), then the watch is taken before the first attempt, so a button
+    // press, a lease change or a reconnect during that attempt also stops a
+    // later retry.
     command_action_in_progress_ = true;
-    command_impaired_ = false;
+    const HoldWatch watch_at_start = CurrentHoldWatch();
+    CommandImpairment impairment;
+    tl_command_impairment = &impairment;
     uint32_t nav_completed_before = NavCompletedCommandId();
     bool ok = ExecuteQueuedCommand(request);
     std::string result_text;
@@ -5117,30 +5156,64 @@ void Adapter::CommandExecutionLoop() {
     // Such faults often clear within seconds (a body camera re-enumerating), so
     // hold the command and retry it once when the fault clears; otherwise the
     // result names the fault.
-    if (!ok && command_impaired_.load() && impaired_retry_applies(request.command()) &&
+    if (!ok && impairment.impaired && impaired_retry_applies(request.command()) &&
         cfg_.impaired_retry_window_sec > 0) {
-      const long long window_ms = static_cast<long long>(cfg_.impaired_retry_window_sec) * 1000LL;
-      const ImpairedHoldResult hold = HoldImpairedCommand(request);
-      if (hold.end == ImpairedHoldEnd::kCleared) {
-        EmitLog("[command] impairment cleared after " + std::to_string(hold.waited_ms) +
-                " ms; retrying once command=" + request.command() + " id=" + request.id());
-        command_impaired_ = false;
-        nav_completed_before = NavCompletedCommandId();
-        ok = ExecuteQueuedCommand(request);
-        if (!ok && command_impaired_.load()) {
-          const ImpairmentSample now_state = SampleImpairment();
-          const std::string fault =
-              now_state.degraded && !now_state.fault.empty() ? now_state.fault : hold.fault;
-          result_text = impaired_again_result_text(fault);
-        }
-        EmitLog("[command] retry after impairment " + std::string(ok ? "succeeded" : "failed") +
-                " command=" + request.command() + " id=" + request.id());
+      std::string other_motion;
+      if (last_graph_nav_command_id_.load() != 0 || graphnav_navigation_active_.load()) {
+        other_motion = "another navigation is still active";
+      } else if (docking_in_progress_.load() || dock_loop_busy_.load()) {
+        other_motion = "a dock is in progress";
+      }
+      if (!other_motion.empty()) {
+        EmitLog("[command] not holding impaired command=" + request.command() + " id=" +
+                request.id() + ": " + other_motion);
       } else {
-        result_text = impaired_hold_result_text(hold, window_ms);
-        EmitLog("[command] not retrying command=" + request.command() + " id=" + request.id() +
-                ": " + result_text);
+        const long long window_ms =
+            static_cast<long long>(cfg_.impaired_retry_window_sec) * 1000LL;
+        ImpairedHoldResult hold = HoldImpairedCommand(
+            request, watch_at_start, impairment.detail, impairment.cause_ids);
+        if (hold.end == ImpairedHoldEnd::kCleared) {
+          // One more read right before acting, so the motors-on and no-fault
+          // check is milliseconds old, not up to a poll interval.
+          const ImpairmentSample last = SampleImpairment(impairment.cause_ids);
+          const SampleVerdict verdict = classify_impairment_sample(last);
+          const std::string why = hold_cancel_reason(watch_at_start, CurrentHoldWatch());
+          if (!why.empty() || verdict == SampleVerdict::kEstopped ||
+              verdict == SampleVerdict::kPoweredOff) {
+            hold.end = ImpairedHoldEnd::kCancelled;
+            hold.cancel_reason = !why.empty() ? why
+                                 : verdict == SampleVerdict::kEstopped ? "E-Stop asserted"
+                                                                       : "robot powered off";
+          } else if (verdict != SampleVerdict::kClear) {
+            hold.end = ImpairedHoldEnd::kNotCleared;
+            hold.unclearable = verdict == SampleVerdict::kUnclearable;
+            if (!last.fault.empty()) hold.fault = last.fault;
+          }
+        }
+        if (hold.end == ImpairedHoldEnd::kCleared) {
+          EmitLog("[command] impairment cleared after " + std::to_string(hold.waited_ms) +
+                  " ms; retrying once command=" + request.command() + " id=" + request.id());
+          impairment.impaired = false;
+          impairment.self_right_budget = 0;
+          impairment.no_lease_takeover = true;
+          nav_completed_before = NavCompletedCommandId();
+          ok = ExecuteQueuedCommand(request);
+          if (!ok && impairment.impaired) {
+            const ImpairmentSample now_state = SampleImpairment(impairment.cause_ids);
+            const std::string fault =
+                !now_state.fault.empty() ? now_state.fault : hold.fault;
+            result_text = impaired_again_result_text(fault);
+          }
+          EmitLog("[command] retry after impairment " + std::string(ok ? "succeeded" : "failed") +
+                  " command=" + request.command() + " id=" + request.id());
+        } else {
+          result_text = impaired_hold_result_text(hold, window_ms);
+          EmitLog("[command] not retrying command=" + request.command() + " id=" + request.id() +
+                  ": " + result_text);
+        }
       }
     }
+    tl_command_impairment = nullptr;
     // Stamp here too, so a command shorter than one main-loop tick still
     // starts the post-autonomy lease hold.
     last_autonomy_activity_ms_ = now_ms();
@@ -5154,38 +5227,89 @@ void Adapter::CommandExecutionLoop() {
 }
 
 
-void Adapter::NoteCommandImpaired(const std::string& detail) {
-  {
-    std::lock_guard<std::mutex> lk(command_impaired_mu_);
-    command_impaired_detail_ = detail;
-  }
-  command_impaired_ = true;
+void Adapter::NoteCommandImpaired(const std::string& detail,
+                                  const std::vector<std::string>& cause_ids) {
+  if (!tl_command_impairment) return;
+  tl_command_impairment->impaired = true;
+  tl_command_impairment->detail = detail;
+  tl_command_impairment->cause_ids = cause_ids;
 }
 
-ImpairmentSample Adapter::SampleImpairment() {
+bool Adapter::TakeSelfRightBudget() {
+  if (!tl_command_impairment) return true;
+  if (tl_command_impairment->self_right_budget <= 0) {
+    EmitLog("[graphnav] skipping impaired self-right: this command already used its one");
+    return false;
+  }
+  --tl_command_impairment->self_right_budget;
+  return true;
+}
+
+HoldWatch Adapter::CurrentHoldWatch() {
+  HoldWatch watch;
+  watch.running = running_.load();
+  watch.connected = SpotConnected();
+  watch.connect_generation = spot_connect_generation_.load();
+  watch.lease_epoch = lease_epoch_.load();
+  watch.operator_actions = operator_actions_.load();
+  std::lock_guard<std::mutex> lk(command_queue_mu_);
+  for (const auto& queued : command_queue_) watch.queued_commands.push_back(queued.command());
+  return watch;
+}
+
+ImpairmentSample Adapter::SampleImpairment(const std::vector<std::string>& cause_ids) {
   ImpairmentSample sample;
   SpotClient::RobotStateSnapshot snap;
   if (!SpotConnected() || !spot_.GetRobotStateSnapshot(&snap)) return sample;
   UpdateDegradedStateFromRobotState(snap);
   sample.read_ok = true;
   sample.estopped = snap.any_estopped;
+  sample.motor_power = snap.motor_power_state;
   std::string fault;
   sample.degraded = !degraded_reason_from_robot_state(snap, &fault).empty();
-  sample.fault = fault;
+  std::vector<std::string> present;
+  std::string present_cause;
+  for (const auto* list : {&snap.system_faults, &snap.service_faults, &snap.behavior_faults}) {
+    for (const auto& f : *list) {
+      present.push_back(f.id);
+      if (present_cause.empty() && any_cause_present(cause_ids, {f.id})) {
+        present_cause = f.message.empty() ? f.id : f.id + ": " + f.message;
+      }
+    }
+  }
+  for (const auto& f : snap.behavior_faults) {
+    if (f.severity == "unclearable") sample.unclearable = true;
+  }
+  sample.cause_present = any_cause_present(cause_ids, present);
+  sample.fault = !fault.empty() ? fault : present_cause;
   return sample;
 }
 
-ImpairedHoldResult Adapter::HoldImpairedCommand(const v1::model::CommandRequest& request) {
+ImpairedHoldResult Adapter::HoldImpairedCommand(const v1::model::CommandRequest& request,
+                                                const HoldWatch& watch_at_command_start,
+                                                const std::string& failure_fault,
+                                                const std::vector<std::string>& cause_ids) {
   const long long window_ms = static_cast<long long>(cfg_.impaired_retry_window_sec) * 1000LL;
-  const long long hold_start_ms = now_ms();
-  std::string failure_fault;
-  {
-    std::lock_guard<std::mutex> lk(command_impaired_mu_);
-    failure_fault = command_impaired_detail_;
-  }
   EmitLog("[command] " + request.command() + " id=" + request.id() +
           " refused: robot impaired (" + failure_fault + "); holding up to " +
           std::to_string(cfg_.impaired_retry_window_sec) + " s for the fault to clear");
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    command_hold_active_ = true;
+    command_hold_command_ = request.command();
+    command_hold_fault_ = failure_fault;
+    command_hold_deadline_ms_ = now_ms() + window_ms;
+  }
+  struct HoldStatusReset {
+    Adapter* self;
+    ~HoldStatusReset() {
+      std::lock_guard<std::mutex> lk(self->nav_state_mu_);
+      self->command_hold_active_ = false;
+      self->command_hold_command_.clear();
+      self->command_hold_fault_.clear();
+      self->command_hold_deadline_ms_ = 0;
+    }
+  } hold_status_reset{this};
 
   ImpairedHoldHooks hooks;
   hooks.now_ms = []() { return now_ms(); };
@@ -5195,16 +5319,16 @@ ImpairedHoldResult Adapter::HoldImpairedCommand(const v1::model::CommandRequest&
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   };
-  hooks.sample = [this]() { return SampleImpairment(); };
-  hooks.cancel_reason = [this, hold_start_ms]() -> std::string {
-    if (!running_.load()) return "adapter stopping";
-    if (!SpotConnected()) return "Spot connection lost";
-    if (last_teleop_motion_ms_.load() >= hold_start_ms) return "operator took teleop control";
-    std::lock_guard<std::mutex> lk(command_queue_mu_);
-    for (const auto& queued : command_queue_) {
-      if (supersedes_held_command(queued.command())) return "superseded by " + queued.command();
+  hooks.sample = [this, &cause_ids]() {
+    ImpairmentSample sample = SampleImpairment(cause_ids);
+    if (!sample.fault.empty()) {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      command_hold_fault_ = sample.fault;
     }
-    return std::string();
+    return sample;
+  };
+  hooks.cancel_reason = [this, &watch_at_command_start]() {
+    return hold_cancel_reason(watch_at_command_start, CurrentHoldWatch());
   };
   return hold_until_impairment_clears(window_ms, 1000, failure_fault, hooks);
 }
@@ -5336,12 +5460,32 @@ bool Adapter::WaitForGraphNavCommandResult(uint32_t command_id, long long timeou
       }
       return true;
     }
+    if (fb.status == Resp::STATUS_ROBOT_IMPAIRED && tl_command_impairment) {
+      // The command thread owns this navigation's impairment handling; the
+      // lease-retain poll leaves it alone (PollGraphNavNavigation), so there
+      // is one live navigation and one self-right at most.
+      NoteCommandImpaired(fb.impaired.detail.empty() ? "Navigation ended with STATUS_ROBOT_IMPAIRED"
+                                                     : fb.impaired.detail,
+                          fb.impaired.fault_ids);
+      if (TakeSelfRightBudget()) {
+        EmitLog("[graphnav] navigation impaired, auto-recovering and retrying");
+        uint32_t retry_command_id = 0;
+        if (spot_.RecoverSelfRight()) {
+          (void)spot_.Stand();
+          if (RetryActiveGraphNavCommandWithRecovery("graphnav.navigation.retry", &retry_command_id)) {
+            command_id = retry_command_id;
+            last_graph_nav_command_id_ = retry_command_id;
+            graphnav_navigation_active_ = true;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
+          }
+        }
+        EmitLog(std::string("[graphnav] navigation retry after recover failed: ") + spot_.LastError());
+      }
+    }
     if (fb.status != Resp::STATUS_FOLLOWING_ROUTE) {
       EmitLog("[command] graphnav ended status=" + std::to_string(fb.status) +
               " (" + nav_status_name(fb.status) + ")");
-      if (fb.status == Resp::STATUS_ROBOT_IMPAIRED) {
-        NoteCommandImpaired("Navigation ended with STATUS_ROBOT_IMPAIRED");
-      }
       std::lock_guard<std::mutex> lk(nav_state_mu_);
       MarkGraphNavNavigationTerminalLocked(
           command_id, fb.status, fb.remaining_route_length, "failed",
@@ -5853,14 +5997,19 @@ bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
     if (nav_ok) {
       // An impairment that the self-right below recovered from is not why a
       // later failure of this command happens.
-      command_impaired_ = false;
+      if (tl_command_impairment) tl_command_impairment->impaired = false;
       if (out_command_id) *out_command_id = command_id;
       return true;
     }
 
     const std::string nav_error = spot_.LastError();
-    if (is_robot_impaired_error_text(nav_error)) {
-      NoteCommandImpaired("navigate failed: " + nav_error);
+    SpotClient::ImpairedCause impaired_cause;
+    const bool impaired =
+        spot_.LastNavigateImpaired(&impaired_cause) || is_robot_impaired_error_text(nav_error);
+    if (impaired) {
+      NoteCommandImpaired(impaired_cause.detail.empty() ? "navigate failed: " + nav_error
+                                                         : impaired_cause.detail,
+                          impaired_cause.fault_ids);
     }
     if (is_not_localized_error_text(nav_error) && !retried_localization) {
       retried_localization = true;
@@ -5868,7 +6017,7 @@ bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
       if (!EnsureLocalizedForNavigation(action_name)) return false;
       continue;
     }
-    if (is_robot_impaired_error_text(nav_error) && !retried_recover) {
+    if (impaired && !retried_recover && TakeSelfRightBudget()) {
       retried_recover = true;
       EmitLog("[graphnav] " + action_name + " navigate detected robot impairment, auto-recovering");
       if (!spot_.RecoverSelfRight()) {
@@ -6316,7 +6465,7 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
   const auto note_if_impaired = [this](const char* step) {
     const ImpairmentSample state = SampleImpairment();
     if (state.read_ok && state.degraded) {
-      NoteCommandImpaired(std::string(step) + " failed while impaired: " + state.fault);
+      NoteCommandImpaired(std::string(step) + " failed while impaired: " + state.fault, {});
     }
   };
 
@@ -6523,6 +6672,10 @@ void Adapter::HandleButtonPress(const std::string& button_key, const std::string
   };
 
   EmitLog(std::string("[teleop] button press key=") + button_key + " stream=" + source_stream);
+  // Any teleop button (the Formant estop, which is a safe power off, sit,
+  // stand, dock, recover, arm reset, a mode) ends an impaired hold without a
+  // retry (DEV-17754).
+  ++operator_actions_;
 
   if (matches(cfg_.stand_button_stream, {"stand"})) {
     (void)ExecuteStandAction(true, false);
@@ -6595,9 +6748,13 @@ bool Adapter::EnsureLeaseForCommand(const std::string& action_name) {
             " cached body lease invalid: " + spot_.LastError());
     ResetLeaseState(true);
   }
-  lease_owned_ = spot_.AcquireBodyLease();
+  // The retry after an impaired hold must not take the lease from a client
+  // that took it meanwhile (the tablet, another operator): acquire only.
+  const bool no_takeover = tl_command_impairment && tl_command_impairment->no_lease_takeover;
+  lease_owned_ = no_takeover ? spot_.TryAcquireBodyLeaseNoTakeover() : spot_.AcquireBodyLease();
   if (!lease_owned_.load()) {
-    EmitLog(std::string("[command] ") + action_name + " rejected: no body lease (" + spot_.LastError() + ")");
+    EmitLog(std::string("[command] ") + action_name + " rejected: no body lease (" + spot_.LastError() + ")" +
+            (no_takeover ? " ; not taking it over on an impaired retry" : ""));
     return false;
   }
   EmitLog(std::string("[command] ") + action_name + " acquired body lease");
@@ -6624,6 +6781,7 @@ bool Adapter::ErrorSuggestsLostLease(const std::string& error) const {
 
 void Adapter::ResetLeaseState(bool clear_motion) {
   lease_owned_ = false;
+  ++lease_epoch_;
   last_lease_attempt_ms_ = 0;
   spot_.InvalidateBodyLease();
   if (!clear_motion) return;
@@ -6857,6 +7015,9 @@ void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
                                 std::abs(twist.linear().y()) >= tuning.twist_deadband ||
                                 std::abs(twist.angular().z()) >= tuning.twist_deadband ||
                                 std::abs(twist.angular().y()) >= tuning.twist_deadband;
+  // Counted before any gate: an operator reaching for the sticks ends an
+  // impaired hold even if this twist is ignored (DEV-17754).
+  if (requested_motion) ++operator_actions_;
   const auto maybe_log_rejection = [&](const char* reason) {
     if (!requested_motion) return;
     const long long now = now_ms();
@@ -6922,7 +7083,6 @@ void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
   }
 
   last_twist_ms_ = now;
-  if (has_motion) last_teleop_motion_ms_ = now;
 
   if (pitch_cmd_nonzero) {
     last_nonzero_cmd_ms_ = now;
@@ -8826,6 +8986,10 @@ std::string Adapter::BuildGraphNavNavStateJson(
   long long localize_at_ms = 0;
   bool localize_confirmed = true;
   std::string localize_unconfirmed_reason;
+  bool hold_active = false;
+  std::string hold_command;
+  std::string hold_fault;
+  long long hold_deadline_ms = 0;
   const bool localized = localization && !localization->waypoint_id.empty();
   const bool has_current_seed_pose = localized && localization->has_seed_tform_body;
   double current_seed_x = 0.0;
@@ -8870,7 +9034,12 @@ std::string Adapter::BuildGraphNavNavStateJson(
     localize_at_ms = localize_at_ms_;
     localize_confirmed = localization_confirmation_.confirmed();
     localize_unconfirmed_reason = localization_confirmation_.pending_reason();
+    hold_active = command_hold_active_;
+    hold_command = command_hold_command_;
+    hold_fault = command_hold_fault_;
+    hold_deadline_ms = command_hold_deadline_ms_;
   }
+  const long long hold_remaining_ms = hold_active ? std::max(0LL, hold_deadline_ms - now_ms()) : 0;
 
   std::ostringstream oss;
   oss << "{\"connected\":" << (connected ? "true" : "false")
@@ -8902,7 +9071,14 @@ std::string Adapter::BuildGraphNavNavStateJson(
       << ",\"localize_unconfirmed_reason\":\"" << json_escape(localize_unconfirmed_reason) << "\""
       << ",\"has_current_seed_pose\":" << (has_current_seed_pose ? "true" : "false")
       << ",\"has_seed_goal\":" << (has_seed_goal ? "true" : "false")
-      << ",\"has_waypoint_goal\":" << (has_waypoint_goal ? "true" : "false");
+      << ",\"has_waypoint_goal\":" << (has_waypoint_goal ? "true" : "false")
+      << ",\"command_hold_active\":" << (hold_active ? "true" : "false")
+      << ",\"command_hold_command\":\"" << json_escape(hold_command) << "\""
+      << ",\"command_hold_remaining_ms\":" << hold_remaining_ms
+      << ",\"command_hold_text\":\""
+      << json_escape(hold_active ? impaired_hold_status_text(hold_fault, hold_remaining_ms)
+                                 : std::string())
+      << "\"";
   if (has_current_seed_pose) {
     oss << ",\"current_seed_x\":" << current_seed_x
         << ",\"current_seed_y\":" << current_seed_y

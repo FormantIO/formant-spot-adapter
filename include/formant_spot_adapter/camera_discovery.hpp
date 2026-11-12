@@ -36,6 +36,12 @@ struct CameraDiscoveryTiming {
   long long missing_fast_ms{30000};
   long long missing_fast_window_ms{10 * 60 * 1000};
   long long missing_slow_ms{5 * 60 * 1000};
+  // If Spot has never answered this long after startup, start every pending
+  // stream anyway with its configured sources, as the adapter did before
+  // DEV-17754: a camera loop waits while Spot is unreachable and publishes once
+  // GetImage works, so a ListImageSources that never succeeds must not keep
+  // every camera dark. 0 or less turns this off.
+  long long unanswered_fallback_ms{2 * 60 * 1000};
 };
 
 class CameraDiscovery {
@@ -52,8 +58,12 @@ class CameraDiscovery {
   // Listings Spot has answered since the last reconnect.
   int answers() const { return answers_; }
 
-  // Spot did not answer: not connected, or the RPC failed.
-  void OnListFailed(long long now_ms);
+  // Spot did not answer: not connected, or the RPC failed. Returns the wants to
+  // start without a source list when the fallback is due (see
+  // CameraDiscoveryTiming::unanswered_fallback_ms), otherwise nothing.
+  std::vector<CameraWant> OnListFailed(long long now_ms);
+  // True once the fallback has started streams without a source list.
+  bool fell_back() const { return fell_back_; }
   // Spot answered. Returns the wants whose sources are all listed with a
   // non-zero size, in configured order; they leave the pending set.
   std::vector<CameraWant> OnListed(const std::vector<ImageSourceSize>& listing, long long now_ms);
@@ -69,7 +79,10 @@ class CameraDiscovery {
   std::vector<CameraWant> pending_;
   CameraDiscoveryTiming timing_;
   long long next_check_ms_{0};
+  long long created_ms_{0};
   long long first_answer_ms_{-1};
+  bool ever_answered_{false};
+  bool fell_back_{false};
   int unanswered_streak_{0};
   int answers_{0};
 };

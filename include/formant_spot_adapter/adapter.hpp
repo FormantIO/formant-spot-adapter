@@ -116,16 +116,27 @@ class Adapter {
                                 uint32_t nav_completed_before);
   uint32_t NavCompletedCommandId();
   void CommandExecutionLoop();
-  // Records that the running command was refused because the robot is
-  // impaired (ROBOT_IMPAIRED from GraphNav, or a dock step that failed while
-  // Spot reported a critical fault). Read by CommandExecutionLoop.
-  void NoteCommandImpaired(const std::string& detail);
+  // Records that the command running on the command thread was refused
+  // because the robot is impaired (ROBOT_IMPAIRED from GraphNav, or a dock step
+  // that failed while Spot reported a critical fault), with GraphNav's named
+  // causes. A no-op on any other thread, so background navigation (the
+  // lease-retain poll, the teleop dock loop) can never mark or clear it.
+  void NoteCommandImpaired(const std::string& detail, const std::vector<std::string>& cause_ids);
+  // Spends the command's one impaired self-right (none on the retry pass).
+  // Always true off the command thread, which keeps its old behaviour.
+  bool TakeSelfRightBudget();
+  // What can change under a held command (operator actions, lease, connection,
+  // queued commands); see HoldWatch in impaired_retry.hpp.
+  HoldWatch CurrentHoldWatch();
   // Waits, bounded by impaired_retry_window_sec, for the fault behind a
   // ROBOT_IMPAIRED refusal to clear. See impaired_retry.hpp.
-  ImpairedHoldResult HoldImpairedCommand(const v1::model::CommandRequest& request);
+  ImpairedHoldResult HoldImpairedCommand(const v1::model::CommandRequest& request,
+                                         const HoldWatch& watch_at_command_start,
+                                         const std::string& failure_fault,
+                                         const std::vector<std::string>& cause_ids);
   // Reads Spot's robot state once for the impaired hold (and keeps the shared
-  // degraded state in step).
-  ImpairmentSample SampleImpairment();
+  // degraded state in step). cause_ids are GraphNav's named causes.
+  ImpairmentSample SampleImpairment(const std::vector<std::string>& cause_ids = {});
   bool ExecuteCameraCalibrateCommand();
   bool ExecuteWaypointGotoCommand(const v1::model::CommandRequest& request);
   bool ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest& request);
@@ -427,12 +438,12 @@ class Adapter {
   std::atomic<bool> spot_degraded_non_estop_{false};
   // Counts transitions to connected, so a loop can tell a reconnect happened.
   std::atomic<unsigned> spot_connect_generation_{0};
-  // Set when the running command was refused as impaired; see NoteCommandImpaired.
-  std::atomic<bool> command_impaired_{false};
-  std::mutex command_impaired_mu_;
-  std::string command_impaired_detail_;
-  // Last teleop twist that asked for motion; cancels an impaired hold.
-  std::atomic<long long> last_teleop_motion_ms_{0};
+  // Bumped whenever the adapter loses or gives up the body lease; an impaired
+  // hold that sees it change is not retried.
+  std::atomic<unsigned long long> lease_epoch_{0};
+  // Bumped on every teleop button press and every teleop twist asking for
+  // motion; an impaired hold that sees it change is not retried.
+  std::atomic<unsigned long long> operator_actions_{0};
   // Consecutive map restore attempts that failed because Spot's GraphNav
   // service was not answering; sets the restore backoff.
   std::atomic<int> map_restore_failures_{0};
@@ -488,6 +499,13 @@ class Adapter {
   double last_nav_remaining_route_m_{0.0};
   long long last_nav_progress_change_ms_{0};
   std::string last_nav_state_payload_;
+  // An impaired command being held (DEV-17754), published on spot.nav.state so
+  // a mission driver can see why the command has not answered yet. Guarded by
+  // nav_state_mu_.
+  bool command_hold_active_{false};
+  std::string command_hold_command_;
+  std::string command_hold_fault_;
+  long long command_hold_deadline_ms_{0};
   std::string nav_phase_{"idle"};
   std::string nav_terminal_result_;
   std::string nav_terminal_reason_;

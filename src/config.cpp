@@ -1,4 +1,5 @@
 #include "formant_spot_adapter/config.hpp"
+#include "formant_spot_adapter/impaired_retry.hpp"
 
 #include <cstdlib>
 #include <cctype>
@@ -254,7 +255,7 @@ void apply_json_config(const config::AdapterConfig& j, Config* c) {
     c->graphnav_command_timeout_sec = j.graphnav_command_timeout_sec().value();
   }
   if (j.has_impaired_retry_window_sec()) {
-    c->impaired_retry_window_sec = j.impaired_retry_window_sec().value();
+    c->impaired_retry_window_sec = clamp_impaired_retry_window_sec(j.impaired_retry_window_sec().value());
   }
   for (const auto& stream_control : j.stream_controls()) {
     if (stream_control.stream().empty()) continue;
@@ -414,8 +415,8 @@ Config load_config_from_env() {
   c.maps_text_stream = getenv_or("MAPS_TEXT_STREAM", c.maps_text_stream);
   c.graphnav_command_timeout_sec =
       getenv_int_or("GRAPHNAV_COMMAND_TIMEOUT_SEC", c.graphnav_command_timeout_sec);
-  c.impaired_retry_window_sec =
-      getenv_int_or("IMPAIRED_RETRY_WINDOW_SEC", c.impaired_retry_window_sec);
+  c.impaired_retry_window_sec = clamp_impaired_retry_window_sec(
+      getenv_int_or("IMPAIRED_RETRY_WINDOW_SEC", c.impaired_retry_window_sec));
   c.map_process_topology_on_commit =
       getenv_bool_or("MAP_PROCESS_TOPOLOGY_ON_COMMIT", c.map_process_topology_on_commit);
   return c;

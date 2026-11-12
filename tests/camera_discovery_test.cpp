@@ -118,7 +118,9 @@ int main() {
 
   // Not answering: 1, 2, 4, 8, 16, 30, 30 s between attempts.
   {
-    CameraDiscovery d(walt_wants(), 0);
+    fsa::CameraDiscoveryTiming no_fallback;
+    no_fallback.unanswered_fallback_ms = 0;
+    CameraDiscovery d(walt_wants(), 0, no_fallback);
     long long now = 0;
     const long long expected[] = {1000, 2000, 4000, 8000, 16000, 30000, 30000};
     for (long long gap : expected) {
@@ -129,6 +131,30 @@ int main() {
       now += gap;
     }
     check(d.unanswered_streak() == 7, "streak counted");
+  }
+
+  // Spot never answers: after 2 minutes every stream starts anyway with its
+  // configured sources (the behaviour before this change), once.
+  {
+    CameraDiscovery d(walt_wants(), 0);
+    long long now = 0;
+    std::vector<fsa::CameraWant> started;
+    while (!d.Done() && now <= 10 * 60 * 1000) {
+      if (d.Due(now)) {
+        for (auto& w : d.OnListFailed(now)) started.push_back(w);
+      }
+      now += 100;
+    }
+    check(d.Done() && d.fell_back(), "fallback started everything");
+    check(started.size() == 5, "all five streams started by the fallback");
+    check(now - 100 >= 120000 && now - 100 <= 150000,
+          "fallback at the first attempt after 2 min, at " + std::to_string(now - 100));
+  }
+  // Once Spot has answered, the fallback never applies.
+  {
+    CameraDiscovery d({{"spot.right.image", {"right_fisheye_image"}}}, 0);
+    (void)d.OnListed(body_cameras(0, 0), 0);
+    check(d.OnListFailed(10 * 60 * 1000).empty() && !d.Done(), "no fallback after an answer");
   }
 
   // Missing after an answer: every 30 s for 10 minutes, then every 5 minutes.

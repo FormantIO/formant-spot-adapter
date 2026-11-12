@@ -21,23 +21,32 @@ const ImageSourceSize* find_source(const std::vector<ImageSourceSize>& listing,
 
 CameraDiscovery::CameraDiscovery(std::vector<CameraWant> wants, long long now_ms,
                                  CameraDiscoveryTiming timing)
-    : timing_(timing), next_check_ms_(now_ms) {
+    : timing_(timing), next_check_ms_(now_ms), created_ms_(now_ms) {
   for (auto& want : wants) {
     if (want.stream.empty() || want.sources.empty()) continue;
     pending_.push_back(std::move(want));
   }
 }
 
-void CameraDiscovery::OnListFailed(long long now_ms) {
+std::vector<CameraWant> CameraDiscovery::OnListFailed(long long now_ms) {
   ++unanswered_streak_;
   next_check_ms_ = now_ms + backoff_delay_ms(unanswered_streak_, timing_.unanswered_initial_ms,
                                              timing_.unanswered_max_ms);
+  std::vector<CameraWant> fallback;
+  if (!ever_answered_ && timing_.unanswered_fallback_ms > 0 &&
+      now_ms - created_ms_ >= timing_.unanswered_fallback_ms) {
+    fallback = std::move(pending_);
+    pending_.clear();
+    fell_back_ = true;
+  }
+  return fallback;
 }
 
 std::vector<CameraWant> CameraDiscovery::OnListed(const std::vector<ImageSourceSize>& listing,
                                                   long long now_ms) {
   unanswered_streak_ = 0;
   ++answers_;
+  ever_answered_ = true;
   if (first_answer_ms_ < 0) first_answer_ms_ = now_ms;
 
   std::vector<CameraWant> ready;

@@ -131,7 +131,9 @@ value in `streamControls`.
   camera with a fault reports 0x0) does not disable its stream: the adapter re-checks it every
   30 s for 10 minutes, then every 5 minutes, and starts the stream when the source is valid,
   logging `configured source available again`. This applies to every camera stream, including
-  the stitched `spot.front.image` (both front sources must be valid). Left, right and back cameras
+  the stitched `spot.front.image` (both front sources must be valid). If Spot has not answered
+  once within 2 minutes of startup, every pending stream starts anyway with its configured sources,
+  as before. Left, right and back cameras
   that are ready together share one batched image request; one that comes up later gets its own.
 - `spot.left.image`, `spot.right.image`, and `spot.back.image` use the same cached-frame publish
   pattern: the adapter polls Spot at a lower configured rate, then republishes the latest JPEG at a
@@ -186,22 +188,40 @@ Additional non-GraphNav command-channel actions:
   `spot.graphnav.goto_pose`, `spot.graphnav.goto_pose_straight`, `spot.dock`,
   `spot.return_and_dock`). Spot refuses to walk with `ROBOT_IMPAIRED` while a critical fault is
   active, for example a body camera that drops to USB2 and comes back seconds later. When one of
-  these commands fails that way (GraphNav `STATUS_ROBOT_IMPAIRED`, or a dock step that fails while
-  Spot reports a critical or unclearable fault), the adapter does not answer at once. It reads the
-  robot state every second for up to `impairedRetryWindowSec` (default 20, env
-  `IMPAIRED_RETRY_WINDOW_SEC`, 0 turns this off) and, on the first read that shows no such fault,
-  runs the command once more from the start. The command response and the `spot.command.result`
-  line then report how the retry ended. It is not retried, and the result names the fault, when:
+  these commands fails that way (GraphNav `STATUS_ROBOT_IMPAIRED` at navigate or in feedback, or a
+  dock step that fails while Spot reports a critical or unclearable fault), the adapter does not
+  answer at once. It reads the robot state every second for up to `impairedRetryWindowSec`
+  (default 20, clamped to 0..60, env `IMPAIRED_RETRY_WINDOW_SEC`, 0 turns this off). After two
+  clear reads in a row it runs the command once more from the start, and the command response and
+  the `spot.command.result` line report how the retry ended. A read is clear only when no E-Stop is
+  asserted, the motors are on, no critical system fault, unclearable behavior fault or motor power
+  error is listed, and none of the faults GraphNav named in its `impaired_state` is still listed
+  (this catches service faults). While a command is held, `spot.nav.state` carries
+  `command_hold_active`, `command_hold_command`, `command_hold_remaining_ms` and
+  `command_hold_text` (`held: robot impaired (<fault>), retrying once when clear, 14s left`).
+  The hold ends without a retry when:
   - the fault is still active at the end of the window:
-    `ABORTED(robot impaired: <fault>, not cleared within 20s)`;
-  - a command that moves or stops the robot is queued meanwhile (`spot.graphnav.cancel`, another
-    walk or dock, `spot.sit`, `spot.stand`, ...), an operator drives with teleop, an E-Stop is
-    asserted, the connection to Spot drops, or the adapter stops:
+    `ABORTED(robot impaired: <fault>, not cleared within 20s)`, or an unclearable behavior fault
+    is seen: `ABORTED(robot impaired: <fault>, unclearable fault)`;
+  - anything a person or another client did since the command started could be overridden by the
+    retry: any teleop button press (including the Formant estop button, which is a safe power off,
+    and sit, stand, dock, recover, arm reset), any teleop twist asking for motion, the motors turned
+    off, an E-Stop, the body lease lost or taken by another client, a disconnect or reconnect, the
+    adapter stopping, or a queued command that moves or stops the robot or changes its map,
+    localization or arm (`spot.graphnav.cancel`, another walk or dock, `spot.sit`, `spot.stand`,
+    `spot.recover`, `spot.undock`, rotate, `spot.reset_arm`, `spot.camera.calibrate`, `spot.map.*`
+    except `set_default`, `spot.localize`, `spot.localize.confirm`, reboot):
     `STOPPED(robot impaired: <fault>, <why>)`;
+  - another navigation or a dock is still live (nothing is held then);
   - the retry is refused as impaired again: `ABORTED(robot impaired: <fault>, still impaired after
     one retry)`.
+  The retry takes the body lease only if nobody holds it (no takeover), and does no self-right:
+  one impaired episode does at most one self-right. While a queued command runs, its own thread
+  handles navigation impairment; the background navigation poll does not recover or re-send it.
+  Formant's command cancellation is not visible to the adapter (the agent API has no cancel
+  call), so a mission that wants to stop a held command must send `spot.graphnav.cancel`.
   `<fault>` is the first critical fault from the robot state, e.g. `camera_server: right camera
-  failed to initialize`, or the refusal itself when the robot state named none.
+  failed to initialize`, GraphNav's named cause, or the refusal itself when neither is known.
 - `spot.rotate_left`: rotate left in place by a requested angle. Parameter: `degrees`.
 - `spot.rotate_right`: rotate right in place by a requested angle. Parameter: `degrees`.
 - `spot.reset_arm`: explicit arm reset/stow; command path does not require active teleop heartbeat.

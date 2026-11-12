@@ -118,8 +118,18 @@ class SpotClient {
     std::vector<int> visible_fiducial_ids;
   };
 
+  // Why GraphNav said ROBOT_IMPAIRED (its RobotImpairedState). fault_ids use
+  // the same ids as RobotStateSnapshot's FaultInfo, so the adapter can tell
+  // whether a named cause is still listed.
+  struct ImpairedCause {
+    std::string status;  // e.g. "IMPAIRED_STATUS_SYSTEM_FAULT"
+    std::vector<std::string> fault_ids;
+    std::string detail;  // e.g. "camera_server: right camera failed to initialize"
+  };
+
   struct NavigationFeedbackSnapshot {
     int status{0};
+    ImpairedCause impaired;  // filled when status is STATUS_ROBOT_IMPAIRED
     double remaining_route_length{0.0};
     int body_movement_status{0};
     int goal_status{0};
@@ -296,6 +306,11 @@ class SpotClient {
   bool ProcessMapTopology(TopologyProcessResult* out_result);
   bool BuildGraphNavMapSnapshot(const StoredMap& map_data, GraphNavMapSnapshot* out_snapshot);
   bool UploadGraphMap(const StoredMap& map_data);
+  // Whether the last NavigateTo* call made on the calling thread was refused
+  // with STATUS_ROBOT_IMPAIRED, and GraphNav's reason when it was. Per thread,
+  // so a navigate from another thread cannot overwrite it.
+  bool LastNavigateImpaired(ImpairedCause* out_cause) const;
+
   // True once Spot's directory lists the GraphNav service and a client for it
   // exists. Right after a power-on it is not registered yet
   // (UnregisteredService); LastError() then says so.
