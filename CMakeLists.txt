@@ -135,6 +135,8 @@ add_executable(formant-spot-adapter
   src/localize_recovery.cpp
   src/localize_request.cpp
   src/map_processing_guard.cpp
+  src/impaired_retry.cpp
+  src/camera_discovery.cpp
   src/adapter.cpp
 )
 
@@ -250,6 +252,28 @@ target_include_directories(map-processing-guard-test PRIVATE
 )
 
 add_test(NAME map-processing-guard-test COMMAND map-processing-guard-test)
+
+add_executable(impaired-retry-test
+  tests/impaired_retry_test.cpp
+  src/impaired_retry.cpp
+)
+
+target_include_directories(impaired-retry-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME impaired-retry-test COMMAND impaired-retry-test)
+
+add_executable(camera-discovery-test
+  tests/camera_discovery_test.cpp
+  src/camera_discovery.cpp
+)
+
+target_include_directories(camera-discovery-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME camera-discovery-test COMMAND camera-discovery-test)
 
 add_executable(localize-recovery-test
   tests/localize_recovery_test.cpp

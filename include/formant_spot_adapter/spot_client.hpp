@@ -296,6 +296,10 @@ class SpotClient {
   bool ProcessMapTopology(TopologyProcessResult* out_result);
   bool BuildGraphNavMapSnapshot(const StoredMap& map_data, GraphNavMapSnapshot* out_snapshot);
   bool UploadGraphMap(const StoredMap& map_data);
+  // True once Spot's directory lists the GraphNav service and a client for it
+  // exists. Right after a power-on it is not registered yet
+  // (UnregisteredService); LastError() then says so.
+  bool GraphNavServiceReady();
   bool ClearGraph();
   // Number of waypoints in the graph currently loaded on the robot. Reads the
   // recording service's map stats first (no graph download). A zero or missing

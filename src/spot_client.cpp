@@ -2472,6 +2472,8 @@ bool SpotClient::EnsureGraphNavClient() {
   return true;
 }
 
+bool SpotClient::GraphNavServiceReady() { return EnsureGraphNavClient(); }
+
 bool SpotClient::EnsureGraphNavRecordingClient() {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (graph_nav_recording_client_) return true;

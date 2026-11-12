@@ -123,10 +123,16 @@ value in `streamControls`.
   changes, then republishes the cached JPEG at a stable output FPS. For camera-like playback in
   Formant, the `spot.localization.graphnav.image` stream also needs Formant-side video encoding/realtime
   stream configuration; otherwise the agent treats it as a throttled telemetry image stream.
-- If the hand camera source is missing or reports 0x0 at startup (the arm cameras come up after
-  the body after a reboot), `spot.hand.image` is not disabled for good: the adapter re-checks the
-  image sources every 30 s for 10 minutes, then every 5 minutes, and starts the stream when the
-  source is valid, logging `configured source available again`.
+- Camera streams start when Spot lists their image sources with a real size, not at a fixed
+  point in startup. After a power-on the adapter can start before Spot answers; it then asks
+  again after 1 s, 2 s, 4 s and so on up to every 30 s (logging `failed to list image sources`
+  on the 1st, 2nd, 4th, 8th ... attempt), and asks again at once after every reconnect. A source
+  that Spot lists as missing or 0x0 (the arm cameras come up after the body after a reboot; a body
+  camera with a fault reports 0x0) does not disable its stream: the adapter re-checks it every
+  30 s for 10 minutes, then every 5 minutes, and starts the stream when the source is valid,
+  logging `configured source available again`. This applies to every camera stream, including
+  the stitched `spot.front.image` (both front sources must be valid). Left, right and back cameras
+  that are ready together share one batched image request; one that comes up later gets its own.
 - `spot.left.image`, `spot.right.image`, and `spot.back.image` use the same cached-frame publish
   pattern: the adapter polls Spot at a lower configured rate, then republishes the latest JPEG at a
   stable output FPS. The right camera is rotated 180 degrees by default.
@@ -176,6 +182,26 @@ Additional non-GraphNav command-channel actions:
     `spot.waypoint.goto name="charging dock"` and `spot.return_and_dock` keep going to the same
     place. A name that points somewhere else is left alone and a warning is logged. Set
     `dock_home_alias` to `""` in the JSON config to turn the sync off.
+- Impaired retry for walk and dock commands (`spot.waypoint.goto`, `spot.waypoint.goto_straight`,
+  `spot.graphnav.goto_pose`, `spot.graphnav.goto_pose_straight`, `spot.dock`,
+  `spot.return_and_dock`). Spot refuses to walk with `ROBOT_IMPAIRED` while a critical fault is
+  active, for example a body camera that drops to USB2 and comes back seconds later. When one of
+  these commands fails that way (GraphNav `STATUS_ROBOT_IMPAIRED`, or a dock step that fails while
+  Spot reports a critical or unclearable fault), the adapter does not answer at once. It reads the
+  robot state every second for up to `impairedRetryWindowSec` (default 20, env
+  `IMPAIRED_RETRY_WINDOW_SEC`, 0 turns this off) and, on the first read that shows no such fault,
+  runs the command once more from the start. The command response and the `spot.command.result`
+  line then report how the retry ended. It is not retried, and the result names the fault, when:
+  - the fault is still active at the end of the window:
+    `ABORTED(robot impaired: <fault>, not cleared within 20s)`;
+  - a command that moves or stops the robot is queued meanwhile (`spot.graphnav.cancel`, another
+    walk or dock, `spot.sit`, `spot.stand`, ...), an operator drives with teleop, an E-Stop is
+    asserted, the connection to Spot drops, or the adapter stops:
+    `STOPPED(robot impaired: <fault>, <why>)`;
+  - the retry is refused as impaired again: `ABORTED(robot impaired: <fault>, still impaired after
+    one retry)`.
+  `<fault>` is the first critical fault from the robot state, e.g. `camera_server: right camera
+  failed to initialize`, or the refusal itself when the robot state named none.
 - `spot.rotate_left`: rotate left in place by a requested angle. Parameter: `degrees`.
 - `spot.rotate_right`: rotate right in place by a requested angle. Parameter: `degrees`.
 - `spot.reset_arm`: explicit arm reset/stow; command path does not require active teleop heartbeat.
@@ -287,9 +313,12 @@ Restart localization recovery:
   nothing can act on a pose recovery has applied but not yet accepted or cleared. The same window
   covers each `spot.localize` attempt.
 - Navigation is also refused while a map restore is pending ("map ... is still being restored to
-  the robot" in `spot.adapter.log`). The restore retries every 5 s and stays pending while the map
-  file under `<graphnav_store_dir>/maps/<map_id>` cannot be read, the upload fails, or another
-  client (for example the tablet) holds the body lease. To clear it, release the lease on the
+  the robot" in `spot.adapter.log`). The restore stays pending while Spot's GraphNav service is
+  not registered yet (right after a power-on), the map file under
+  `<graphnav_store_dir>/maps/<map_id>` cannot be read, the upload fails, or another client (for
+  example the tablet) holds the body lease. It retries every 5 s; while the GraphNav service is
+  missing or the upload fails it retries after 1 s, 2 s and 4 s first, starting over after each
+  reconnect, and it does not take the body lease until the service answers. To clear it, release the lease on the
   other client, or fix or replace the map files, or load a different map with `spot.map.load`.
   If none of these works, restart the adapter.
 - An accepted recovery leaves the localization unconfirmed (`localize_confirmed=false` on

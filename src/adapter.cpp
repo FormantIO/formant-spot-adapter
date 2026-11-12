@@ -5,6 +5,7 @@
 #include "formant_spot_adapter/graphnav_map_render.hpp"
 #include "formant_spot_adapter/localize_recovery.hpp"
 #include "formant_spot_adapter/map_processing_guard.hpp"
+#include "formant_spot_adapter/retry_backoff.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1901,6 +1902,41 @@ bool any_fault_requires_soft_recovery(const std::vector<SpotClient::FaultInfo>& 
   return false;
 }
 
+// "id: message" of the first fault that requires soft recovery, or "".
+std::string first_soft_recovery_fault(const std::vector<SpotClient::FaultInfo>& faults) {
+  for (const auto& fault : faults) {
+    if (!fault_requires_soft_recovery(fault)) continue;
+    if (fault.message.empty()) return fault.id;
+    return fault.id + ": " + fault.message;
+  }
+  return std::string();
+}
+
+// Why Spot is degraded (not E-Stopped, but a fault gates motion), or "" when it
+// is not: critical_system_fault, unclearable_behavior_fault or
+// motor_power_error. detail, when given, gets the fault itself, e.g.
+// "camera_server: right camera failed to initialize".
+std::string degraded_reason_from_robot_state(const SpotClient::RobotStateSnapshot& snap,
+                                             std::string* detail) {
+  if (detail) detail->clear();
+  if (snap.any_estopped) return std::string();
+  // Auxiliary service liveness faults should stay visible in telemetry and events,
+  // but they should not gate locomotion unless they escalate into system/behavior faults.
+  if (any_fault_requires_soft_recovery(snap.system_faults)) {
+    if (detail) *detail = first_soft_recovery_fault(snap.system_faults);
+    return "critical_system_fault";
+  }
+  if (any_fault_requires_soft_recovery(snap.behavior_faults)) {
+    if (detail) *detail = first_soft_recovery_fault(snap.behavior_faults);
+    return "unclearable_behavior_fault";
+  }
+  if (snap.motor_power_state == "error") {
+    if (detail) *detail = "motor power error";
+    return "motor_power_error";
+  }
+  return std::string();
+}
+
 std::string fault_event_key(const std::string& fault_type, const SpotClient::FaultInfo& fault) {
   std::string key = fault_type + ":" + fault.id;
   if (fault_type == "service" && !fault.message.empty()) {
@@ -2449,92 +2485,36 @@ bool Adapter::Init() {
   DisableConfiguredStreamIfDisabled(&cfg_.waypoint_text_stream, "waypoint_text_stream");
   DisableConfiguredStreamIfDisabled(&cfg_.maps_text_stream, "maps_text_stream");
 
-  std::vector<SpotClient::ImageSourceInfo> sources;
-  if (SpotConnected() && spot_.ListImageSources(&sources)) {
-    std::unordered_map<std::string, SpotClient::ImageSourceInfo> source_map;
-    for (const auto& src : sources) {
-      source_map[src.name] = src;
+  // Camera streams are not checked against Spot's image sources here: after a
+  // power-on Spot may not answer yet, and a source can be missing or 0x0 for a
+  // while (an arm that boots after the body, a body camera with a fault).
+  // CameraDiscoveryLoop asks until Spot answers and starts each stream once its
+  // sources are listed with a real size (DEV-17754).
+  camera_stream_specs_.clear();
+  const auto add_camera_spec = [this](CameraStreamSpec::Kind kind, const std::string& stream,
+                                      std::vector<std::string> sources, bool rotate_180) {
+    if (stream.empty()) return;
+    for (const auto& source : sources) {
+      if (source.empty()) return;
     }
-    std::cerr << "[camera] available image sources (" << sources.size() << "):" << std::endl;
-    for (const auto& src : sources) {
-      std::cerr << "  - " << src.name << " (" << src.cols << "x" << src.rows << ")" << std::endl;
-    }
-
-    // retry_later: instead of disabling the stream for the life of the
-    // process, hand it to a DeferredCameraLoop that keeps checking. Used for
-    // the hand camera, which reports 0x0 (or is not listed yet) when the
-    // adapter starts before the arm has finished booting.
-    const auto validate_configured_source = [&source_map, this](std::string* source, std::string* stream,
-                                                                bool retry_later) {
-      if (!source || !stream) return;
-      if (source->empty() || stream->empty()) return;
-      const std::string src = *source;
-      const std::string out_stream = *stream;
-      const char* disabled_note =
-          retry_later ? " (stream deferred, retrying source discovery)" : " (stream disabled)";
-      auto it = source_map.find(src);
-      if (it == source_map.end()) {
-        std::cerr << "[camera] configured source missing: source=" << src
-                  << " stream=" << out_stream << disabled_note << std::endl;
-        if (retry_later) deferred_camera_sources_.push_back({src, out_stream});
-        source->clear();
-        stream->clear();
-        return;
-      }
-      if (it->second.cols <= 0 || it->second.rows <= 0) {
-        std::cerr << "[camera] configured source unavailable: source=" << src
-                  << " stream=" << out_stream
-                  << " size=" << it->second.cols << "x" << it->second.rows
-                  << disabled_note << std::endl;
-        if (retry_later) deferred_camera_sources_.push_back({src, out_stream});
-        source->clear();
-        stream->clear();
-        return;
-      }
-      std::cerr << "[camera] stream config: stream=" << out_stream << " source=" << src
-                << " size=" << it->second.cols << "x" << it->second.rows << std::endl;
-    };
-    deferred_camera_sources_.clear();
-    validate_configured_source(&cfg_.camera_source, &cfg_.camera_stream_name, true);
-    validate_configured_source(&cfg_.left_camera_source, &cfg_.left_camera_stream_name, false);
-    validate_configured_source(&cfg_.right_camera_source, &cfg_.right_camera_stream_name, false);
-    validate_configured_source(&cfg_.back_camera_source, &cfg_.back_camera_stream_name, false);
-
-    if (!cfg_.front_image_stream_name.empty()) {
-      const auto left_it = source_map.find(cfg_.front_left_camera_source);
-      const auto right_it = source_map.find(cfg_.front_right_camera_source);
-      const bool left_ok = left_it != source_map.end() &&
-                           left_it->second.cols > 0 &&
-                           left_it->second.rows > 0;
-      const bool right_ok = right_it != source_map.end() &&
-                            right_it->second.cols > 0 &&
-                            right_it->second.rows > 0;
-      if (!left_ok || !right_ok) {
-        std::cerr << "[camera] stitched front stream disabled:"
-                  << " left_source=" << cfg_.front_left_camera_source
-                  << " right_source=" << cfg_.front_right_camera_source
-                  << " reason=" << (!left_ok ? "left unavailable " : "")
-                  << (!right_ok ? "right unavailable" : "")
-                  << std::endl;
-        cfg_.front_image_stream_name.clear();
-      } else {
-        std::cerr << "[camera] stitched front stream config: stream=" << cfg_.front_image_stream_name
-                  << " left_source=" << cfg_.front_left_camera_source
-                  << " right_source=" << cfg_.front_right_camera_source
-                  << " output_fps=" << std::max(1, cfg_.front_image_fps)
-                  << " data_poll_hz=" << std::max(1, cfg_.front_image_poll_hz)
-                  << " roll_degrees="
-                  << (cfg_.front_image_roll_degrees_configured
-                          ? std::to_string(cfg_.front_image_roll_degrees)
-                          : std::string("auto"))
-                  << " left_size=" << left_it->second.cols << "x" << left_it->second.rows
-                  << " right_size=" << right_it->second.cols << "x" << right_it->second.rows
-                  << std::endl;
-      }
-    }
-  } else {
-    std::cerr << "[camera] failed to list image sources: " << spot_.LastError() << std::endl;
-  }
+    CameraStreamSpec spec;
+    spec.kind = kind;
+    spec.stream = stream;
+    spec.sources = std::move(sources);
+    spec.rotate_180 = rotate_180;
+    camera_stream_specs_.push_back(std::move(spec));
+  };
+  add_camera_spec(CameraStreamSpec::Kind::kHand, cfg_.camera_stream_name, {cfg_.camera_source}, false);
+  add_camera_spec(CameraStreamSpec::Kind::kSurround, cfg_.left_camera_stream_name,
+                  {cfg_.left_camera_source}, false);
+  add_camera_spec(CameraStreamSpec::Kind::kSurround, cfg_.right_camera_stream_name,
+                  {cfg_.right_camera_source}, cfg_.right_camera_rotate_180);
+  add_camera_spec(CameraStreamSpec::Kind::kSurround, cfg_.back_camera_stream_name,
+                  {cfg_.back_camera_source}, false);
+  add_camera_spec(CameraStreamSpec::Kind::kFront, cfg_.front_image_stream_name,
+                  {cfg_.front_left_camera_source, cfg_.front_right_camera_source}, false);
+  std::cerr << "[camera] " << camera_stream_specs_.size()
+            << " camera stream(s) start once Spot lists their image sources" << std::endl;
   if (!cfg_.localization_image_stream_name.empty()) {
     std::cerr << "[localization-image] stream config: stream=" << cfg_.localization_image_stream_name
               << " output_fps=" << std::max(1, cfg_.localization_image_fps)
@@ -2729,35 +2709,8 @@ void Adapter::Run() {
       [this](const v1::agent::GetTeleopHeartbeatStreamResponse& hb) { HandleHeartbeat(hb); },
       request_app_config_refresh);
 
-  camera_threads_.clear();
-  auto start_camera = [this](const std::string& source, const std::string& stream, int output_fps,
-                             int poll_hz, bool rotate_180, bool normalize_jpeg,
-                             int post_timeout_ms) {
-    if (source.empty() || stream.empty()) return;
-    camera_threads_.emplace_back(&Adapter::CameraLoop, this, source, stream, output_fps, poll_hz,
-                                 rotate_180, normalize_jpeg, post_timeout_ms);
-  };
-  const int hand_fps = std::max(1, cfg_.camera_fps);
-  const int surround_output_fps = std::max(1, cfg_.surround_camera_fps);
-  const int surround_poll_hz = std::max(1, cfg_.surround_camera_poll_hz);
-  start_camera(cfg_.camera_source, cfg_.camera_stream_name, hand_fps, hand_fps, false, false, 75);
-  for (const auto& deferred : deferred_camera_sources_) {
-    camera_threads_.emplace_back(&Adapter::DeferredCameraLoop, this, deferred.source,
-                                 deferred.stream, hand_fps, hand_fps, false, false, 75);
-  }
-  const bool have_surround_stream =
-      (!cfg_.left_camera_source.empty() && !cfg_.left_camera_stream_name.empty()) ||
-      (!cfg_.right_camera_source.empty() && !cfg_.right_camera_stream_name.empty()) ||
-      (!cfg_.back_camera_source.empty() && !cfg_.back_camera_stream_name.empty());
-  if (have_surround_stream) {
-    surround_image_thread_ = std::thread(&Adapter::SurroundImageLoop, this,
-                                         surround_output_fps, surround_poll_hz);
-  }
-  if (!cfg_.front_image_stream_name.empty()) {
-    front_image_thread_ = std::thread(&Adapter::FrontImageLoop, this,
-                                      cfg_.front_image_stream_name,
-                                      std::max(1, cfg_.front_image_fps),
-                                      std::max(1, cfg_.front_image_poll_hz));
+  if (!camera_stream_specs_.empty()) {
+    camera_discovery_thread_ = std::thread(&Adapter::CameraDiscoveryLoop, this);
   }
   if (!cfg_.localization_image_stream_name.empty()) {
     localization_image_thread_ = std::thread(&Adapter::LocalizationImageLoop, this,
@@ -2976,12 +2929,7 @@ void Adapter::Run() {
   app_config_cv_.notify_all();
   agent_.StopLoops();
   if (app_config_thread_.joinable()) app_config_thread_.join();
-  for (auto& t : camera_threads_) {
-    if (t.joinable()) t.join();
-  }
-  camera_threads_.clear();
-  if (surround_image_thread_.joinable()) surround_image_thread_.join();
-  if (front_image_thread_.joinable()) front_image_thread_.join();
+  if (camera_discovery_thread_.joinable()) camera_discovery_thread_.join();
   if (localization_image_thread_.joinable()) localization_image_thread_.join();
   if (graphnav_map_image_thread_.joinable()) graphnav_map_image_thread_.join();
   if (lease_thread_.joinable()) lease_thread_.join();
@@ -3009,41 +2957,130 @@ void Adapter::Stop() {
   agent_.StopLoops();
 }
 
-void Adapter::DeferredCameraLoop(const std::string& source, const std::string& stream,
-                                 int output_fps, int poll_hz, bool rotate_180,
-                                 bool normalize_jpeg, int post_timeout_ms) {
-  // Check every 30 s for the first 10 min after startup (an arm normally comes
-  // up within a couple of minutes of the body), then every 5 min.
-  constexpr long long kFastRetryMs = 30 * 1000;
-  constexpr long long kFastRetryWindowMs = 10 * 60 * 1000;
-  constexpr long long kSlowRetryMs = 5 * 60 * 1000;
+void Adapter::CameraDiscoveryLoop() {
+  std::vector<CameraWant> wants;
+  wants.reserve(camera_stream_specs_.size());
+  for (const auto& spec : camera_stream_specs_) wants.push_back({spec.stream, spec.sources});
   const long long started_ms = now_ms();
-  long long next_check_ms = started_ms + kFastRetryMs;
-  int checks = 0;
+  CameraDiscovery discovery(std::move(wants), started_ms);
+  std::vector<std::thread> threads;
+  std::unordered_set<std::string> unready_logged;
+  unsigned seen_generation = spot_connect_generation_.load();
+  bool sources_logged = false;
 
-  while (running_) {
-    if (now_ms() < next_check_ms) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      continue;
+  while (running_ && !discovery.Done()) {
+    const unsigned generation = spot_connect_generation_.load();
+    if (generation != seen_generation) {
+      seen_generation = generation;
+      discovery.OnReconnected(now_ms());
     }
     const long long now = now_ms();
-    next_check_ms =
-        now + ((now - started_ms) < kFastRetryWindowMs ? kFastRetryMs : kSlowRetryMs);
-    if (!SpotConnected()) continue;
-    ++checks;
-    std::vector<SpotClient::ImageSourceInfo> sources;
-    if (!spot_.ListImageSources(&sources)) continue;
-    for (const auto& info : sources) {
-      if (info.name != source || info.cols <= 0 || info.rows <= 0) continue;
-      EmitLog("[camera] configured source available again: source=" + source +
-              " stream=" + stream + " size=" + std::to_string(info.cols) + "x" +
-              std::to_string(info.rows) + " after_sec=" +
-              std::to_string((now_ms() - started_ms) / 1000) + " checks=" +
-              std::to_string(checks) + " (stream enabled)");
-      CameraLoop(source, stream, output_fps, poll_hz, rotate_180, normalize_jpeg,
-                 post_timeout_ms);
-      return;
+    if (!discovery.Due(now)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
     }
+
+    std::vector<SpotClient::ImageSourceInfo> sources;
+    const bool connected = SpotConnected();
+    if (!connected || !spot_.ListImageSources(&sources)) {
+      const std::string error = connected ? spot_.LastError() : std::string("robot unavailable");
+      discovery.OnListFailed(now);
+      const int streak = discovery.unanswered_streak();
+      // Log the 1st, 2nd, 4th, 8th ... failure, so a long boot is visible
+      // without a line every few seconds.
+      if ((streak & (streak - 1)) == 0) {
+        EmitLog("[camera] failed to list image sources: " + error + " (attempt " +
+                std::to_string(streak) + ", retrying in " +
+                std::to_string((discovery.next_check_ms() - now + 999) / 1000) +
+                " s; camera streams start when Spot answers)");
+      }
+      continue;
+    }
+
+    std::vector<ImageSourceSize> listing;
+    listing.reserve(sources.size());
+    for (const auto& src : sources) listing.push_back({src.name, src.cols, src.rows});
+    if (!sources_logged) {
+      sources_logged = true;
+      std::ostringstream oss;
+      oss << "[camera] available image sources (" << sources.size() << "):";
+      for (const auto& src : sources) {
+        oss << " " << src.name << "(" << src.cols << "x" << src.rows << ")";
+      }
+      EmitLog(oss.str());
+    }
+
+    const std::vector<CameraWant> ready = discovery.OnListed(listing, now);
+    for (const auto& want : discovery.pending()) {
+      if (!unready_logged.insert(want.stream).second) continue;
+      EmitLog("[camera] configured source unavailable: stream=" + want.stream + " " +
+              CameraDiscovery::Unready(want, listing) +
+              " (stream deferred, rechecking every 30 s for 10 min, then every 5 min)");
+    }
+    StartReadyCameraStreams(ready, now - started_ms, unready_logged, &threads);
+  }
+
+  for (auto& t : threads) {
+    if (t.joinable()) t.join();
+  }
+}
+
+void Adapter::StartReadyCameraStreams(const std::vector<CameraWant>& ready, long long waited_ms,
+                                      const std::unordered_set<std::string>& were_unready,
+                                      std::vector<std::thread>* threads) {
+  if (!threads) return;
+  const int hand_fps = std::max(1, cfg_.camera_fps);
+  std::vector<SurroundSource> surround;
+  for (const auto& want : ready) {
+    const CameraStreamSpec* spec = nullptr;
+    for (const auto& candidate : camera_stream_specs_) {
+      if (candidate.stream == want.stream) {
+        spec = &candidate;
+        break;
+      }
+    }
+    if (!spec || spec->sources.empty()) continue;
+
+    std::string source_text;
+    for (const auto& source : spec->sources) {
+      source_text += (source_text.empty() ? "" : ",") + source;
+    }
+    if (were_unready.count(spec->stream) > 0) {
+      EmitLog("[camera] configured source available again: stream=" + spec->stream +
+              " source=" + source_text + " after_sec=" + std::to_string(waited_ms / 1000) +
+              " (stream enabled)");
+    } else {
+      EmitLog("[camera] stream config: stream=" + spec->stream + " source=" + source_text);
+    }
+
+    switch (spec->kind) {
+      case CameraStreamSpec::Kind::kHand:
+        threads->emplace_back(&Adapter::CameraLoop, this, spec->sources.front(), spec->stream,
+                              hand_fps, hand_fps, false, false, 75);
+        break;
+      case CameraStreamSpec::Kind::kSurround:
+        surround.push_back({spec->sources.front(), spec->stream, spec->rotate_180});
+        break;
+      case CameraStreamSpec::Kind::kFront:
+        EmitLog("[camera] stitched front stream config: stream=" + spec->stream +
+                " output_fps=" + std::to_string(std::max(1, cfg_.front_image_fps)) +
+                " data_poll_hz=" + std::to_string(std::max(1, cfg_.front_image_poll_hz)) +
+                " roll_degrees=" +
+                (cfg_.front_image_roll_degrees_configured
+                     ? std::to_string(cfg_.front_image_roll_degrees)
+                     : std::string("auto")));
+        threads->emplace_back(&Adapter::FrontImageLoop, this, spec->stream,
+                              std::max(1, cfg_.front_image_fps),
+                              std::max(1, cfg_.front_image_poll_hz));
+        break;
+    }
+  }
+  // Surround cameras ready at the same time share one batched GetImage loop,
+  // as at startup before; one that comes up later gets its own.
+  if (!surround.empty()) {
+    threads->emplace_back(&Adapter::SurroundImageLoop, this,
+                          std::max(1, cfg_.surround_camera_fps),
+                          std::max(1, cfg_.surround_camera_poll_hz), std::move(surround));
   }
 }
 
@@ -3114,7 +3151,8 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
   if (sender.joinable()) sender.join();
 }
 
-void Adapter::SurroundImageLoop(int output_fps, int poll_hz) {
+void Adapter::SurroundImageLoop(int output_fps, int poll_hz,
+                                std::vector<SurroundSource> sources_in) {
   constexpr int kMaxImageFetchBackoffMs = 1000;
   const int output_period_ms = std::max(1, 1000 / std::max(1, output_fps));
   const int poll_period_ms = std::max(1, 1000 / std::max(1, poll_hz));
@@ -3146,18 +3184,9 @@ void Adapter::SurroundImageLoop(int output_fps, int poll_hz) {
   };
 
   std::vector<std::unique_ptr<SurroundStreamState>> stream_states;
-  if (!cfg_.left_camera_source.empty() && !cfg_.left_camera_stream_name.empty()) {
-    stream_states.push_back(make_stream_state(
-        cfg_.left_camera_source, cfg_.left_camera_stream_name, false, true, 250));
-  }
-  if (!cfg_.right_camera_source.empty() && !cfg_.right_camera_stream_name.empty()) {
-    stream_states.push_back(make_stream_state(
-        cfg_.right_camera_source, cfg_.right_camera_stream_name, cfg_.right_camera_rotate_180,
-        true, 250));
-  }
-  if (!cfg_.back_camera_source.empty() && !cfg_.back_camera_stream_name.empty()) {
-    stream_states.push_back(make_stream_state(
-        cfg_.back_camera_source, cfg_.back_camera_stream_name, false, true, 250));
+  for (const auto& in : sources_in) {
+    if (in.source.empty() || in.stream.empty()) continue;
+    stream_states.push_back(make_stream_state(in.source, in.stream, in.rotate_180, true, 250));
   }
   if (stream_states.empty()) return;
 
@@ -4228,6 +4257,11 @@ void Adapter::SetSpotConnected() {
   }
   if (!was_connected) {
     EmitLog("[spot] connection established");
+    ++spot_connect_generation_;
+    // Spot just came (back) up: try a pending map restore now, with the
+    // backoff restarted.
+    map_restore_failures_ = 0;
+    next_map_restore_attempt_ms_ = 0;
     const long long connected_ms = now_ms();
     bool restore_pending = false;
     {
@@ -4321,20 +4355,7 @@ std::string Adapter::BuildSpotConnectionJson() const {
 }
 
 void Adapter::UpdateDegradedStateFromRobotState(const SpotClient::RobotStateSnapshot& snap) {
-  std::string reason;
-  if (!snap.any_estopped) {
-    const bool has_critical_system_fault = any_fault_requires_soft_recovery(snap.system_faults);
-    // Auxiliary service liveness faults should stay visible in telemetry and events,
-    // but they should not gate locomotion unless they escalate into system/behavior faults.
-    const bool has_unclearable_behavior_fault = any_fault_requires_soft_recovery(snap.behavior_faults);
-    if (has_critical_system_fault) {
-      reason = "critical_system_fault";
-    } else if (has_unclearable_behavior_fault) {
-      reason = "unclearable_behavior_fault";
-    } else if (snap.motor_power_state == "error") {
-      reason = "motor_power_error";
-    }
-  }
+  const std::string reason = degraded_reason_from_robot_state(snap, nullptr);
 
   const bool degraded = !reason.empty();
   const bool was_degraded = spot_degraded_non_estop_.exchange(degraded);
@@ -4500,6 +4521,25 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
   }
   if (restore_map_id.empty()) return;
 
+  // After a power-on the adapter can reach Spot before Spot's GraphNav service
+  // is registered. Wait for it (1 s, 2 s, 4 s, then every 5 s; restarted on
+  // every reconnect) instead of taking the lease and failing the upload. The
+  // cap stays at the old fixed 5 s so the restore never starts later than it
+  // did, which matters for localize_recovery_max_restore_delay_sec.
+  const auto retry_later = [this, &restore_map_id, now](const std::string& what) {
+    const int failures = map_restore_failures_.load() + 1;
+    map_restore_failures_ = failures;
+    const long long delay = backoff_delay_ms(failures, 1000, 5000);
+    next_map_restore_attempt_ms_ = now + delay;
+    EmitLog("[graphnav] deferred restore " + what + " map_id=" + restore_map_id +
+            " error=" + spot_.LastError() + " (attempt " + std::to_string(failures) +
+            ", retrying in " + std::to_string(delay / 1000) + " s)");
+  };
+  if (!spot_.GraphNavServiceReady()) {
+    retry_later("waiting for the GraphNav service");
+    return;
+  }
+
   bool temporary_lease = false;
   if (!lease_owned_.load()) {
     if (!spot_.TryAcquireBodyLeaseNoTakeover()) {
@@ -4519,12 +4559,11 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
     return;
   }
   if (!spot_.UploadGraphMap(map_data)) {
-    EmitLog(std::string("[graphnav] deferred restore upload failed map_id=") + restore_map_id +
-            " error=" + spot_.LastError());
+    retry_later("upload failed");
     if (temporary_lease) (void)spot_.ReturnBodyLease();
-    next_map_restore_attempt_ms_ = now + 5000;
     return;
   }
+  map_restore_failures_ = 0;
   graph_left_empty_by_adapter_ = false;
   {
     // A freshly uploaded graph carries no trusted localization yet.
@@ -5070,20 +5109,105 @@ void Adapter::CommandExecutionLoop() {
     }
 
     command_action_in_progress_ = true;
-    const uint32_t nav_completed_before = NavCompletedCommandId();
-    const bool ok = ExecuteQueuedCommand(request);
+    command_impaired_ = false;
+    uint32_t nav_completed_before = NavCompletedCommandId();
+    bool ok = ExecuteQueuedCommand(request);
+    std::string result_text;
+    // Spot refused a walk or dock because a critical fault is active (DEV-17754).
+    // Such faults often clear within seconds (a body camera re-enumerating), so
+    // hold the command and retry it once when the fault clears; otherwise the
+    // result names the fault.
+    if (!ok && command_impaired_.load() && impaired_retry_applies(request.command()) &&
+        cfg_.impaired_retry_window_sec > 0) {
+      const long long window_ms = static_cast<long long>(cfg_.impaired_retry_window_sec) * 1000LL;
+      const ImpairedHoldResult hold = HoldImpairedCommand(request);
+      if (hold.end == ImpairedHoldEnd::kCleared) {
+        EmitLog("[command] impairment cleared after " + std::to_string(hold.waited_ms) +
+                " ms; retrying once command=" + request.command() + " id=" + request.id());
+        command_impaired_ = false;
+        nav_completed_before = NavCompletedCommandId();
+        ok = ExecuteQueuedCommand(request);
+        if (!ok && command_impaired_.load()) {
+          const ImpairmentSample now_state = SampleImpairment();
+          const std::string fault =
+              now_state.degraded && !now_state.fault.empty() ? now_state.fault : hold.fault;
+          result_text = impaired_again_result_text(fault);
+        }
+        EmitLog("[command] retry after impairment " + std::string(ok ? "succeeded" : "failed") +
+                " command=" + request.command() + " id=" + request.id());
+      } else {
+        result_text = impaired_hold_result_text(hold, window_ms);
+        EmitLog("[command] not retrying command=" + request.command() + " id=" + request.id() +
+                ": " + result_text);
+      }
+    }
     // Stamp here too, so a command shorter than one main-loop tick still
     // starts the post-autonomy lease hold.
     last_autonomy_activity_ms_ = now_ms();
     command_action_in_progress_ = false;
+    if (result_text.empty()) result_text = CommandResultText(request, ok, nav_completed_before);
     // The result text goes on its own stream first, then a plain response:
     // a text the agent throttles is lost on its own, never the response.
-    (void)agent_.PostText(kCommandResultStream,
-                          CommandResultText(request, ok, nav_completed_before));
+    (void)agent_.PostText(kCommandResultStream, result_text);
     agent_.SendCommandResponse(request.id(), ok);
   }
 }
 
+
+void Adapter::NoteCommandImpaired(const std::string& detail) {
+  {
+    std::lock_guard<std::mutex> lk(command_impaired_mu_);
+    command_impaired_detail_ = detail;
+  }
+  command_impaired_ = true;
+}
+
+ImpairmentSample Adapter::SampleImpairment() {
+  ImpairmentSample sample;
+  SpotClient::RobotStateSnapshot snap;
+  if (!SpotConnected() || !spot_.GetRobotStateSnapshot(&snap)) return sample;
+  UpdateDegradedStateFromRobotState(snap);
+  sample.read_ok = true;
+  sample.estopped = snap.any_estopped;
+  std::string fault;
+  sample.degraded = !degraded_reason_from_robot_state(snap, &fault).empty();
+  sample.fault = fault;
+  return sample;
+}
+
+ImpairedHoldResult Adapter::HoldImpairedCommand(const v1::model::CommandRequest& request) {
+  const long long window_ms = static_cast<long long>(cfg_.impaired_retry_window_sec) * 1000LL;
+  const long long hold_start_ms = now_ms();
+  std::string failure_fault;
+  {
+    std::lock_guard<std::mutex> lk(command_impaired_mu_);
+    failure_fault = command_impaired_detail_;
+  }
+  EmitLog("[command] " + request.command() + " id=" + request.id() +
+          " refused: robot impaired (" + failure_fault + "); holding up to " +
+          std::to_string(cfg_.impaired_retry_window_sec) + " s for the fault to clear");
+
+  ImpairedHoldHooks hooks;
+  hooks.now_ms = []() { return now_ms(); };
+  hooks.sleep_ms = [this](long long ms) {
+    const long long until = now_ms() + ms;
+    while (running_.load() && now_ms() < until) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  };
+  hooks.sample = [this]() { return SampleImpairment(); };
+  hooks.cancel_reason = [this, hold_start_ms]() -> std::string {
+    if (!running_.load()) return "adapter stopping";
+    if (!SpotConnected()) return "Spot connection lost";
+    if (last_teleop_motion_ms_.load() >= hold_start_ms) return "operator took teleop control";
+    std::lock_guard<std::mutex> lk(command_queue_mu_);
+    for (const auto& queued : command_queue_) {
+      if (supersedes_held_command(queued.command())) return "superseded by " + queued.command();
+    }
+    return std::string();
+  };
+  return hold_until_impairment_clears(window_ms, 1000, failure_fault, hooks);
+}
 
 uint32_t Adapter::NavCompletedCommandId() {
   std::lock_guard<std::mutex> lk(nav_state_mu_);
@@ -5215,6 +5339,9 @@ bool Adapter::WaitForGraphNavCommandResult(uint32_t command_id, long long timeou
     if (fb.status != Resp::STATUS_FOLLOWING_ROUTE) {
       EmitLog("[command] graphnav ended status=" + std::to_string(fb.status) +
               " (" + nav_status_name(fb.status) + ")");
+      if (fb.status == Resp::STATUS_ROBOT_IMPAIRED) {
+        NoteCommandImpaired("Navigation ended with STATUS_ROBOT_IMPAIRED");
+      }
       std::lock_guard<std::mutex> lk(nav_state_mu_);
       MarkGraphNavNavigationTerminalLocked(
           command_id, fb.status, fb.remaining_route_length, "failed",
@@ -5724,11 +5851,17 @@ bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
                                               waypoint_id, cfg_.graphnav_command_timeout_sec,
                                               &command_id));
     if (nav_ok) {
+      // An impairment that the self-right below recovered from is not why a
+      // later failure of this command happens.
+      command_impaired_ = false;
       if (out_command_id) *out_command_id = command_id;
       return true;
     }
 
     const std::string nav_error = spot_.LastError();
+    if (is_robot_impaired_error_text(nav_error)) {
+      NoteCommandImpaired("navigate failed: " + nav_error);
+    }
     if (is_not_localized_error_text(nav_error) && !retried_localization) {
       retried_localization = true;
       EmitLog("[graphnav] " + action_name + " navigate failed: not localized; relocalizing");
@@ -6177,10 +6310,21 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
     return false;
   }
 
+  // Docking has no ROBOT_IMPAIRED status of its own; a dock step that fails
+  // while Spot reports a critical fault counts as impaired, so the command is
+  // held and retried like a refused walk (DEV-17754).
+  const auto note_if_impaired = [this](const char* step) {
+    const ImpairmentSample state = SampleImpairment();
+    if (state.read_ok && state.degraded) {
+      NoteCommandImpaired(std::string(step) + " failed while impaired: " + state.fault);
+    }
+  };
+
   bool can_dock = false;
   if (!spot_.CanDock(dock_id, &can_dock) || !can_dock) {
     EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
             " dock unavailable id=" + std::to_string(dock_id));
+    note_if_impaired("dock check");
     return false;
   }
 
@@ -6209,6 +6353,7 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
       std::lock_guard<std::mutex> lk(map_mu_);
       ClearDockWaypointCandidateLocked();
     }
+    if (!lost_lease) note_if_impaired("dock");
     return false;
   }
   if (!return_and_dock) CommitDockWaypointCandidateOnSuccess();
@@ -6777,6 +6922,7 @@ void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
   }
 
   last_twist_ms_ = now;
+  if (has_motion) last_teleop_motion_ms_ = now;
 
   if (pitch_cmd_nonzero) {
     last_nonzero_cmd_ms_ = now;
