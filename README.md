@@ -365,7 +365,10 @@ Restart localization recovery:
   (`moved_ms` is then the write time). While odometry shows the body still, the timestamp
   (`updated_ms`) is refreshed once a minute, so a robot that stood still for hours still has a
   fresh record when it reboots; the age limit below therefore measures roughly the time since it
-  lost power. Without odometry there is no refresh. Nothing is saved while a restore is pending,
+  lost power. Without odometry there is no refresh. "Odometry" in these checks is the kinematic
+  odom frame and the vision frame: the body counts as moved if either moved, since kinematic
+  odometry may miss a powered robot carried or rolled on a cart. If the vision frame is missing,
+  the checks use odometry alone and say so in `spot.adapter.log`. Nothing is saved while a restore is pending,
   a map is recording, or the localization is unconfirmed.
 - The map restore runs at adapter start. It also runs while the adapter keeps running after a
   reconnect (a Spot body reboot drops the connection) when Spot's GraphNav map stats show an empty
@@ -394,7 +397,7 @@ Restart localization recovery:
     6 attempts (`localize_result=retrying` meanwhile). Any other failure is final: the robot is
     left unlocalized and no other guess is tried.
   - A retry reuses the first attempt's guess, so it is dropped (robot left unlocalized) if
-    odometry shows the body moved 0.1 m / 5 deg since that attempt, if any walk or dock command,
+    odometry or the vision frame shows the body moved 0.1 m / 5 deg since that attempt, if any walk or dock command,
     teleop motion or teleop button, GraphNav navigation or docking happened since, if
     `localize_recovery_max_restore_delay_sec` has passed since the first attempt, if a newer
     restore started or the active map changed, or when an operator runs `spot.localize`

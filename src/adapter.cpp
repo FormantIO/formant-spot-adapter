@@ -5862,7 +5862,17 @@ void Adapter::MaybePersistLastLocalization(const SpotClient::LocalizationSnapsho
     // from a move.
     std::lock_guard<std::mutex> lk(last_localization_mu_);
     last_localization_throttle_.ObserveOdom(now, localization.has_odom_tform_body,
-                                            localization.odom_tform_body);
+                                            localization.odom_tform_body,
+                                            localization.has_vision_tform_body,
+                                            localization.vision_tform_body);
+  }
+  if (localization.has_odom_tform_body && !localization.has_vision_tform_body) {
+    if (!vision_fallback_logged_.exchange(true)) {
+      EmitLog("[graphnav] vision frame missing from the localization state; last-localization "
+              "stillness check uses odometry only");
+    }
+  } else if (localization.has_vision_tform_body) {
+    vision_fallback_logged_ = false;
   }
   {
     // Never save a guess nobody has confirmed; the next restart would reuse it.
@@ -6181,6 +6191,8 @@ void Adapter::MaybeRetryLocalizationRecovery(long long now) {
     check.motion_epoch_at_first = recovery_retry_motion_epoch_;
     check.has_odom_at_first = recovery_retry_first_pose_.has_odom;
     check.odom_at_first = recovery_retry_first_pose_.odom_tform_body;
+    check.has_vision_at_first = recovery_retry_first_pose_.has_vision;
+    check.vision_at_first = recovery_retry_first_pose_.vision_tform_body;
   }
   auto later = [&](long long delay_ms) {
     std::lock_guard<std::mutex> lk(recovery_retry_mu_);
@@ -6225,8 +6237,16 @@ void Adapter::MaybeRetryLocalizationRecovery(long long now) {
   check.motion_epoch_now = motion_epoch_.load();
   check.has_odom_now = have_body && body.has_odom;
   check.odom_now = body.odom_tform_body;
+  check.has_vision_now = have_body && body.has_vision;
+  check.vision_now = body.vision_tform_body;
   check.map_activity = MapActivityBlocksRecovery();
   const RecoveryRetryGateDecision gate = CheckRecoveryRetry(check);
+  if (gate.gate == RecoveryRetryGate::kRun && !gate.vision_compared) {
+    EmitLog("[graphnav] restart localization recovery retry: vision frame unavailable "
+            "(attempt 1: " + std::string(check.has_vision_at_first ? "yes" : "no") +
+            ", now: " + std::string(check.has_vision_now ? "yes" : "no") +
+            "); motion check used odometry only");
+  }
   if (gate.gate == RecoveryRetryGate::kWait) {
     later(1000);
     return;

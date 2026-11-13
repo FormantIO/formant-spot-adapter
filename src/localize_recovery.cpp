@@ -284,8 +284,31 @@ bool BodyHeightUsable(const std::string& behavior_state) {
   return behavior_state == "not_ready" || behavior_state == "standing";
 }
 
+namespace {
+std::string moved_text(const char* frame, const LocalizePose& before, const LocalizePose& now,
+                       double max_m, double max_yaw_rad);
+}  // namespace
+
 std::string BodyMovedReason(const LocalizePose& before, const LocalizePose& now, double max_m,
                             double max_yaw_rad) {
+  return moved_text("odometry", before, now, max_m, max_yaw_rad);
+}
+
+std::string BodyMovedInEitherFrame(const LocalizePose& odom_before, const LocalizePose& odom_now,
+                                   bool has_vision_before, const LocalizePose& vision_before,
+                                   bool has_vision_now, const LocalizePose& vision_now,
+                                   bool* vision_compared) {
+  const bool compare_vision = has_vision_before && has_vision_now;
+  if (vision_compared) *vision_compared = compare_vision;
+  const std::string odom = BodyMovedReason(odom_before, odom_now);
+  if (!odom.empty()) return odom;
+  if (!compare_vision) return "";
+  return moved_text("the vision frame", vision_before, vision_now, 0.1, 0.08726646259971647);
+}
+
+namespace {
+std::string moved_text(const char* frame, const LocalizePose& before, const LocalizePose& now,
+                       double max_m, double max_yaw_rad) {
   double xy = 0.0;
   double z = 0.0;
   double yaw = 0.0;
@@ -294,11 +317,12 @@ std::string BodyMovedReason(const LocalizePose& before, const LocalizePose& now,
   std::ostringstream oss;
   oss.setf(std::ios::fixed);
   oss.precision(2);
-  oss << "odometry shows the body moved " << xy << " m";
+  oss << frame << " shows the body moved " << xy << " m";
   oss.precision(1);
   oss << " / " << yaw * 180.0 / kPi << " deg";
   return oss.str();
 }
+}  // namespace
 
 LastLocalizationThrottle::LastLocalizationThrottle(long long min_interval_ms, double min_move_m,
                                                    double min_turn_rad,
@@ -309,19 +333,31 @@ LastLocalizationThrottle::LastLocalizationThrottle(long long min_interval_ms, do
       refresh_interval_ms_(refresh_interval_ms) {}
 
 void LastLocalizationThrottle::ObserveOdom(long long now_ms, bool has_odom,
-                                           const LocalizePose& odom_tform_body) {
+                                           const LocalizePose& odom_tform_body, bool has_vision,
+                                           const LocalizePose& vision_tform_body) {
   if (!has_odom) {
     has_odom_ = false;
+    has_vision_ = false;
     still_since_ms_ = 0;
     return;
   }
   if (!has_odom_ || still_since_ms_ == 0 ||
-      !BodyMovedReason(still_anchor_, odom_tform_body).empty()) {
+      !BodyMovedInEitherFrame(still_anchor_, odom_tform_body, still_anchor_has_vision_,
+                              still_anchor_vision_, has_vision, vision_tform_body)
+           .empty()) {
     still_anchor_ = odom_tform_body;
+    still_anchor_has_vision_ = has_vision;
+    still_anchor_vision_ = vision_tform_body;
     still_since_ms_ = now_ms;
+  } else if (has_vision && !still_anchor_has_vision_) {
+    // Vision just became available: start comparing from here.
+    still_anchor_has_vision_ = true;
+    still_anchor_vision_ = vision_tform_body;
   }
   has_odom_ = true;
   odom_ = odom_tform_body;
+  has_vision_ = has_vision;
+  vision_ = vision_tform_body;
 }
 
 LastLocalizationThrottle::Reason LastLocalizationThrottle::Decide(const LastLocalization& current,
@@ -347,7 +383,10 @@ LastLocalizationThrottle::Reason LastLocalizationThrottle::Decide(const LastLoca
     if (angle_diff(yaw_of(current), yaw_of(last_)) >= min_turn_rad_) return Reason::kChanged;
   }
   // Odometry moved since the last write, even if GraphNav's pose barely did.
-  if (has_odom_ && has_odom_at_write_ && !BodyMovedReason(odom_at_write_, odom_).empty()) {
+  if (has_odom_ && has_odom_at_write_ &&
+      !BodyMovedInEitherFrame(odom_at_write_, odom_, has_vision_at_write_, vision_at_write_,
+                              has_vision_, vision_)
+           .empty()) {
     return Reason::kChanged;
   }
   // Still here: refresh the timestamp, but only on odometry's word that the
@@ -368,6 +407,8 @@ void LastLocalizationThrottle::MarkPersisted(const LastLocalization& rec, long l
   last_stamp_ms_ = now_ms;
   has_odom_at_write_ = has_odom_;
   odom_at_write_ = odom_;
+  has_vision_at_write_ = has_vision_;
+  vision_at_write_ = vision_;
 }
 
 void LastLocalizationThrottle::Seed(const LastLocalization& rec) {
@@ -377,6 +418,7 @@ void LastLocalizationThrottle::Seed(const LastLocalization& rec) {
   last_write_ms_ = 0;
   last_stamp_ms_ = rec.updated_ms;
   has_odom_at_write_ = false;
+  has_vision_at_write_ = false;
 }
 
 std::string FiducialFailureBlocksWaypointRecovery(const std::string& error_text) {
@@ -752,7 +794,10 @@ RecoveryRetryGateDecision CheckRecoveryRetry(const RecoveryRetryCheck& in) {
     d.reason = "odometry not available yet";
     return d;
   }
-  const std::string moved = BodyMovedReason(in.odom_at_first, in.odom_now);
+  const std::string moved =
+      BodyMovedInEitherFrame(in.odom_at_first, in.odom_now, in.has_vision_at_first,
+                             in.vision_at_first, in.has_vision_now, in.vision_now,
+                             &d.vision_compared);
   if (!moved.empty()) {
     d.reason = moved + " since the first attempt";
     return d;

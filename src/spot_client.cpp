@@ -1895,6 +1895,15 @@ bool SpotClient::GetBodyPoseSample(BodyPoseSample* out_sample) {
                               odom_tform_body.rotation().y(), odom_tform_body.rotation().z(),
                               odom_tform_body.rotation().w()};
   }
+  ::bosdyn::api::SE3Pose vision_tform_body;
+  if (::bosdyn::api::get_a_tform_b(snapshot, ::bosdyn::api::kVisionFrame,
+                                    ::bosdyn::api::kBodyFrame, &vision_tform_body)) {
+    sample.has_vision = true;
+    sample.vision_tform_body = {vision_tform_body.position().x(), vision_tform_body.position().y(),
+                                vision_tform_body.position().z(), vision_tform_body.rotation().x(),
+                                vision_tform_body.rotation().y(), vision_tform_body.rotation().z(),
+                                vision_tform_body.rotation().w()};
+  }
   ::bosdyn::api::SE3Pose gpe_tform_body;
   if (::bosdyn::api::get_a_tform_b(snapshot, ::bosdyn::api::kGroundPlaneEstimateFrame,
                                     ::bosdyn::api::kBodyFrame, &gpe_tform_body)) {
@@ -1961,6 +1970,19 @@ bool SpotClient::GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot) {
                                 odom_tform_body.position().z(), odom_tform_body.rotation().x(),
                                 odom_tform_body.rotation().y(), odom_tform_body.rotation().z(),
                                 odom_tform_body.rotation().w()};
+  }
+  ::bosdyn::api::SE3Pose vision_tform_body;
+  if (::bosdyn::api::get_a_tform_b(r.response.robot_kinematics().transforms_snapshot(),
+                                    ::bosdyn::api::kVisionFrame, ::bosdyn::api::kBodyFrame,
+                                    &vision_tform_body)) {
+    snapshot.has_vision_tform_body = true;
+    snapshot.vision_tform_body = {vision_tform_body.position().x(),
+                                  vision_tform_body.position().y(),
+                                  vision_tform_body.position().z(),
+                                  vision_tform_body.rotation().x(),
+                                  vision_tform_body.rotation().y(),
+                                  vision_tform_body.rotation().z(),
+                                  vision_tform_body.rotation().w()};
   }
   if (localization.has_seed_tform_body()) {
     snapshot.has_seed_tform_body = true;

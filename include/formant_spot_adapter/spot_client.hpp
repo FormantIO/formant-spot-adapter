@@ -178,6 +178,9 @@ class SpotClient {
     // adapter can tell whether the body moved without another RPC.
     bool has_odom_tform_body{false};
     LocalizePose odom_tform_body;
+    // Same for the vision frame, which also tracks motion without stepping.
+    bool has_vision_tform_body{false};
+    LocalizePose vision_tform_body;
   };
 
   // Localize against the loaded map from a guess of "the robot is here relative
@@ -339,7 +342,7 @@ class SpotClient {
   bool SetLocalizationAtWaypoint(const WaypointLocalizeRequest& request,
                                  const LocalizeAcceptancePolicy& policy,
                                  WaypointLocalizeResult* out_result);
-  // One robot state read: odom_tform_body, the body height above Spot's ground
+  // One robot state read: odom_tform_body, vision_tform_body, the body height above Spot's ground
   // plane estimate ("gpe" frame; about 0.5 m standing, lower sitting) and the
   // behavior state. False only when the robot state could not be read; missing
   // frames leave has_odom / has_body_height false.

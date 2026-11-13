@@ -464,6 +464,82 @@ void test_retry_gate() {
   }
 }
 
+void test_vision_frame() {
+  using R = fsa::LastLocalizationThrottle::Reason;
+  using G = fsa::RecoveryRetryGate;
+  const auto odom = odom_at(3.0, 4.0, 0.2);
+  const auto vis = odom_at(-7.0, 2.0, 1.1);
+  const auto vis_carried = odom_at(-6.6, 2.0, 1.1);  // rolled 0.4 m on a cart, no stepping
+  {
+    bool compared = false;
+    const std::string m =
+        fsa::BodyMovedInEitherFrame(odom, odom, true, vis, true, vis_carried, &compared);
+    check(compared && contains(m, "vision frame"), "odom still, vision moved: moved: " + m);
+    check(fsa::BodyMovedInEitherFrame(odom, odom, true, vis, true, odom_at(-6.97, 2.0, 1.1),
+                                      &compared)
+              .empty() && compared,
+          "both still (3 cm vision jitter): still");
+    const std::string fb =
+        fsa::BodyMovedInEitherFrame(odom, odom, false, vis, true, vis_carried, &compared);
+    check(fb.empty() && !compared, "vision missing at one end: odometry only, not compared");
+    check(!fsa::BodyMovedInEitherFrame(odom, odom_at(3.2, 4.0, 0.2), false, vis, false, vis,
+                                       &compared)
+               .empty(),
+          "vision missing: an odometry move still counts");
+  }
+  {
+    // Refresh: odometry still, vision moved -> a change, not a refresh.
+    fsa::LastLocalizationThrottle t(5000, 0.5, 0.2617993877991494, 60000);
+    const auto a = with_pose(rec("m", "wp-a"), 0.0, 0.0, 0.0);
+    t.ObserveOdom(1000, true, odom, true, vis);
+    t.MarkPersisted(a, 1000);
+    t.ObserveOdom(30000, true, odom, true, vis_carried);
+    check(t.Decide(a, 30000) == R::kChanged, "carried on a cart (vision moved): written as change");
+    t.MarkPersisted(a, 30000);
+    t.ObserveOdom(91000, true, odom, true, vis_carried);
+    check(t.Decide(a, 91000) == R::kRefresh, "then both still: refresh");
+  }
+  {
+    // Still in both frames for a whole interval after a restart: refresh.
+    fsa::LastLocalizationThrottle t(5000, 0.5, 0.2617993877991494, 60000);
+    auto a = with_pose(rec("m", "wp-a"), 0.0, 0.0, 0.0);
+    a.updated_ms = 1000;
+    t.Seed(a);
+    t.ObserveOdom(500000, true, odom, true, vis);
+    t.ObserveOdom(530000, true, odom, true, vis_carried);  // vision moved: anchor resets
+    t.ObserveOdom(570000, true, odom, true, vis_carried);
+    check(t.Decide(a, 570000) == R::kNone, "vision moved 40 s ago: no refresh yet");
+    t.ObserveOdom(591000, true, odom, true, vis_carried);
+    check(t.Decide(a, 591000) == R::kRefresh, "still in both frames for 61 s: refresh");
+  }
+  {
+    // Vision unavailable: falls back to odometry and still refreshes.
+    fsa::LastLocalizationThrottle t(5000, 0.5, 0.2617993877991494, 60000);
+    const auto a = with_pose(rec("m", "wp-a"), 0.0, 0.0, 0.0);
+    t.ObserveOdom(1000, true, odom);
+    t.MarkPersisted(a, 1000);
+    t.ObserveOdom(61000, true, odom);
+    check(t.Decide(a, 61000) == R::kRefresh, "no vision frame: odometry-only refresh");
+  }
+  {
+    auto c = retry_ok();
+    c.has_vision_at_first = true;
+    c.vision_at_first = vis;
+    c.has_vision_now = true;
+    c.vision_now = vis_carried;
+    const auto d = fsa::CheckRecoveryRetry(c);
+    check(d.gate == G::kDrop && contains(d.reason, "vision frame"),
+          "retry: odom still, vision moved: drop: " + d.reason);
+    c.vision_now = vis;
+    const auto ok = fsa::CheckRecoveryRetry(c);
+    check(ok.gate == G::kRun && ok.vision_compared, "retry: both still: run, vision compared");
+    c.has_vision_now = false;
+    const auto fb = fsa::CheckRecoveryRetry(c);
+    check(fb.gate == G::kRun && !fb.vision_compared,
+          "retry: vision unavailable: odometry only, reported as not compared");
+  }
+}
+
 void test_retry_window_keeps_state() {
   std::string refusal;
   {
@@ -1207,6 +1283,7 @@ int main() {
   test_motion_helpers();
   test_retry_gate();
   test_retry_window_keeps_state();
+  test_vision_frame();
   test_body_height_serialization();
   test_recovery_seed();
   test_pose_math();

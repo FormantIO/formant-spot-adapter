@@ -652,6 +652,9 @@ class Adapter {
   std::atomic<unsigned long long> motion_epoch_{0};
   // A spot.map.* command is running (HandleMapCommand).
   std::atomic<int> map_command_active_{0};
+  // Logged once each time the vision frame goes missing from the localization
+  // state, so motion checks fall back to odometry alone.
+  std::atomic<bool> vision_fallback_logged_{false};
   std::atomic<long long> last_nav_hold_log_ms_{0};
   std::atomic<long long> last_nav_diag_log_ms_{0};
   std::atomic<bool> force_waypoint_publish_{true};

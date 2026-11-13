@@ -269,6 +269,14 @@ struct RecoveryRetryCheck {
   LocalizePose odom_at_first;
   bool has_odom_now{false};
   LocalizePose odom_now;
+  // vision_tform_body at attempt 1 and now. Kinematic odometry may not see a
+  // powered robot carried or rolled on a cart without stepping; the vision frame
+  // (visual odometry) can. Compared when both readings have it; otherwise the
+  // check falls back to odometry alone.
+  bool has_vision_at_first{false};
+  LocalizePose vision_at_first;
+  bool has_vision_now{false};
+  LocalizePose vision_now;
   // A spot.map.* command is running or queued, or recording or map processing
   // is active.
   bool map_activity{false};
@@ -277,6 +285,8 @@ enum class RecoveryRetryGate { kRun, kWait, kDrop };
 struct RecoveryRetryGateDecision {
   RecoveryRetryGate gate{RecoveryRetryGate::kDrop};
   std::string reason;
+  // False when the vision frame was missing and only odometry was compared.
+  bool vision_compared{false};
 };
 RecoveryRetryGateDecision CheckRecoveryRetry(const RecoveryRetryCheck& in);
 
@@ -368,6 +378,8 @@ bool LoadLastLocalization(const std::string& path, LastLocalization* out);
 struct BodyPoseSample {
   bool has_odom{false};
   LocalizePose odom_tform_body;
+  bool has_vision{false};
+  LocalizePose vision_tform_body;
   bool has_body_height{false};
   double body_height_m{0.0};
   // "not_ready", "transition", "standing", "stepping" or "unknown".
@@ -385,6 +397,14 @@ bool BodyHeightUsable(const std::string& behavior_state);
 std::string BodyMovedReason(const LocalizePose& before, const LocalizePose& now,
                             double max_m = 0.1, double max_yaw_rad = 0.08726646259971647);
 
+// The body moved if odometry or the vision frame moved (same limits). Odometry
+// is always compared; vision only when both readings have it, and
+// `vision_compared` (optional) says whether it was. Empty when still.
+std::string BodyMovedInEitherFrame(const LocalizePose& odom_before, const LocalizePose& odom_now,
+                                   bool has_vision_before, const LocalizePose& vision_before,
+                                   bool has_vision_now, const LocalizePose& vision_now,
+                                   bool* vision_compared = nullptr);
+
 // Decides when a fresh localization is worth writing to disk. GraphNav reports
 // localization every poll. A write is due:
 //   - kChanged: first record, a different waypoint or map, the pose moved 0.5 m
@@ -394,6 +414,8 @@ std::string BodyMovedReason(const LocalizePose& before, const LocalizePose& now,
 //   - kRefresh: `refresh_interval_ms` since the saved timestamp and odometry has
 //     shown the body still (within 0.1 m / 5 deg) since the last write or for the
 //     whole refresh interval. moved_ms is kept. No odometry, no refresh.
+// "Odometry" here is the kinematic odom frame plus, when available, the vision
+// frame: the body counts as moved if either moved (BodyMovedInEitherFrame).
 // A refresh interval of 0 turns refreshes off. A saved stamp ahead of the clock
 // (the clock was set back) is rewritten as kChanged.
 class LastLocalizationThrottle {
@@ -406,7 +428,8 @@ class LastLocalizationThrottle {
                                     long long refresh_interval_ms = 60000);
 
   // Call on every poll, before Decide.
-  void ObserveOdom(long long now_ms, bool has_odom, const LocalizePose& odom_tform_body);
+  void ObserveOdom(long long now_ms, bool has_odom, const LocalizePose& odom_tform_body,
+                   bool has_vision = false, const LocalizePose& vision_tform_body = {});
   Reason Decide(const LastLocalization& current, long long now_ms) const;
   bool ShouldPersist(const LastLocalization& current, long long now_ms) const {
     return Decide(current, now_ms) != Reason::kNone;
@@ -434,11 +457,17 @@ class LastLocalizationThrottle {
   // Latest odometry, and the stretch over which it has been still.
   bool has_odom_{false};
   LocalizePose odom_;
+  bool has_vision_{false};
+  LocalizePose vision_;
   LocalizePose still_anchor_;
+  bool still_anchor_has_vision_{false};
+  LocalizePose still_anchor_vision_;
   long long still_since_ms_{0};
-  // Odometry when the last write happened.
+  // Odometry (and vision) when the last write happened.
   bool has_odom_at_write_{false};
   LocalizePose odom_at_write_;
+  bool has_vision_at_write_{false};
+  LocalizePose vision_at_write_;
 };
 
 // Whether a failed nearest-fiducial localization leaves anything for a waypoint
