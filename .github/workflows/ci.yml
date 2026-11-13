@@ -62,6 +62,12 @@ jobs:
             tests/localize_recovery_test.cpp src/localize_recovery.cpp src/command_params.cpp
           run_target map-processing-guard-test \
             tests/map_processing_guard_test.cpp src/map_processing_guard.cpp
+          run_target impaired-retry-test \
+            tests/impaired_retry_test.cpp src/impaired_retry.cpp
+          run_target camera-discovery-test \
+            tests/camera_discovery_test.cpp src/camera_discovery.cpp
+          run_target command-cancel-test \
+            tests/command_cancel_test.cpp src/command_cancel.cpp src/impaired_retry.cpp
 
   build:
     name: Build and ctest
@@ -106,5 +112,6 @@ jobs:
             formant-agent-client-test dock-preflight-test \
             autonomy-lease-hold-test \
             localize-recovery-test localize-request-test \
-            map-processing-guard-test
+            map-processing-guard-test impaired-retry-test camera-discovery-test \
+            command-cancel-test
           ctest --output-on-failure

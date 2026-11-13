@@ -1,10 +1,12 @@
 #include "formant_spot_adapter/adapter.hpp"
 #include "formant_spot_adapter/command_result.hpp"
+#include "formant_spot_adapter/command_cancel.hpp"
 #include "formant_spot_adapter/autonomy_lease_hold.hpp"
 #include "formant_spot_adapter/command_params.hpp"
 #include "formant_spot_adapter/graphnav_map_render.hpp"
 #include "formant_spot_adapter/localize_recovery.hpp"
 #include "formant_spot_adapter/map_processing_guard.hpp"
+#include "formant_spot_adapter/retry_backoff.hpp"
 
 #include <algorithm>
 #include <array>
@@ -41,6 +43,41 @@ long long now_ms() {
   using namespace std::chrono;
   return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
+
+// Impairment state of the command the command thread is running (DEV-17754).
+// CommandExecutionLoop points tl_command_impairment at a local for each
+// command; every other thread sees nullptr, so background navigation (the
+// lease-retain poll, the teleop dock loop) can never mark, clear or spend it.
+struct CommandImpairment {
+  bool impaired{false};
+  std::string detail;
+  std::vector<std::string> cause_ids;
+  // The operator-action counter when the command started; the dock step
+  // does not call AutoDock if it changed (decide_dock_start).
+  unsigned long long operator_actions_at_start{0};
+  // Set when a cancel stopped this command.
+  bool cancelled{false};
+  // A cancel that found nothing to stop: no autonomy stamp afterwards.
+  bool idle_noop{false};
+  // A cancel that found nothing live and nothing unconfirmed to stop.
+  bool nothing_to_hold{false};
+  // For a running spot.graphnav.cancel: it already ended queued walks.
+  bool cancel_stopped_queued{false};
+  // A cancel's stop could not be confirmed: the navigation is left active so
+  // hold position runs next.
+  bool stop_unconfirmed{false};
+  uint32_t unconfirmed_nav_id{0};
+  std::string unconfirmed_reason;
+  // The result line when the command stopped itself for another reason, e.g.
+  // STOPPED(operator action) from the dock step.
+  std::string stopped_text;
+  // Self-rights this command may still do after an impaired refusal: one on
+  // the first pass, none on the retry.
+  int self_right_budget{1};
+  // On the retry, take the body lease only if nobody else holds it.
+  bool no_lease_takeover{false};
+};
+thread_local CommandImpairment* tl_command_impairment = nullptr;
 
 // localize_detail for one SetLocalization attempt (see FormatLocalizeDetail).
 std::string localize_detail(const SpotClient::WaypointLocalizeResult& r) {
@@ -1901,6 +1938,41 @@ bool any_fault_requires_soft_recovery(const std::vector<SpotClient::FaultInfo>& 
   return false;
 }
 
+// "id: message" of the first fault that requires soft recovery, or "".
+std::string first_soft_recovery_fault(const std::vector<SpotClient::FaultInfo>& faults) {
+  for (const auto& fault : faults) {
+    if (!fault_requires_soft_recovery(fault)) continue;
+    if (fault.message.empty()) return fault.id;
+    return fault.id + ": " + fault.message;
+  }
+  return std::string();
+}
+
+// Why Spot is degraded (not E-Stopped, but a fault gates motion), or "" when it
+// is not: critical_system_fault, unclearable_behavior_fault or
+// motor_power_error. detail, when given, gets the fault itself, e.g.
+// "camera_server: right camera failed to initialize".
+std::string degraded_reason_from_robot_state(const SpotClient::RobotStateSnapshot& snap,
+                                             std::string* detail) {
+  if (detail) detail->clear();
+  if (snap.any_estopped) return std::string();
+  // Auxiliary service liveness faults should stay visible in telemetry and events,
+  // but they should not gate locomotion unless they escalate into system/behavior faults.
+  if (any_fault_requires_soft_recovery(snap.system_faults)) {
+    if (detail) *detail = first_soft_recovery_fault(snap.system_faults);
+    return "critical_system_fault";
+  }
+  if (any_fault_requires_soft_recovery(snap.behavior_faults)) {
+    if (detail) *detail = first_soft_recovery_fault(snap.behavior_faults);
+    return "unclearable_behavior_fault";
+  }
+  if (snap.motor_power_state == "error") {
+    if (detail) *detail = "motor power error";
+    return "motor_power_error";
+  }
+  return std::string();
+}
+
 std::string fault_event_key(const std::string& fault_type, const SpotClient::FaultInfo& fault) {
   std::string key = fault_type + ":" + fault.id;
   if (fault_type == "service" && !fault.message.empty()) {
@@ -2026,8 +2098,7 @@ const char* nav_status_name(int status) {
 }
 
 bool is_robot_impaired_error_text(const std::string& error_text) {
-  return error_text.find("ROBOT_IMPAIRED") != std::string::npos ||
-         error_text.find("status=5") != std::string::npos;
+  return error_text_says_robot_impaired(error_text);
 }
 
 bool is_not_localized_error_text(const std::string& error_text) {
@@ -2449,92 +2520,36 @@ bool Adapter::Init() {
   DisableConfiguredStreamIfDisabled(&cfg_.waypoint_text_stream, "waypoint_text_stream");
   DisableConfiguredStreamIfDisabled(&cfg_.maps_text_stream, "maps_text_stream");
 
-  std::vector<SpotClient::ImageSourceInfo> sources;
-  if (SpotConnected() && spot_.ListImageSources(&sources)) {
-    std::unordered_map<std::string, SpotClient::ImageSourceInfo> source_map;
-    for (const auto& src : sources) {
-      source_map[src.name] = src;
+  // Camera streams are not checked against Spot's image sources here: after a
+  // power-on Spot may not answer yet, and a source can be missing or 0x0 for a
+  // while (an arm that boots after the body, a body camera with a fault).
+  // CameraDiscoveryLoop asks until Spot answers and starts each stream once its
+  // sources are listed with a real size (DEV-17754).
+  camera_stream_specs_.clear();
+  const auto add_camera_spec = [this](CameraStreamSpec::Kind kind, const std::string& stream,
+                                      std::vector<std::string> sources, bool rotate_180) {
+    if (stream.empty()) return;
+    for (const auto& source : sources) {
+      if (source.empty()) return;
     }
-    std::cerr << "[camera] available image sources (" << sources.size() << "):" << std::endl;
-    for (const auto& src : sources) {
-      std::cerr << "  - " << src.name << " (" << src.cols << "x" << src.rows << ")" << std::endl;
-    }
-
-    // retry_later: instead of disabling the stream for the life of the
-    // process, hand it to a DeferredCameraLoop that keeps checking. Used for
-    // the hand camera, which reports 0x0 (or is not listed yet) when the
-    // adapter starts before the arm has finished booting.
-    const auto validate_configured_source = [&source_map, this](std::string* source, std::string* stream,
-                                                                bool retry_later) {
-      if (!source || !stream) return;
-      if (source->empty() || stream->empty()) return;
-      const std::string src = *source;
-      const std::string out_stream = *stream;
-      const char* disabled_note =
-          retry_later ? " (stream deferred, retrying source discovery)" : " (stream disabled)";
-      auto it = source_map.find(src);
-      if (it == source_map.end()) {
-        std::cerr << "[camera] configured source missing: source=" << src
-                  << " stream=" << out_stream << disabled_note << std::endl;
-        if (retry_later) deferred_camera_sources_.push_back({src, out_stream});
-        source->clear();
-        stream->clear();
-        return;
-      }
-      if (it->second.cols <= 0 || it->second.rows <= 0) {
-        std::cerr << "[camera] configured source unavailable: source=" << src
-                  << " stream=" << out_stream
-                  << " size=" << it->second.cols << "x" << it->second.rows
-                  << disabled_note << std::endl;
-        if (retry_later) deferred_camera_sources_.push_back({src, out_stream});
-        source->clear();
-        stream->clear();
-        return;
-      }
-      std::cerr << "[camera] stream config: stream=" << out_stream << " source=" << src
-                << " size=" << it->second.cols << "x" << it->second.rows << std::endl;
-    };
-    deferred_camera_sources_.clear();
-    validate_configured_source(&cfg_.camera_source, &cfg_.camera_stream_name, true);
-    validate_configured_source(&cfg_.left_camera_source, &cfg_.left_camera_stream_name, false);
-    validate_configured_source(&cfg_.right_camera_source, &cfg_.right_camera_stream_name, false);
-    validate_configured_source(&cfg_.back_camera_source, &cfg_.back_camera_stream_name, false);
-
-    if (!cfg_.front_image_stream_name.empty()) {
-      const auto left_it = source_map.find(cfg_.front_left_camera_source);
-      const auto right_it = source_map.find(cfg_.front_right_camera_source);
-      const bool left_ok = left_it != source_map.end() &&
-                           left_it->second.cols > 0 &&
-                           left_it->second.rows > 0;
-      const bool right_ok = right_it != source_map.end() &&
-                            right_it->second.cols > 0 &&
-                            right_it->second.rows > 0;
-      if (!left_ok || !right_ok) {
-        std::cerr << "[camera] stitched front stream disabled:"
-                  << " left_source=" << cfg_.front_left_camera_source
-                  << " right_source=" << cfg_.front_right_camera_source
-                  << " reason=" << (!left_ok ? "left unavailable " : "")
-                  << (!right_ok ? "right unavailable" : "")
-                  << std::endl;
-        cfg_.front_image_stream_name.clear();
-      } else {
-        std::cerr << "[camera] stitched front stream config: stream=" << cfg_.front_image_stream_name
-                  << " left_source=" << cfg_.front_left_camera_source
-                  << " right_source=" << cfg_.front_right_camera_source
-                  << " output_fps=" << std::max(1, cfg_.front_image_fps)
-                  << " data_poll_hz=" << std::max(1, cfg_.front_image_poll_hz)
-                  << " roll_degrees="
-                  << (cfg_.front_image_roll_degrees_configured
-                          ? std::to_string(cfg_.front_image_roll_degrees)
-                          : std::string("auto"))
-                  << " left_size=" << left_it->second.cols << "x" << left_it->second.rows
-                  << " right_size=" << right_it->second.cols << "x" << right_it->second.rows
-                  << std::endl;
-      }
-    }
-  } else {
-    std::cerr << "[camera] failed to list image sources: " << spot_.LastError() << std::endl;
-  }
+    CameraStreamSpec spec;
+    spec.kind = kind;
+    spec.stream = stream;
+    spec.sources = std::move(sources);
+    spec.rotate_180 = rotate_180;
+    camera_stream_specs_.push_back(std::move(spec));
+  };
+  add_camera_spec(CameraStreamSpec::Kind::kHand, cfg_.camera_stream_name, {cfg_.camera_source}, false);
+  add_camera_spec(CameraStreamSpec::Kind::kSurround, cfg_.left_camera_stream_name,
+                  {cfg_.left_camera_source}, false);
+  add_camera_spec(CameraStreamSpec::Kind::kSurround, cfg_.right_camera_stream_name,
+                  {cfg_.right_camera_source}, cfg_.right_camera_rotate_180);
+  add_camera_spec(CameraStreamSpec::Kind::kSurround, cfg_.back_camera_stream_name,
+                  {cfg_.back_camera_source}, false);
+  add_camera_spec(CameraStreamSpec::Kind::kFront, cfg_.front_image_stream_name,
+                  {cfg_.front_left_camera_source, cfg_.front_right_camera_source}, false);
+  std::cerr << "[camera] " << camera_stream_specs_.size()
+            << " camera stream(s) start once Spot lists their image sources" << std::endl;
   if (!cfg_.localization_image_stream_name.empty()) {
     std::cerr << "[localization-image] stream config: stream=" << cfg_.localization_image_stream_name
               << " output_fps=" << std::max(1, cfg_.localization_image_fps)
@@ -2729,35 +2744,8 @@ void Adapter::Run() {
       [this](const v1::agent::GetTeleopHeartbeatStreamResponse& hb) { HandleHeartbeat(hb); },
       request_app_config_refresh);
 
-  camera_threads_.clear();
-  auto start_camera = [this](const std::string& source, const std::string& stream, int output_fps,
-                             int poll_hz, bool rotate_180, bool normalize_jpeg,
-                             int post_timeout_ms) {
-    if (source.empty() || stream.empty()) return;
-    camera_threads_.emplace_back(&Adapter::CameraLoop, this, source, stream, output_fps, poll_hz,
-                                 rotate_180, normalize_jpeg, post_timeout_ms);
-  };
-  const int hand_fps = std::max(1, cfg_.camera_fps);
-  const int surround_output_fps = std::max(1, cfg_.surround_camera_fps);
-  const int surround_poll_hz = std::max(1, cfg_.surround_camera_poll_hz);
-  start_camera(cfg_.camera_source, cfg_.camera_stream_name, hand_fps, hand_fps, false, false, 75);
-  for (const auto& deferred : deferred_camera_sources_) {
-    camera_threads_.emplace_back(&Adapter::DeferredCameraLoop, this, deferred.source,
-                                 deferred.stream, hand_fps, hand_fps, false, false, 75);
-  }
-  const bool have_surround_stream =
-      (!cfg_.left_camera_source.empty() && !cfg_.left_camera_stream_name.empty()) ||
-      (!cfg_.right_camera_source.empty() && !cfg_.right_camera_stream_name.empty()) ||
-      (!cfg_.back_camera_source.empty() && !cfg_.back_camera_stream_name.empty());
-  if (have_surround_stream) {
-    surround_image_thread_ = std::thread(&Adapter::SurroundImageLoop, this,
-                                         surround_output_fps, surround_poll_hz);
-  }
-  if (!cfg_.front_image_stream_name.empty()) {
-    front_image_thread_ = std::thread(&Adapter::FrontImageLoop, this,
-                                      cfg_.front_image_stream_name,
-                                      std::max(1, cfg_.front_image_fps),
-                                      std::max(1, cfg_.front_image_poll_hz));
+  if (!camera_stream_specs_.empty()) {
+    camera_discovery_thread_ = std::thread(&Adapter::CameraDiscoveryLoop, this);
   }
   if (!cfg_.localization_image_stream_name.empty()) {
     localization_image_thread_ = std::thread(&Adapter::LocalizationImageLoop, this,
@@ -2864,6 +2852,7 @@ void Adapter::Run() {
           EmitLog(std::string("[adapter] failed returning body lease: ") + spot_.LastError());
         }
         lease_owned_ = false;
+        ++lease_epoch_;
         desired_twist_valid_ = false;
         active_motion_source_ = kMotionSourceNone;
         {
@@ -2976,12 +2965,7 @@ void Adapter::Run() {
   app_config_cv_.notify_all();
   agent_.StopLoops();
   if (app_config_thread_.joinable()) app_config_thread_.join();
-  for (auto& t : camera_threads_) {
-    if (t.joinable()) t.join();
-  }
-  camera_threads_.clear();
-  if (surround_image_thread_.joinable()) surround_image_thread_.join();
-  if (front_image_thread_.joinable()) front_image_thread_.join();
+  if (camera_discovery_thread_.joinable()) camera_discovery_thread_.join();
   if (localization_image_thread_.joinable()) localization_image_thread_.join();
   if (graphnav_map_image_thread_.joinable()) graphnav_map_image_thread_.join();
   if (lease_thread_.joinable()) lease_thread_.join();
@@ -3009,41 +2993,137 @@ void Adapter::Stop() {
   agent_.StopLoops();
 }
 
-void Adapter::DeferredCameraLoop(const std::string& source, const std::string& stream,
-                                 int output_fps, int poll_hz, bool rotate_180,
-                                 bool normalize_jpeg, int post_timeout_ms) {
-  // Check every 30 s for the first 10 min after startup (an arm normally comes
-  // up within a couple of minutes of the body), then every 5 min.
-  constexpr long long kFastRetryMs = 30 * 1000;
-  constexpr long long kFastRetryWindowMs = 10 * 60 * 1000;
-  constexpr long long kSlowRetryMs = 5 * 60 * 1000;
+void Adapter::CameraDiscoveryLoop() {
+  std::vector<CameraWant> wants;
+  wants.reserve(camera_stream_specs_.size());
+  for (const auto& spec : camera_stream_specs_) wants.push_back({spec.stream, spec.sources});
   const long long started_ms = now_ms();
-  long long next_check_ms = started_ms + kFastRetryMs;
-  int checks = 0;
+  CameraDiscovery discovery(std::move(wants), started_ms);
+  std::vector<std::thread> threads;
+  std::unordered_set<std::string> unready_logged;
+  unsigned seen_generation = spot_connect_generation_.load();
+  bool sources_logged = false;
 
-  while (running_) {
-    if (now_ms() < next_check_ms) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      continue;
+  while (running_ && !discovery.Done()) {
+    const unsigned generation = spot_connect_generation_.load();
+    if (generation != seen_generation) {
+      seen_generation = generation;
+      discovery.OnReconnected(now_ms());
     }
     const long long now = now_ms();
-    next_check_ms =
-        now + ((now - started_ms) < kFastRetryWindowMs ? kFastRetryMs : kSlowRetryMs);
-    if (!SpotConnected()) continue;
-    ++checks;
-    std::vector<SpotClient::ImageSourceInfo> sources;
-    if (!spot_.ListImageSources(&sources)) continue;
-    for (const auto& info : sources) {
-      if (info.name != source || info.cols <= 0 || info.rows <= 0) continue;
-      EmitLog("[camera] configured source available again: source=" + source +
-              " stream=" + stream + " size=" + std::to_string(info.cols) + "x" +
-              std::to_string(info.rows) + " after_sec=" +
-              std::to_string((now_ms() - started_ms) / 1000) + " checks=" +
-              std::to_string(checks) + " (stream enabled)");
-      CameraLoop(source, stream, output_fps, poll_hz, rotate_180, normalize_jpeg,
-                 post_timeout_ms);
-      return;
+    if (!discovery.Due(now)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
     }
+
+    std::vector<SpotClient::ImageSourceInfo> sources;
+    const bool connected = SpotConnected();
+    if (!connected || !spot_.ListImageSources(&sources)) {
+      const std::string error = connected ? spot_.LastError() : std::string("robot unavailable");
+      const std::vector<CameraWant> fallback = discovery.OnListFailed(now);
+      if (!fallback.empty()) {
+        EmitLog("[camera] Spot has not listed image sources " +
+                std::to_string((now - started_ms) / 1000) +
+                " s after startup; starting the configured camera streams without the list");
+        StartReadyCameraStreams(fallback, now - started_ms, unready_logged, &threads);
+        continue;
+      }
+      const int streak = discovery.unanswered_streak();
+      // Log the 1st, 2nd, 4th, 8th ... failure, so a long boot is visible
+      // without a line every few seconds.
+      if ((streak & (streak - 1)) == 0) {
+        EmitLog("[camera] failed to list image sources: " + error + " (attempt " +
+                std::to_string(streak) + ", retrying in " +
+                std::to_string((discovery.next_check_ms() - now + 999) / 1000) +
+                " s; camera streams start when Spot answers)");
+      }
+      continue;
+    }
+
+    std::vector<ImageSourceSize> listing;
+    listing.reserve(sources.size());
+    for (const auto& src : sources) listing.push_back({src.name, src.cols, src.rows});
+    if (!sources_logged) {
+      sources_logged = true;
+      std::ostringstream oss;
+      oss << "[camera] available image sources (" << sources.size() << "):";
+      for (const auto& src : sources) {
+        oss << " " << src.name << "(" << src.cols << "x" << src.rows << ")";
+      }
+      EmitLog(oss.str());
+    }
+
+    const std::vector<CameraWant> ready = discovery.OnListed(listing, now);
+    for (const auto& want : discovery.pending()) {
+      if (!unready_logged.insert(want.stream).second) continue;
+      EmitLog("[camera] configured source unavailable: stream=" + want.stream + " " +
+              CameraDiscovery::Unready(want, listing) +
+              " (stream deferred, rechecking every 30 s for 10 min, then every 5 min)");
+    }
+    StartReadyCameraStreams(ready, now - started_ms, unready_logged, &threads);
+  }
+
+  for (auto& t : threads) {
+    if (t.joinable()) t.join();
+  }
+}
+
+void Adapter::StartReadyCameraStreams(const std::vector<CameraWant>& ready, long long waited_ms,
+                                      const std::unordered_set<std::string>& were_unready,
+                                      std::vector<std::thread>* threads) {
+  if (!threads) return;
+  const int hand_fps = std::max(1, cfg_.camera_fps);
+  std::vector<SurroundSource> surround;
+  for (const auto& want : ready) {
+    const CameraStreamSpec* spec = nullptr;
+    for (const auto& candidate : camera_stream_specs_) {
+      if (candidate.stream == want.stream) {
+        spec = &candidate;
+        break;
+      }
+    }
+    if (!spec || spec->sources.empty()) continue;
+
+    std::string source_text;
+    for (const auto& source : spec->sources) {
+      source_text += (source_text.empty() ? "" : ",") + source;
+    }
+    if (were_unready.count(spec->stream) > 0) {
+      EmitLog("[camera] configured source available again: stream=" + spec->stream +
+              " source=" + source_text + " after_sec=" + std::to_string(waited_ms / 1000) +
+              " (stream enabled)");
+    } else {
+      EmitLog("[camera] stream config: stream=" + spec->stream + " source=" + source_text);
+    }
+
+    switch (spec->kind) {
+      case CameraStreamSpec::Kind::kHand:
+        threads->emplace_back(&Adapter::CameraLoop, this, spec->sources.front(), spec->stream,
+                              hand_fps, hand_fps, false, false, 75);
+        break;
+      case CameraStreamSpec::Kind::kSurround:
+        surround.push_back({spec->sources.front(), spec->stream, spec->rotate_180});
+        break;
+      case CameraStreamSpec::Kind::kFront:
+        EmitLog("[camera] stitched front stream config: stream=" + spec->stream +
+                " output_fps=" + std::to_string(std::max(1, cfg_.front_image_fps)) +
+                " data_poll_hz=" + std::to_string(std::max(1, cfg_.front_image_poll_hz)) +
+                " roll_degrees=" +
+                (cfg_.front_image_roll_degrees_configured
+                     ? std::to_string(cfg_.front_image_roll_degrees)
+                     : std::string("auto")));
+        threads->emplace_back(&Adapter::FrontImageLoop, this, spec->stream,
+                              std::max(1, cfg_.front_image_fps),
+                              std::max(1, cfg_.front_image_poll_hz));
+        break;
+    }
+  }
+  // Surround cameras ready at the same time share one batched GetImage loop,
+  // as at startup before; one that comes up later gets its own.
+  if (!surround.empty()) {
+    threads->emplace_back(&Adapter::SurroundImageLoop, this,
+                          std::max(1, cfg_.surround_camera_fps),
+                          std::max(1, cfg_.surround_camera_poll_hz), std::move(surround));
   }
 }
 
@@ -3114,7 +3194,8 @@ void Adapter::CameraLoop(const std::string& source, const std::string& stream, i
   if (sender.joinable()) sender.join();
 }
 
-void Adapter::SurroundImageLoop(int output_fps, int poll_hz) {
+void Adapter::SurroundImageLoop(int output_fps, int poll_hz,
+                                std::vector<SurroundSource> sources_in) {
   constexpr int kMaxImageFetchBackoffMs = 1000;
   const int output_period_ms = std::max(1, 1000 / std::max(1, output_fps));
   const int poll_period_ms = std::max(1, 1000 / std::max(1, poll_hz));
@@ -3146,18 +3227,9 @@ void Adapter::SurroundImageLoop(int output_fps, int poll_hz) {
   };
 
   std::vector<std::unique_ptr<SurroundStreamState>> stream_states;
-  if (!cfg_.left_camera_source.empty() && !cfg_.left_camera_stream_name.empty()) {
-    stream_states.push_back(make_stream_state(
-        cfg_.left_camera_source, cfg_.left_camera_stream_name, false, true, 250));
-  }
-  if (!cfg_.right_camera_source.empty() && !cfg_.right_camera_stream_name.empty()) {
-    stream_states.push_back(make_stream_state(
-        cfg_.right_camera_source, cfg_.right_camera_stream_name, cfg_.right_camera_rotate_180,
-        true, 250));
-  }
-  if (!cfg_.back_camera_source.empty() && !cfg_.back_camera_stream_name.empty()) {
-    stream_states.push_back(make_stream_state(
-        cfg_.back_camera_source, cfg_.back_camera_stream_name, false, true, 250));
+  for (const auto& in : sources_in) {
+    if (in.source.empty() || in.stream.empty()) continue;
+    stream_states.push_back(make_stream_state(in.source, in.stream, in.rotate_180, true, 250));
   }
   if (stream_states.empty()) return;
 
@@ -4228,6 +4300,11 @@ void Adapter::SetSpotConnected() {
   }
   if (!was_connected) {
     EmitLog("[spot] connection established");
+    ++spot_connect_generation_;
+    // Spot just came (back) up: try a pending map restore now, with the
+    // backoff restarted.
+    map_restore_failures_ = 0;
+    next_map_restore_attempt_ms_ = 0;
     const long long connected_ms = now_ms();
     bool restore_pending = false;
     {
@@ -4257,6 +4334,7 @@ void Adapter::SetSpotDisconnected(const std::string& reason) {
   const bool was_connected = SpotConnected();
   spot_connection_state_ = 0;
   lease_owned_ = false;
+  ++lease_epoch_;
   spot_.InvalidateBodyLease();
   moving_ = false;
   ResetTeleopSlewState();
@@ -4321,20 +4399,7 @@ std::string Adapter::BuildSpotConnectionJson() const {
 }
 
 void Adapter::UpdateDegradedStateFromRobotState(const SpotClient::RobotStateSnapshot& snap) {
-  std::string reason;
-  if (!snap.any_estopped) {
-    const bool has_critical_system_fault = any_fault_requires_soft_recovery(snap.system_faults);
-    // Auxiliary service liveness faults should stay visible in telemetry and events,
-    // but they should not gate locomotion unless they escalate into system/behavior faults.
-    const bool has_unclearable_behavior_fault = any_fault_requires_soft_recovery(snap.behavior_faults);
-    if (has_critical_system_fault) {
-      reason = "critical_system_fault";
-    } else if (has_unclearable_behavior_fault) {
-      reason = "unclearable_behavior_fault";
-    } else if (snap.motor_power_state == "error") {
-      reason = "motor_power_error";
-    }
-  }
+  const std::string reason = degraded_reason_from_robot_state(snap, nullptr);
 
   const bool degraded = !reason.empty();
   const bool was_degraded = spot_degraded_non_estop_.exchange(degraded);
@@ -4500,6 +4565,25 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
   }
   if (restore_map_id.empty()) return;
 
+  // After a power-on the adapter can reach Spot before Spot's GraphNav service
+  // is registered. Wait for it (1 s, 2 s, 4 s, then every 5 s; restarted on
+  // every reconnect) instead of taking the lease and failing the upload. The
+  // cap stays at the old fixed 5 s so the restore never starts later than it
+  // did, which matters for localize_recovery_max_restore_delay_sec.
+  const auto retry_later = [this, &restore_map_id, now](const std::string& what) {
+    const int failures = map_restore_failures_.load() + 1;
+    map_restore_failures_ = failures;
+    const long long delay = backoff_delay_ms(failures, 1000, 5000);
+    next_map_restore_attempt_ms_ = now + delay;
+    EmitLog("[graphnav] deferred restore " + what + " map_id=" + restore_map_id +
+            " error=" + spot_.LastError() + " (attempt " + std::to_string(failures) +
+            ", retrying in " + std::to_string(delay / 1000) + " s)");
+  };
+  if (!spot_.GraphNavServiceReady()) {
+    retry_later("waiting for the GraphNav service");
+    return;
+  }
+
   bool temporary_lease = false;
   if (!lease_owned_.load()) {
     if (!spot_.TryAcquireBodyLeaseNoTakeover()) {
@@ -4519,12 +4603,11 @@ void Adapter::MaybeRestoreActiveMap(long long now) {
     return;
   }
   if (!spot_.UploadGraphMap(map_data)) {
-    EmitLog(std::string("[graphnav] deferred restore upload failed map_id=") + restore_map_id +
-            " error=" + spot_.LastError());
+    retry_later("upload failed");
     if (temporary_lease) (void)spot_.ReturnBodyLease();
-    next_map_restore_attempt_ms_ = now + 5000;
     return;
   }
+  map_restore_failures_ = 0;
   graph_left_empty_by_adapter_ = false;
   {
     // A freshly uploaded graph carries no trusted localization yet.
@@ -4766,7 +4849,20 @@ void Adapter::PollGraphNavNavigation(long long now) {
   }
 
   if (status == Resp::STATUS_ROBOT_IMPAIRED) {
-    const bool already_recovered = nav_auto_recovered_.exchange(true);
+    if (command_action_in_progress_.load()) {
+      // A queued command is running and its thread handles this impairment
+      // (WaitForGraphNavCommandResult, then the impaired hold). Recovering here
+      // too would start a second navigation behind its back (DEV-17754).
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      last_nav_status_ = status;
+      last_nav_remaining_route_m_ = fb.remaining_route_length;
+      return;
+    }
+    // A navigation a cancel stopped is never recovered or re-sent here; it is
+    // marked failed below like one that was already recovered once.
+    const bool already_recovered =
+        !poll_may_auto_recover(command_id, cancelled_nav_command_id_.load(), false,
+                               nav_auto_recovered_.exchange(true));
     std::string waypoint_name;
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
@@ -5039,13 +5135,59 @@ void Adapter::HandleHeartbeat(const v1::agent::GetTeleopHeartbeatStreamResponse&
 static const char* const kCommandResultStream = "spot.command.result";
 
 void Adapter::HandleCommand(const v1::model::CommandRequest& request) {
+  // Runs on the agent's command stream thread, not the command thread, so a
+  // cancel takes effect while a walk is still running (DEV-17754).
+  if (is_stop_command(request.command())) {
+    std::string text;
+    (void)ExtractCommandText(request, &text);
+    CancelInput in;
+    in.target_id = Trim(ExtractCommandParam(text, {"command_id"}));
+    CancelDecision decision;
+    {
+      std::lock_guard<std::mutex> lk(command_queue_mu_);
+      in.running_id = running_command_id_;
+      in.running_command = running_command_;
+      in.running_in_dock_phase = running_in_dock_phase_;
+      for (const auto& queued : command_queue_) {
+        in.queued.push_back({queued.request.id(), queued.request.command()});
+      }
+      decision = decide_cancel(in);
+      // Under the same lock as EnterDockPhase, so a cancel either lands before
+      // docking starts (and the dock is skipped) or sees the dock phase.
+      if (decision.stop_running) {
+        running_cancel_requested_ = true;
+        // Answered once the stop is confirmed, not now.
+        pending_cancel_answers_.push_back(request.id());
+      }
+      if (decision.remember_target) cancelled_targets_.Add(in.target_id, now_ms());
+      for (auto& queued : command_queue_) {
+        if (std::find(decision.cancel_queued_ids.begin(), decision.cancel_queued_ids.end(),
+                      queued.request.id()) != decision.cancel_queued_ids.end()) {
+          queued.cancelled = true;
+        }
+      }
+      if (decision.enqueue) {
+        command_queue_.push_front({request, false, false, !decision.cancel_queued_ids.empty()});
+      }
+    }
+    EmitLog(decision.log);
+    if (decision.enqueue) {
+      command_queue_cv_.notify_one();
+    } else if (!decision.stop_running) {
+      (void)agent_.PostText(kCommandResultStream, decision.result_text);
+      (void)agent_.SendCommandResponse(request.id(), decision.success);
+    }
+    return;
+  }
+
   bool reject = false;
   {
     std::lock_guard<std::mutex> lk(command_queue_mu_);
-    if (command_queue_.size() >= kMaxCommandQueueDepth) {
+    if (admit_command(request.command(), command_queue_.size(), kMaxCommandQueueDepth) ==
+        QueueAdmission::kReject) {
       reject = true;
     } else {
-      command_queue_.push_back(request);
+      command_queue_.push_back({request, false});
     }
   }
   if (reject) {
@@ -5061,29 +5203,407 @@ void Adapter::HandleCommand(const v1::model::CommandRequest& request) {
 void Adapter::CommandExecutionLoop() {
   while (running_.load()) {
     v1::model::CommandRequest request;
+    bool cancelled_while_queued = false;
+    bool internal = false;
+    bool stopped_queued = false;
+    bool cancelled_before_arrival = false;
     {
       std::unique_lock<std::mutex> lk(command_queue_mu_);
       command_queue_cv_.wait(lk, [this]() { return !running_.load() || !command_queue_.empty(); });
       if (!running_.load() && command_queue_.empty()) break;
-      request = command_queue_.front();
+      request = command_queue_.front().request;
+      cancelled_while_queued = command_queue_.front().cancelled;
+      internal = command_queue_.front().internal;
+      stopped_queued = command_queue_.front().stopped_queued;
       command_queue_.pop_front();
+      // A targeted cancel can arrive before its target (a reconnect may
+      // deliver them in that order).
+      cancelled_before_arrival =
+          !internal && cancelled_targets_.Take(request.id(), now_ms());
+      running_command_ = request.command();
+      running_command_id_ = request.id();
+      running_in_dock_phase_ = false;
+      running_cancel_requested_ = false;
+    }
+    struct RunningCommandReset {
+      Adapter* self;
+      ~RunningCommandReset() {
+        std::lock_guard<std::mutex> lk(self->command_queue_mu_);
+        self->running_command_.clear();
+        self->running_command_id_.clear();
+        self->running_in_dock_phase_ = false;
+        self->running_cancel_requested_ = false;
+      }
+    } running_command_reset{this};
+
+    // A walk or dock that a cancel ended while it was queued, or that a cancel
+    // named before it arrived, never starts.
+    if (cancelled_while_queued || cancelled_before_arrival) {
+      EmitLog("[command] not starting command=" + request.command() + " id=" + request.id() +
+              (cancelled_while_queued ? ": a spot.graphnav.cancel ended it while queued"
+                                      : ": a spot.graphnav.cancel named it before it arrived"));
+      (void)agent_.PostText(kCommandResultStream, stopped_by_cancel_result_text());
+      agent_.SendCommandResponse(request.id(), false);
+      continue;
     }
 
+    // Marked in progress first (so the idle lease return cannot run between
+    // the two), then the watch is taken before the first attempt, so a button
+    // press, a lease change or a reconnect during that attempt also stops a
+    // later retry.
     command_action_in_progress_ = true;
-    const uint32_t nav_completed_before = NavCompletedCommandId();
-    const bool ok = ExecuteQueuedCommand(request);
+    const HoldWatch watch_at_start = CurrentHoldWatch();
+    CommandImpairment impairment;
+    impairment.operator_actions_at_start = watch_at_start.operator_actions;
+    impairment.cancel_stopped_queued = stopped_queued;
+    tl_command_impairment = &impairment;
+    uint32_t nav_completed_before = NavCompletedCommandId();
+    // A cancel that arrived between taking the command and here: send nothing.
+    bool ok = stoppable_command(request.command()) && AbortIfCancelled(request.command())
+                  ? false
+                  : ExecuteQueuedCommand(request);
+    std::string result_text;
+    // Spot refused a walk or dock because a critical fault is active (DEV-17754).
+    // Such faults often clear within seconds (a body camera re-enumerating), so
+    // hold the command and retry it once when the fault clears; otherwise the
+    // result names the fault.
+    if (!ok && !impairment.cancelled && !CancelRequested() && impairment.stopped_text.empty() &&
+        impairment.impaired &&
+        impaired_retry_applies(request.command()) && cfg_.impaired_retry_window_sec > 0) {
+      std::string other_motion;
+      if (last_graph_nav_command_id_.load() != 0 || graphnav_navigation_active_.load()) {
+        other_motion = "another navigation is still active";
+      } else if (docking_in_progress_.load() || dock_loop_busy_.load()) {
+        other_motion = "a dock is in progress";
+      }
+      if (!other_motion.empty()) {
+        EmitLog("[command] not holding impaired command=" + request.command() + " id=" +
+                request.id() + ": " + other_motion);
+      } else {
+        const long long window_ms =
+            static_cast<long long>(cfg_.impaired_retry_window_sec) * 1000LL;
+        ImpairedHoldResult hold = HoldImpairedCommand(
+            request, watch_at_start, impairment.detail, impairment.cause_ids);
+        if (hold.end == ImpairedHoldEnd::kCleared) {
+          // One more read right before acting, so the motors-on and no-fault
+          // check is milliseconds old, not up to a poll interval.
+          const ImpairmentSample last = SampleImpairment(impairment.cause_ids);
+          const SampleVerdict verdict = classify_impairment_sample(last);
+          const std::string why = hold_cancel_reason(watch_at_start, CurrentHoldWatch());
+          if (!why.empty() || verdict == SampleVerdict::kEstopped ||
+              verdict == SampleVerdict::kPoweredOff) {
+            hold.end = ImpairedHoldEnd::kCancelled;
+            hold.cancel_reason = !why.empty() ? why
+                                 : verdict == SampleVerdict::kEstopped ? "E-Stop asserted"
+                                                                       : "robot powered off";
+          } else if (verdict != SampleVerdict::kClear) {
+            hold.end = ImpairedHoldEnd::kNotCleared;
+            hold.unclearable = verdict == SampleVerdict::kUnclearable;
+            if (!last.fault.empty()) hold.fault = last.fault;
+          }
+        }
+        if (hold.end == ImpairedHoldEnd::kCleared) {
+          EmitLog("[command] impairment cleared after " + std::to_string(hold.waited_ms) +
+                  " ms; retrying once command=" + request.command() + " id=" + request.id());
+          impairment.impaired = false;
+          impairment.self_right_budget = 0;
+          impairment.no_lease_takeover = true;
+          nav_completed_before = NavCompletedCommandId();
+          ok = AbortIfCancelled("the impaired retry") ? false : ExecuteQueuedCommand(request);
+          if (!ok && impairment.impaired) {
+            const ImpairmentSample now_state = SampleImpairment(impairment.cause_ids);
+            const std::string fault =
+                !now_state.fault.empty() ? now_state.fault : hold.fault;
+            result_text = impaired_again_result_text(fault);
+          }
+          EmitLog("[command] retry after impairment " + std::string(ok ? "succeeded" : "failed") +
+                  " command=" + request.command() + " id=" + request.id());
+        } else {
+          result_text = impaired_hold_result_text(hold, window_ms);
+          EmitLog("[command] not retrying command=" + request.command() + " id=" + request.id() +
+                  ": " + result_text);
+        }
+      }
+    }
+    // A cancel that ended this command (in its walk, its dock or its hold) is
+    // reported as such, whatever the command was doing.
+    if (!ok && impairment.stop_unconfirmed) {
+      result_text = "ABORTED(" + grammar_reason("stop not confirmed: " + impairment.unconfirmed_reason) + ")";
+    } else if (!ok && (impairment.cancelled || CancelRequested()) &&
+               stoppable_command(request.command())) {
+      result_text = stopped_by_cancel_result_text();
+    } else if (!ok && !impairment.stopped_text.empty()) {
+      result_text = impairment.stopped_text;
+    }
+    if (impairment.stop_unconfirmed) {
+      // The robot may still be walking: the walk's caller cleared the active
+      // navigation on its way out, so restore it and hold position next,
+      // before anything else runs.
+      last_graph_nav_command_id_ = impairment.unconfirmed_nav_id;
+      graphnav_navigation_active_ = true;
+      v1::model::CommandRequest hold;
+      hold.set_command("spot.graphnav.cancel");
+      hold.set_id("adapter-hold-after-unconfirmed-stop");
+      {
+        std::lock_guard<std::mutex> lk(command_queue_mu_);
+        command_queue_.push_front({hold, false, true, false});
+      }
+      command_queue_cv_.notify_one();
+      EmitLog("[command] stop not confirmed for command=" + request.command() + " id=" + request.id() +
+              " (" + impairment.unconfirmed_reason + "); holding position next");
+    }
+    // Cancels that arrived while this command ran and were not answered by a
+    // stop: the command ended on its own first, or was stopped without a walk
+    // to stop (in its hold, before sending anything).
+    {
+      const bool stopped = !ok && !impairment.stop_unconfirmed &&
+                           (impairment.cancelled || CancelRequested());
+      AnswerPendingCancels(stopped, stopped ? cancel_done_text() : cancel_ignored_finished_text());
+    }
+    tl_command_impairment = nullptr;
     // Stamp here too, so a command shorter than one main-loop tick still
-    // starts the post-autonomy lease hold.
-    last_autonomy_activity_ms_ = now_ms();
-    command_action_in_progress_ = false;
+    // starts the post-autonomy lease hold. Not for a cancel that found nothing
+    // to stop: that must not make the adapter keep a lease (DEV-17754).
+    if (!impairment.idle_noop) last_autonomy_activity_ms_ = now_ms();
+    // After an unconfirmed stop, stay "in progress" until the internal hold
+    // (queued at the front) has run, so no background loop owns the cancelled
+    // navigation in between.
+    command_action_in_progress_ = impairment.stop_unconfirmed;
+    if (result_text.empty()) result_text = CommandResultText(request, ok, nav_completed_before);
+    if (internal) {
+      switch (internal_hold_outcome(ok, impairment.nothing_to_hold)) {
+        case InternalHoldOutcome::kDone:
+          EmitLog("[command] adapter hold position after an unconfirmed stop done");
+          break;
+        case InternalHoldOutcome::kSuperseded:
+          EmitLog("[command] adapter hold position after an unconfirmed stop superseded: an "
+                  "earlier cancel already held the robot, nothing left to hold");
+          break;
+        case InternalHoldOutcome::kFailed:
+          // Keep the navigation marked active and the stop marked unconfirmed:
+          // spot.nav.state must not say idle while the robot may be walking,
+          // and the next cancel retries. The poll will not resume it
+          // (poll_may_auto_recover).
+          EmitLog("[command] adapter hold position after an unconfirmed stop FAILED; the walk "
+                  "stays marked active with its stop unconfirmed; the next spot.graphnav.cancel "
+                  "retries; check the robot");
+          break;
+      }
+      continue;
+    }
     // The result text goes on its own stream first, then a plain response:
     // a text the agent throttles is lost on its own, never the response.
-    (void)agent_.PostText(kCommandResultStream,
-                          CommandResultText(request, ok, nav_completed_before));
+    (void)agent_.PostText(kCommandResultStream, result_text);
     agent_.SendCommandResponse(request.id(), ok);
   }
 }
 
+
+void Adapter::NoteCommandImpaired(const std::string& detail,
+                                  const std::vector<std::string>& cause_ids) {
+  if (!tl_command_impairment) return;
+  tl_command_impairment->impaired = true;
+  tl_command_impairment->detail = detail;
+  tl_command_impairment->cause_ids = cause_ids;
+}
+
+bool Adapter::CancelRequested() const {
+  return tl_command_impairment && running_cancel_requested_.load();
+}
+
+bool Adapter::AbortIfCancelled(const std::string& what) {
+  if (!CancelRequested()) return false;
+  tl_command_impairment->cancelled = true;
+  EmitLog("[command] spot.graphnav.cancel: not sending " + what);
+  return true;
+}
+
+bool Adapter::EnterDockPhase() {
+  std::lock_guard<std::mutex> lk(command_queue_mu_);
+  if (running_cancel_requested_.load()) return false;
+  running_in_dock_phase_ = true;
+  return true;
+}
+
+void Adapter::LeaveDockPhase() {
+  std::lock_guard<std::mutex> lk(command_queue_mu_);
+  running_in_dock_phase_ = false;
+}
+
+StopConfirmation Adapter::StopAndConfirm(uint32_t nav_command_id) {
+  using Resp = ::bosdyn::api::graph_nav::NavigationFeedbackResponse;
+  StopConfirmHooks hooks;
+  hooks.stop = [this](std::string* error) {
+    if (spot_.StopMotion()) return true;
+    if (error) *error = spot_.LastError();
+    return false;
+  };
+  hooks.feedback = [this, nav_command_id]() {
+    StopFeedback fb;
+    SpotClient::NavigationFeedbackSnapshot snap;
+    if (nav_command_id != 0 && spot_.GetNavigationFeedbackSnapshot(nav_command_id, &snap)) {
+      fb.read_ok = true;
+      fb.following = snap.status == Resp::STATUS_FOLLOWING_ROUTE;
+    }
+    return fb;
+  };
+  hooks.sleep_ms = [](long long ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+  return confirm_stop(3, 200, hooks);
+}
+
+bool Adapter::StopForCancel(const std::string& what, uint32_t nav_command_id) {
+  if (tl_command_impairment) tl_command_impairment->cancelled = true;
+  // Whatever happens next, the background poll must not resume this walk.
+  if (nav_command_id != 0) cancelled_nav_command_id_ = nav_command_id;
+  nav_auto_recovered_ = true;
+  EmitLog("[command] spot.graphnav.cancel: stopping " + what + " now");
+  const StopConfirmation confirmation = StopAndConfirm(nav_command_id);
+  if (confirmation.confirmed) {
+    EmitLog("[command] spot.graphnav.cancel: stop confirmed after " +
+            std::to_string(confirmation.attempts) + " attempt(s)");
+    {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      if (nav_command_id != 0) {
+        MarkGraphNavNavigationTerminalLocked(nav_command_id, last_nav_status_,
+                                             last_nav_remaining_route_m_, "interrupted",
+                                             "Cancelled by spot.graphnav.cancel.", now_ms());
+      }
+      if (stop_unconfirmed_nav_id_ == nav_command_id) {
+        stop_unconfirmed_nav_id_ = 0;
+        stop_unconfirmed_reason_.clear();
+      }
+    }
+    AnswerPendingCancels(true, cancel_done_text());
+    return true;
+  }
+  EmitLog("[command] spot.graphnav.cancel: stop NOT confirmed after " +
+          std::to_string(confirmation.attempts) + " attempt(s): " + confirmation.reason);
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    stop_unconfirmed_nav_id_ = nav_command_id;
+    stop_unconfirmed_reason_ = confirmation.reason;
+  }
+  if (tl_command_impairment) {
+    tl_command_impairment->stop_unconfirmed = true;
+    tl_command_impairment->unconfirmed_nav_id = nav_command_id;
+    tl_command_impairment->unconfirmed_reason = confirmation.reason;
+  }
+  AnswerPendingCancels(false, cancel_not_confirmed_text(confirmation.reason));
+  return false;
+}
+
+void Adapter::AnswerPendingCancels(bool success, const std::string& result_text) {
+  std::vector<std::string> ids;
+  {
+    std::lock_guard<std::mutex> lk(command_queue_mu_);
+    ids.swap(pending_cancel_answers_);
+  }
+  for (const auto& id : ids) {
+    (void)agent_.PostText(kCommandResultStream, result_text);
+    (void)agent_.SendCommandResponse(id, success);
+  }
+}
+
+bool Adapter::TakeSelfRightBudget() {
+  if (!tl_command_impairment) return true;
+  if (tl_command_impairment->self_right_budget <= 0) {
+    EmitLog("[graphnav] skipping impaired self-right: this command already used its one");
+    return false;
+  }
+  --tl_command_impairment->self_right_budget;
+  return true;
+}
+
+HoldWatch Adapter::CurrentHoldWatch() {
+  HoldWatch watch;
+  watch.running = running_.load();
+  watch.connected = SpotConnected();
+  watch.connect_generation = spot_connect_generation_.load();
+  watch.lease_epoch = lease_epoch_.load();
+  watch.operator_actions = operator_actions_.load();
+  watch.cancelled = running_cancel_requested_.load();
+  std::lock_guard<std::mutex> lk(command_queue_mu_);
+  for (const auto& queued : command_queue_) {
+    watch.queued_commands.push_back(queued.request.command());
+  }
+  return watch;
+}
+
+ImpairmentSample Adapter::SampleImpairment(const std::vector<std::string>& cause_ids) {
+  ImpairmentSample sample;
+  SpotClient::RobotStateSnapshot snap;
+  if (!SpotConnected() || !spot_.GetRobotStateSnapshot(&snap)) return sample;
+  UpdateDegradedStateFromRobotState(snap);
+  sample.read_ok = true;
+  sample.estopped = snap.any_estopped;
+  sample.motor_power = snap.motor_power_state;
+  std::string fault;
+  sample.degraded = !degraded_reason_from_robot_state(snap, &fault).empty();
+  std::vector<std::string> present;
+  std::string present_cause;
+  for (const auto* list : {&snap.system_faults, &snap.service_faults, &snap.behavior_faults}) {
+    for (const auto& f : *list) {
+      present.push_back(f.id);
+      if (present_cause.empty() && any_cause_present(cause_ids, {f.id})) {
+        present_cause = f.message.empty() ? f.id : f.id + ": " + f.message;
+      }
+    }
+  }
+  for (const auto& f : snap.behavior_faults) {
+    if (f.severity == "unclearable") sample.unclearable = true;
+  }
+  sample.cause_present = any_cause_present(cause_ids, present);
+  sample.fault = !fault.empty() ? fault : present_cause;
+  return sample;
+}
+
+ImpairedHoldResult Adapter::HoldImpairedCommand(const v1::model::CommandRequest& request,
+                                                const HoldWatch& watch_at_command_start,
+                                                const std::string& failure_fault,
+                                                const std::vector<std::string>& cause_ids) {
+  const long long window_ms = static_cast<long long>(cfg_.impaired_retry_window_sec) * 1000LL;
+  EmitLog("[command] " + request.command() + " id=" + request.id() +
+          " refused: robot impaired (" + failure_fault + "); holding up to " +
+          std::to_string(cfg_.impaired_retry_window_sec) + " s for the fault to clear");
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    command_hold_active_ = true;
+    command_hold_command_ = request.command();
+    command_hold_fault_ = failure_fault;
+    command_hold_deadline_ms_ = now_ms() + window_ms;
+  }
+  struct HoldStatusReset {
+    Adapter* self;
+    ~HoldStatusReset() {
+      std::lock_guard<std::mutex> lk(self->nav_state_mu_);
+      self->command_hold_active_ = false;
+      self->command_hold_command_.clear();
+      self->command_hold_fault_.clear();
+      self->command_hold_deadline_ms_ = 0;
+    }
+  } hold_status_reset{this};
+
+  ImpairedHoldHooks hooks;
+  hooks.now_ms = []() { return now_ms(); };
+  hooks.sleep_ms = [this](long long ms) {
+    const long long until = now_ms() + ms;
+    while (running_.load() && !CancelRequested() && now_ms() < until) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  };
+  hooks.sample = [this, &cause_ids]() {
+    ImpairmentSample sample = SampleImpairment(cause_ids);
+    if (!sample.fault.empty()) {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      command_hold_fault_ = sample.fault;
+    }
+    return sample;
+  };
+  hooks.cancel_reason = [this, &watch_at_command_start]() {
+    return hold_cancel_reason(watch_at_command_start, CurrentHoldWatch());
+  };
+  return hold_until_impairment_clears(window_ms, 1000, failure_fault, hooks);
+}
 
 uint32_t Adapter::NavCompletedCommandId() {
   std::lock_guard<std::mutex> lk(nav_state_mu_);
@@ -5162,17 +5682,11 @@ bool Adapter::ExecuteCameraCalibrateCommand() {
 bool Adapter::WaitForGraphNavCommandResult(uint32_t command_id, long long timeout_ms) {
   if (command_id == 0) return false;
   using Resp = ::bosdyn::api::graph_nav::NavigationFeedbackResponse;
-  const long long deadline = now_ms() + timeout_ms;
-  while (running_.load()) {
+
+  // One feedback poll. command_id may move to a re-sent navigation after an
+  // in-route self-right.
+  const auto poll = [&]() -> PollStep {
     const long long now = now_ms();
-    if (now > deadline) {
-      EmitLog("[command] graphnav command timeout");
-      std::lock_guard<std::mutex> lk(nav_state_mu_);
-      MarkGraphNavNavigationTerminalLocked(
-          command_id, last_nav_status_, last_nav_remaining_route_m_, "failed",
-          "Navigation timed out before reaching a terminal state.", now);
-      return false;
-    }
     SpotClient::NavigationFeedbackSnapshot fb;
     if (!spot_.GetNavigationFeedbackSnapshot(command_id, &fb)) {
       EmitLog(std::string("[command] graphnav feedback failed: ") + spot_.LastError());
@@ -5180,7 +5694,7 @@ bool Adapter::WaitForGraphNavCommandResult(uint32_t command_id, long long timeou
       MarkGraphNavNavigationTerminalLocked(
           command_id, last_nav_status_, last_nav_remaining_route_m_, "failed",
           std::string("Navigation feedback failed: ") + spot_.LastError(), now);
-      return false;
+      return PollStep::kFailed;
     }
     if (IsStreamEnabled(kNavFeedbackStream)) {
       QueueStatusText(kNavFeedbackStream, nav_feedback_to_json(command_id, fb));
@@ -5197,31 +5711,75 @@ bool Adapter::WaitForGraphNavCommandResult(uint32_t command_id, long long timeou
       if (last_nav_progress_change_ms_ == 0) {
         last_nav_progress_change_ms_ = now;
       }
+      return PollStep::kContinue;
     }
     if (fb.status == Resp::STATUS_REACHED_GOAL) {
-      std::string mode;
-      {
-        std::lock_guard<std::mutex> lk(nav_state_mu_);
-        mode = nav_target_mode_;
-        MarkGraphNavNavigationTerminalLocked(
-            command_id, fb.status, fb.remaining_route_length,
-            mode == "hold_position" ? "held_position" : "reached",
-            mode == "hold_position" ? "Robot is holding the current localized pose."
-                                    : "Reached goal.",
-            now);
-      }
-      return true;
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      const std::string mode = nav_target_mode_;
+      MarkGraphNavNavigationTerminalLocked(
+          command_id, fb.status, fb.remaining_route_length,
+          mode == "hold_position" ? "held_position" : "reached",
+          mode == "hold_position" ? "Robot is holding the current localized pose."
+                                  : "Reached goal.",
+          now);
+      return PollStep::kSucceeded;
     }
-    if (fb.status != Resp::STATUS_FOLLOWING_ROUTE) {
-      EmitLog("[command] graphnav ended status=" + std::to_string(fb.status) +
-              " (" + nav_status_name(fb.status) + ")");
+    if (fb.status == Resp::STATUS_ROBOT_IMPAIRED && tl_command_impairment) {
+      // The command thread owns this navigation's impairment handling; the
+      // lease-retain poll leaves it alone (PollGraphNavNavigation), so there
+      // is one live navigation and one self-right at most.
+      NoteCommandImpaired(fb.impaired.detail.empty() ? "Navigation ended with STATUS_ROBOT_IMPAIRED"
+                                                     : fb.impaired.detail,
+                          fb.impaired.fault_ids);
+      if (!CancelRequested() && TakeSelfRightBudget()) {
+        EmitLog("[graphnav] navigation impaired, auto-recovering and retrying");
+        uint32_t retry_command_id = 0;
+        if (spot_.RecoverSelfRight()) {
+          (void)spot_.Stand();
+          if (RetryActiveGraphNavCommandWithRecovery("graphnav.navigation.retry", &retry_command_id)) {
+            command_id = retry_command_id;
+            last_graph_nav_command_id_ = retry_command_id;
+            graphnav_navigation_active_ = true;
+            return PollStep::kContinue;
+          }
+        }
+        EmitLog(std::string("[graphnav] navigation retry after recover failed: ") + spot_.LastError());
+      }
+    }
+    EmitLog("[command] graphnav ended status=" + std::to_string(fb.status) +
+            " (" + nav_status_name(fb.status) + ")");
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    MarkGraphNavNavigationTerminalLocked(
+        command_id, fb.status, fb.remaining_route_length, "failed",
+        std::string("Navigation ended with ") + nav_status_name(fb.status) + ".", now);
+    return PollStep::kFailed;
+  };
+
+  // Feedback once a second as before, but a spot.graphnav.cancel is seen
+  // within 100 ms (DEV-17754).
+  CancellableWaitHooks hooks;
+  hooks.now_ms = []() { return now_ms(); };
+  hooks.sleep_ms = [](long long ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+  hooks.poll = poll;
+  hooks.cancelled = [this]() { return CancelRequested(); };
+  hooks.running = [this]() { return running_.load(); };
+  switch (cancellable_wait(timeout_ms, 1000, 100, hooks)) {
+    case WaitEnd::kSucceeded:
+      return true;
+    case WaitEnd::kFailed:
+    case WaitEnd::kStopped:
+      return false;
+    case WaitEnd::kCancelled:
+      StopForCancel("navigation cmd_id=" + std::to_string(command_id), command_id);
+      return false;
+    case WaitEnd::kTimedOut: {
+      EmitLog("[command] graphnav command timeout");
       std::lock_guard<std::mutex> lk(nav_state_mu_);
       MarkGraphNavNavigationTerminalLocked(
-          command_id, fb.status, fb.remaining_route_length, "failed",
-          std::string("Navigation ended with ") + nav_status_name(fb.status) + ".", now);
+          command_id, last_nav_status_, last_nav_remaining_route_m_, "failed",
+          "Navigation timed out before reaching a terminal state.", now_ms());
       return false;
     }
-    std::this_thread::sleep_for(std::chrono::seconds(1));
   }
   return false;
 }
@@ -5695,6 +6253,9 @@ bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
                                         double waypoint_goal_x,
                                         double waypoint_goal_y,
                                         double waypoint_goal_yaw_rad) {
+  // A cancel for this command that arrived before any of the steps below
+  // means nothing is sent (no relocalization, no self-right, no NavigateTo).
+  if (AbortIfCancelled(action_name + " navigation")) return false;
   // Holding position (spot.graphnav.cancel) targets the robot's own current pose,
   // which is safe even if the map alignment is wrong; everything else needs a
   // confirmed localization.
@@ -5702,11 +6263,13 @@ bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
       !EnsureLocalizationConfirmedForNavigation(action_name)) {
     return false;
   }
+  if (AbortIfCancelled(action_name + " navigation")) return false;
   if (!EnsureLocalizedForNavigation(action_name)) return false;
 
   bool retried_localization = false;
   bool retried_recover = false;
   for (;;) {
+    if (AbortIfCancelled(action_name + " NavigateTo")) return false;
     uint32_t command_id = 0;
     const bool nav_ok = has_waypoint_goal
                             ? (straight ? spot_.NavigateToWaypointPoseStraight(
@@ -5724,18 +6287,31 @@ bool Adapter::StartNavigateWithRecovery(const std::string& action_name,
                                               waypoint_id, cfg_.graphnav_command_timeout_sec,
                                               &command_id));
     if (nav_ok) {
+      // An impairment that the self-right below recovered from is not why a
+      // later failure of this command happens.
+      if (tl_command_impairment) tl_command_impairment->impaired = false;
       if (out_command_id) *out_command_id = command_id;
       return true;
     }
 
     const std::string nav_error = spot_.LastError();
+    SpotClient::ImpairedCause impaired_cause;
+    const bool impaired =
+        spot_.LastNavigateImpaired(&impaired_cause) || is_robot_impaired_error_text(nav_error);
+    if (impaired) {
+      NoteCommandImpaired(impaired_cause.detail.empty() ? "navigate failed: " + nav_error
+                                                         : impaired_cause.detail,
+                          impaired_cause.fault_ids);
+    }
     if (is_not_localized_error_text(nav_error) && !retried_localization) {
       retried_localization = true;
       EmitLog("[graphnav] " + action_name + " navigate failed: not localized; relocalizing");
+      if (AbortIfCancelled(action_name + " relocalization")) return false;
       if (!EnsureLocalizedForNavigation(action_name)) return false;
       continue;
     }
-    if (is_robot_impaired_error_text(nav_error) && !retried_recover) {
+    if (impaired && !retried_recover && TakeSelfRightBudget()) {
+      if (AbortIfCancelled(action_name + " self-right")) return false;
       retried_recover = true;
       EmitLog("[graphnav] " + action_name + " navigate detected robot impairment, auto-recovering");
       if (!spot_.RecoverSelfRight()) {
@@ -6045,13 +6621,86 @@ bool Adapter::ExecuteGraphNavGotoPoseCommand(const v1::model::CommandRequest& re
 
 bool Adapter::ExecuteGraphNavCancelCommand() {
   const std::string action_name = "spot.graphnav.cancel";
-  if (!EnsureLeaseForCommand(action_name)) return false;
-
-  const uint32_t active_command_id = last_graph_nav_command_id_.load();
-  if (active_command_id == 0 && !graphnav_navigation_active_.load()) {
-    EmitLog("[graphnav] spot.graphnav.cancel ignored: no active navigation command");
-    return true;
+  // Decide before touching the lease: with nothing to stop, a cancel must not
+  // take the lease from a client that is driving (the tablet), stamp autonomy
+  // activity or clear a pending release (DEV-17754).
+  const bool navigation_active =
+      last_graph_nav_command_id_.load() != 0 || graphnav_navigation_active_.load();
+  // A walk whose earlier cancel stop was not confirmed may still be moving
+  // even with no live navigation recorded: read its feedback.
+  uint32_t unconfirmed_id = 0;
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    unconfirmed_id = stop_unconfirmed_nav_id_;
   }
+  UnconfirmedWalk unconfirmed = UnconfirmedWalk::kNone;
+  if (!navigation_active && unconfirmed_id != 0) {
+    SpotClient::NavigationFeedbackSnapshot snap;
+    if (!spot_.GetNavigationFeedbackSnapshot(unconfirmed_id, &snap)) {
+      unconfirmed = UnconfirmedWalk::kUnreadable;
+    } else {
+      unconfirmed = snap.status == ::bosdyn::api::graph_nav::NavigationFeedbackResponse::STATUS_FOLLOWING_ROUTE
+                        ? UnconfirmedWalk::kFollowing
+                        : UnconfirmedWalk::kNotFollowing;
+    }
+  }
+  const CancelExecutionPlan plan = plan_cancel_execution(navigation_active, unconfirmed);
+  if (plan.clear_unconfirmed) {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    if (stop_unconfirmed_nav_id_ == unconfirmed_id) {
+      stop_unconfirmed_nav_id_ = 0;
+      stop_unconfirmed_reason_.clear();
+    }
+  }
+  if (plan.stop_unconfirmed_walk) {
+    // No lease is taken: the stop command uses the lease the adapter has.
+    if (tl_command_impairment) tl_command_impairment->idle_noop = true;
+    EmitLog("[graphnav] spot.graphnav.cancel: walk cmd_id=" + std::to_string(unconfirmed_id) +
+            " had an unconfirmed stop and may still be moving; stopping it again");
+    const StopConfirmation confirmation = StopAndConfirm(unconfirmed_id);
+    if (confirmation.confirmed) {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      MarkGraphNavNavigationTerminalLocked(unconfirmed_id, last_nav_status_,
+                                           last_nav_remaining_route_m_, "interrupted",
+                                           "Cancelled by spot.graphnav.cancel.", now_ms());
+      if (stop_unconfirmed_nav_id_ == unconfirmed_id) {
+        stop_unconfirmed_nav_id_ = 0;
+        stop_unconfirmed_reason_.clear();
+      }
+      EmitLog("[graphnav] spot.graphnav.cancel: stop of the earlier walk confirmed");
+      return true;
+    }
+    {
+      std::lock_guard<std::mutex> lk(nav_state_mu_);
+      stop_unconfirmed_reason_ = confirmation.reason;
+    }
+    EmitLog("[graphnav] spot.graphnav.cancel: stop of the earlier walk still NOT confirmed: " +
+            confirmation.reason);
+    if (tl_command_impairment) {
+      tl_command_impairment->stopped_text = cancel_not_confirmed_text(confirmation.reason);
+    }
+    return false;
+  }
+  if (!plan.act) {
+    // Success only if this cancel already ended queued walks or docks;
+    // otherwise it stopped nothing and says so.
+    const bool stopped_queued =
+        tl_command_impairment && tl_command_impairment->cancel_stopped_queued;
+    if (tl_command_impairment) {
+      tl_command_impairment->idle_noop = true;
+      tl_command_impairment->nothing_to_hold = true;
+      if (!stopped_queued) tl_command_impairment->stopped_text = cancel_ignored_nothing_text();
+    }
+    EmitLog("[graphnav] spot.graphnav.cancel ignored: no active navigation command" +
+            std::string(stopped_queued ? " (queued walks were cancelled)" : ""));
+    return stopped_queued;
+  }
+  // Something is live: hold position with the lease we have, or one nobody
+  // holds. Never take it over.
+  if (tl_command_impairment) {
+    tl_command_impairment->no_lease_takeover = !plan.allow_lease_takeover;
+  }
+  if (!EnsureLeaseForCommand(action_name)) return false;
 
   SpotClient::LocalizationSnapshot localization;
   if (!SpotConnected() || !spot_.GetLocalizationSnapshot(&localization)) {
@@ -6120,7 +6769,14 @@ bool Adapter::ExecuteGraphNavCancelCommand() {
       command_id, static_cast<long long>(std::max(15, cfg_.graphnav_command_timeout_sec)) * 1000LL);
   graphnav_navigation_active_ = false;
   last_graph_nav_command_id_ = 0;
-  if (ok) EmitLog("[graphnav] spot.graphnav.cancel hold-position success");
+  if (ok) {
+    EmitLog("[graphnav] spot.graphnav.cancel hold-position success");
+    // Holding position overrides any earlier walk, so a stop that was not
+    // confirmed is settled now.
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    stop_unconfirmed_nav_id_ = 0;
+    stop_unconfirmed_reason_.clear();
+  }
   return ok;
 }
 
@@ -6133,6 +6789,12 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
   if (!SpotConnected()) {
     EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") + " failed: robot unavailable");
     return false;
+  }
+  // Motor power when this dock command started, for decide_dock_start.
+  std::string motor_power_at_start;
+  {
+    SpotClient::RobotStateSnapshot snap;
+    if (spot_.GetRobotStateSnapshot(&snap)) motor_power_at_start = snap.motor_power_state;
   }
   if (!EnsureLeaseForCommand(return_and_dock ? "spot.return_and_dock" : "spot.dock")) return false;
 
@@ -6177,10 +6839,21 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
     return false;
   }
 
+  // Docking has no ROBOT_IMPAIRED status of its own; a dock step that fails
+  // while Spot reports a critical fault counts as impaired, so the command is
+  // held and retried like a refused walk (DEV-17754).
+  const auto note_if_impaired = [this](const char* step) {
+    const ImpairmentSample state = SampleImpairment();
+    if (state.read_ok && state.degraded) {
+      NoteCommandImpaired(std::string(step) + " failed while impaired: " + state.fault, {});
+    }
+  };
+
   bool can_dock = false;
   if (!spot_.CanDock(dock_id, &can_dock) || !can_dock) {
     EmitLog(std::string(return_and_dock ? "[return_and_dock]" : "[dock]") +
             " dock unavailable id=" + std::to_string(dock_id));
+    note_if_impaired("dock check");
     return false;
   }
 
@@ -6192,6 +6865,44 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
     return false;
   }
 
+  const char* const tag = return_and_dock ? "[return_and_dock]" : "[dock]";
+  const auto clear_candidate = [this, return_and_dock]() {
+    if (return_and_dock) return;
+    std::lock_guard<std::mutex> lk(map_mu_);
+    ClearDockWaypointCandidateLocked();
+  };
+  // AutoDock powers the motors on. If an operator acted since the command
+  // started (the Formant estop button is a safe power off), or the motors
+  // were on and are now off, the dock must not undo that (DEV-17754).
+  if (tl_command_impairment) {
+    std::string motor_power_now;
+    SpotClient::RobotStateSnapshot snap;
+    if (spot_.GetRobotStateSnapshot(&snap)) motor_power_now = snap.motor_power_state;
+    const DockStart start =
+        decide_dock_start(tl_command_impairment->operator_actions_at_start, operator_actions_.load(),
+                          motor_power_at_start, motor_power_now);
+    if (start != DockStart::kStart) {
+      EmitLog(std::string(tag) + " not docking: " +
+              (start == DockStart::kStopOperatorAction
+                   ? "an operator used teleop or a button since the command started"
+                   : "the motors were turned off since the command started (power=" +
+                         motor_power_now + ")"));
+      tl_command_impairment->stopped_text = stopped_by_operator_result_text();
+      clear_candidate();
+      return false;
+    }
+  }
+  // From here a cancel no longer interrupts: the robot is docking onto the dock.
+  if (!EnterDockPhase()) {
+    if (tl_command_impairment) tl_command_impairment->cancelled = true;
+    EmitLog(std::string(tag) + " spot.graphnav.cancel arrived before docking; not docking");
+    clear_candidate();
+    return false;
+  }
+  struct DockPhaseReset {
+    Adapter* self;
+    ~DockPhaseReset() { self->LeaveDockPhase(); }
+  } dock_phase_reset{this};
   docking_in_progress_ = true;
   moving_ = false;
   spot_.ZeroVelocity(1);
@@ -6209,6 +6920,7 @@ bool Adapter::ExecuteDockSequence(bool return_and_dock) {
       std::lock_guard<std::mutex> lk(map_mu_);
       ClearDockWaypointCandidateLocked();
     }
+    if (!lost_lease) note_if_impaired("dock");
     return false;
   }
   if (!return_and_dock) CommitDockWaypointCandidateOnSuccess();
@@ -6378,6 +7090,10 @@ void Adapter::HandleButtonPress(const std::string& button_key, const std::string
   };
 
   EmitLog(std::string("[teleop] button press key=") + button_key + " stream=" + source_stream);
+  // Any teleop button (the Formant estop, which is a safe power off, sit,
+  // stand, dock, recover, arm reset, a mode) ends an impaired hold without a
+  // retry (DEV-17754).
+  ++operator_actions_;
 
   if (matches(cfg_.stand_button_stream, {"stand"})) {
     (void)ExecuteStandAction(true, false);
@@ -6450,9 +7166,13 @@ bool Adapter::EnsureLeaseForCommand(const std::string& action_name) {
             " cached body lease invalid: " + spot_.LastError());
     ResetLeaseState(true);
   }
-  lease_owned_ = spot_.AcquireBodyLease();
+  // The retry after an impaired hold must not take the lease from a client
+  // that took it meanwhile (the tablet, another operator): acquire only.
+  const bool no_takeover = tl_command_impairment && tl_command_impairment->no_lease_takeover;
+  lease_owned_ = no_takeover ? spot_.TryAcquireBodyLeaseNoTakeover() : spot_.AcquireBodyLease();
   if (!lease_owned_.load()) {
-    EmitLog(std::string("[command] ") + action_name + " rejected: no body lease (" + spot_.LastError() + ")");
+    EmitLog(std::string("[command] ") + action_name + " rejected: no body lease (" + spot_.LastError() + ")" +
+            (no_takeover ? " ; not taking it over on an impaired retry" : ""));
     return false;
   }
   EmitLog(std::string("[command] ") + action_name + " acquired body lease");
@@ -6479,6 +7199,7 @@ bool Adapter::ErrorSuggestsLostLease(const std::string& error) const {
 
 void Adapter::ResetLeaseState(bool clear_motion) {
   lease_owned_ = false;
+  ++lease_epoch_;
   last_lease_attempt_ms_ = 0;
   spot_.InvalidateBodyLease();
   if (!clear_motion) return;
@@ -6712,6 +7433,9 @@ void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
                                 std::abs(twist.linear().y()) >= tuning.twist_deadband ||
                                 std::abs(twist.angular().z()) >= tuning.twist_deadband ||
                                 std::abs(twist.angular().y()) >= tuning.twist_deadband;
+  // Counted before any gate: an operator reaching for the sticks ends an
+  // impaired hold even if this twist is ignored (DEV-17754).
+  if (requested_motion) ++operator_actions_;
   const auto maybe_log_rejection = [&](const char* reason) {
     if (!requested_motion) return;
     const long long now = now_ms();
@@ -8680,6 +9404,12 @@ std::string Adapter::BuildGraphNavNavStateJson(
   long long localize_at_ms = 0;
   bool localize_confirmed = true;
   std::string localize_unconfirmed_reason;
+  uint32_t unconfirmed_stop_id = 0;
+  std::string unconfirmed_stop_reason;
+  bool hold_active = false;
+  std::string hold_command;
+  std::string hold_fault;
+  long long hold_deadline_ms = 0;
   const bool localized = localization && !localization->waypoint_id.empty();
   const bool has_current_seed_pose = localized && localization->has_seed_tform_body;
   double current_seed_x = 0.0;
@@ -8724,7 +9454,14 @@ std::string Adapter::BuildGraphNavNavStateJson(
     localize_at_ms = localize_at_ms_;
     localize_confirmed = localization_confirmation_.confirmed();
     localize_unconfirmed_reason = localization_confirmation_.pending_reason();
+    unconfirmed_stop_id = stop_unconfirmed_nav_id_;
+    unconfirmed_stop_reason = stop_unconfirmed_reason_;
+    hold_active = command_hold_active_;
+    hold_command = command_hold_command_;
+    hold_fault = command_hold_fault_;
+    hold_deadline_ms = command_hold_deadline_ms_;
   }
+  const long long hold_remaining_ms = hold_active ? std::max(0LL, hold_deadline_ms - now_ms()) : 0;
 
   std::ostringstream oss;
   oss << "{\"connected\":" << (connected ? "true" : "false")
@@ -8756,7 +9493,17 @@ std::string Adapter::BuildGraphNavNavStateJson(
       << ",\"localize_unconfirmed_reason\":\"" << json_escape(localize_unconfirmed_reason) << "\""
       << ",\"has_current_seed_pose\":" << (has_current_seed_pose ? "true" : "false")
       << ",\"has_seed_goal\":" << (has_seed_goal ? "true" : "false")
-      << ",\"has_waypoint_goal\":" << (has_waypoint_goal ? "true" : "false");
+      << ",\"has_waypoint_goal\":" << (has_waypoint_goal ? "true" : "false")
+      << ",\"stop_unconfirmed\":" << (unconfirmed_stop_id != 0 ? "true" : "false")
+      << ",\"stop_unconfirmed_command_id\":" << unconfirmed_stop_id
+      << ",\"stop_unconfirmed_reason\":\"" << json_escape(unconfirmed_stop_reason) << "\""
+      << ",\"command_hold_active\":" << (hold_active ? "true" : "false")
+      << ",\"command_hold_command\":\"" << json_escape(hold_command) << "\""
+      << ",\"command_hold_remaining_ms\":" << hold_remaining_ms
+      << ",\"command_hold_text\":\""
+      << json_escape(hold_active ? impaired_hold_status_text(hold_fault, hold_remaining_ms)
+                                 : std::string())
+      << "\"";
   if (has_current_seed_pose) {
     oss << ",\"current_seed_x\":" << current_seed_x
         << ",\"current_seed_y\":" << current_seed_y

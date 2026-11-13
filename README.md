@@ -123,10 +123,18 @@ value in `streamControls`.
   changes, then republishes the cached JPEG at a stable output FPS. For camera-like playback in
   Formant, the `spot.localization.graphnav.image` stream also needs Formant-side video encoding/realtime
   stream configuration; otherwise the agent treats it as a throttled telemetry image stream.
-- If the hand camera source is missing or reports 0x0 at startup (the arm cameras come up after
-  the body after a reboot), `spot.hand.image` is not disabled for good: the adapter re-checks the
-  image sources every 30 s for 10 minutes, then every 5 minutes, and starts the stream when the
-  source is valid, logging `configured source available again`.
+- Camera streams start when Spot lists their image sources with a real size, not at a fixed
+  point in startup. After a power-on the adapter can start before Spot answers; it then asks
+  again after 1 s, 2 s, 4 s and so on up to every 30 s (logging `failed to list image sources`
+  on the 1st, 2nd, 4th, 8th ... attempt), and asks again at once after every reconnect. A source
+  that Spot lists as missing or 0x0 (the arm cameras come up after the body after a reboot; a body
+  camera with a fault reports 0x0) does not disable its stream: the adapter re-checks it every
+  30 s for 10 minutes, then every 5 minutes, and starts the stream when the source is valid,
+  logging `configured source available again`. This applies to every camera stream, including
+  the stitched `spot.front.image` (both front sources must be valid). If Spot has not answered
+  once within 2 minutes of startup, every pending stream starts anyway with its configured sources,
+  as before. Left, right and back cameras
+  that are ready together share one batched image request; one that comes up later gets its own.
 - `spot.left.image`, `spot.right.image`, and `spot.back.image` use the same cached-frame publish
   pattern: the adapter polls Spot at a lower configured rate, then republishes the latest JPEG at a
   stable output FPS. The right camera is rotated 180 degrees by default.
@@ -176,6 +184,93 @@ Additional non-GraphNav command-channel actions:
     `spot.waypoint.goto name="charging dock"` and `spot.return_and_dock` keep going to the same
     place. A name that points somewhere else is left alone and a warning is logged. Set
     `dock_home_alias` to `""` in the JSON config to turn the sync off.
+- Impaired retry for walk and dock commands (`spot.waypoint.goto`, `spot.waypoint.goto_straight`,
+  `spot.graphnav.goto_pose`, `spot.graphnav.goto_pose_straight`, `spot.dock`,
+  `spot.return_and_dock`). Spot refuses to walk with `ROBOT_IMPAIRED` while a critical fault is
+  active, for example a body camera that drops to USB2 and comes back seconds later. When one of
+  these commands fails that way (GraphNav `STATUS_ROBOT_IMPAIRED` at navigate or in feedback, or a
+  dock step that fails while Spot reports a critical or unclearable fault), the adapter does not
+  answer at once. It reads the robot state every second for up to `impairedRetryWindowSec`
+  (default 20, clamped to 0..60, env `IMPAIRED_RETRY_WINDOW_SEC`, 0 turns this off). After two
+  clear reads in a row it runs the command once more from the start, and the command response and
+  the `spot.command.result` line report how the retry ended. A read is clear only when no E-Stop is
+  asserted, the motors are on, no critical system fault, unclearable behavior fault or motor power
+  error is listed, and none of the faults GraphNav named in its `impaired_state` is still listed
+  (this catches service faults). While a command is held, `spot.nav.state` carries
+  `command_hold_active`, `command_hold_command`, `command_hold_remaining_ms` and
+  `command_hold_text` (`held: robot impaired (<fault>), retrying once when clear, 14s left`).
+  The hold ends without a retry when:
+  - the fault is still active at the end of the window:
+    `ABORTED(robot impaired: <fault>, not cleared within 20s)`, or an unclearable behavior fault
+    is seen: `ABORTED(robot impaired: <fault>, unclearable fault)`;
+  - anything a person or another client did since the command started could be overridden by the
+    retry: any teleop button press (including the Formant estop button, which is a safe power off,
+    and sit, stand, dock, recover, arm reset), any teleop twist asking for motion, the motors turned
+    off, an E-Stop, the body lease lost or taken by another client, a disconnect or reconnect, the
+    adapter stopping, or a queued command that moves or stops the robot or changes its map,
+    localization or arm (`spot.graphnav.cancel`, another walk or dock, `spot.sit`, `spot.stand`,
+    `spot.recover`, `spot.undock`, rotate, `spot.reset_arm`, `spot.camera.calibrate`, `spot.map.*`
+    except `set_default`, `spot.localize`, `spot.localize.confirm`, reboot):
+    `STOPPED(robot impaired: <fault>, <why>)`;
+  - another navigation or a dock is still live (nothing is held then);
+  - the retry is refused as impaired again: `ABORTED(robot impaired: <fault>, still impaired after
+    one retry)`.
+  The retry takes the body lease only if nobody holds it (no takeover), and does no self-right:
+  one impaired episode does at most one self-right. While a queued command runs, its own thread
+  handles navigation impairment; the background navigation poll does not recover or re-send it.
+  Formant's command cancellation is not visible to the adapter (the agent API has no cancel
+  call), so a mission that wants to stop a held command must send `spot.graphnav.cancel`.
+- `spot.graphnav.cancel` takes effect on arrival. Commands run one at a time, and a walk or dock
+  occupies the queue until it ends, so a cancel used to wait behind the walk it was meant to stop.
+  Now a cancel is decided the moment it arrives and is accepted even when the queue is full.
+  - Parameter text, optional: `command_id=<formant command id>`, for example
+    `command_id=3f2c9a52-6d1e-4b8a-9c0f-1a2b3c4d5e6f`. With it, only that walk or dock command is
+    stopped, whether it is running or still queued. If that command is neither running nor queued
+    nothing is stopped and the answer is `REJECTED(ignored: target not running)` with
+    success=false; the id is remembered for 10 minutes (up to 64 ids), so if that command arrives
+    later (a reconnect can deliver the cancel first) it does not start and ends `STOPPED(cancelled)`.
+    Mission drivers should always send `command_id`, so a late cancel never stops the next walk.
+  - Without `command_id` (an operator's cancel) the running walk or dock and every queued walk or
+    dock are stopped. With nothing running, the cancel runs from the front of the queue: it holds
+    position if a navigation that is not a queued command (the teleop return-and-dock) is live,
+    and otherwise answers `REJECTED(ignored: nothing running)` with success=false (success if it
+    ended queued walks).
+  - The running walk, dock or impaired hold sees the cancel within 100 ms and sends Spot a stop
+    command (the robot stops in place; nothing is powered on), up to three times, each followed by
+    a 200 ms wait and a navigation feedback read. The stop is confirmed once the navigation is no
+    longer following its route. Only then is the cancel answered, `DONE: spot.graphnav.cancel` with
+    success, and the walk ends `STOPPED(cancelled)`. If it cannot be confirmed, the cancel answers
+    `STOPPED not confirmed: <reason>` with success=false, the walk ends
+    `ABORTED(stop not confirmed: <reason>)`, the navigation is left marked active, and the adapter
+    holds position at once, before any other command. `spot.nav.state` reports it with
+    `stop_unconfirmed`, `stop_unconfirmed_command_id` and `stop_unconfirmed_reason` until a stop or
+    a hold-position settles it; if that hold fails, the walk stays marked active rather than idle.
+    A later cancel that finds no live navigation still sends the stop command again when that walk
+    reads `FOLLOWING_ROUTE` or its feedback cannot be read, and answers by whether that stop is
+    confirmed. A cancel that ends a walk or dock that had
+    not sent anything yet (in its impaired hold, or before its first NavigateTo) answers success.
+    A queued one never starts (`STOPPED(cancelled)`). Nothing is sent after the cancel arrives: no
+    relocalization, no self-right, no NavigateTo.
+  - A robot that has started docking onto the dock (AutoDock) is never interrupted:
+    `spot.return_and_dock` can be stopped only while it walks to the dock waypoint, and a targeted
+    cancel of a docking robot answers `REJECTED(docking in progress)`. Teleop and the E-Stop remain
+    the tools that stop everything.
+  - Not stopped by a cancel: `spot.undock`, `spot.rotate_left`, `spot.rotate_right`, and any other
+    command that is not a walk or dock.
+  - With nothing to stop, the cancel logs `spot.graphnav.cancel ignored: no active navigation
+    command` and answers as above without touching the body lease (someone may be driving with the
+    tablet), without starting the autonomy lease hold and without clearing a pending release. When
+    it does have to hold position it uses the lease the adapter has, or one nobody holds; it never
+    takes the lease over.
+  - `spot.sit` is not treated this way: a sit queued after a goto by a driver that does not wait for
+    the goto's result must not cancel it. The teleop sit and estop buttons already act at once.
+- Before a dock command calls AutoDock (which powers the motors on), the adapter checks that no
+  teleop button or twist was used since the command started and that the motors were not turned
+  off (the Formant estop button is a safe power off). Otherwise it does not dock and ends with
+  `STOPPED(operator action)`. A robot whose motors were off when the dock command started is still
+  powered on by the dock, as before. Any teleop twist above the deadband counts as an operator
+  action, so joystick drift while a teleop session is open can turn a dock into
+  `STOPPED(operator action)`.
 - `spot.rotate_left`: rotate left in place by a requested angle. Parameter: `degrees`.
 - `spot.rotate_right`: rotate right in place by a requested angle. Parameter: `degrees`.
 - `spot.reset_arm`: explicit arm reset/stow; command path does not require active teleop heartbeat.
@@ -287,9 +382,12 @@ Restart localization recovery:
   nothing can act on a pose recovery has applied but not yet accepted or cleared. The same window
   covers each `spot.localize` attempt.
 - Navigation is also refused while a map restore is pending ("map ... is still being restored to
-  the robot" in `spot.adapter.log`). The restore retries every 5 s and stays pending while the map
-  file under `<graphnav_store_dir>/maps/<map_id>` cannot be read, the upload fails, or another
-  client (for example the tablet) holds the body lease. To clear it, release the lease on the
+  the robot" in `spot.adapter.log`). The restore stays pending while Spot's GraphNav service is
+  not registered yet (right after a power-on), the map file under
+  `<graphnav_store_dir>/maps/<map_id>` cannot be read, the upload fails, or another client (for
+  example the tablet) holds the body lease. It retries every 5 s; while the GraphNav service is
+  missing or the upload fails it retries after 1 s, 2 s and 4 s first, starting over after each
+  reconnect, and it does not take the body lease until the service answers. To clear it, release the lease on the
   other client, or fix or replace the map files, or load a different map with `spot.map.load`.
   If none of these works, restart the adapter.
 - An accepted recovery leaves the localization unconfirmed (`localize_confirmed=false` on

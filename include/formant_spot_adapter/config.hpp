@@ -144,6 +144,10 @@ struct Config {
   std::string waypoint_text_stream{"spot.waypoints"};
   std::string maps_text_stream{"spot.maps"};
   int graphnav_command_timeout_sec{60};
+  // A walk or dock command that Spot refuses with ROBOT_IMPAIRED (a critical
+  // fault such as a body camera dropping out) is held this long and retried
+  // once as soon as the fault clears (see impaired_retry.hpp). 0 turns it off.
+  int impaired_retry_window_sec{20};
   // Run the robot's map processing (odometry + fiducial loop closure) on the
   // live graph before a mapping session is committed. Without it a recorded
   // map is a single chain and routes retrace the whole walk.

@@ -437,9 +437,23 @@ parameters documented in the repository `README.md`.
 - Same seed-frame goal contract as `spot.graphnav.goto_pose`, but with straight-line-biased travel params.
 
 - `spot.graphnav.cancel` (command)
-- Overrides active GraphNav navigation with a new goal at the robot's current localized pose.
-- Intended as the operator-facing hold-position override for map UIs.
-- No parameters.
+- Stops a walk or dock command on arrival (it does not wait behind it in the command queue), and
+  overrides any other active GraphNav navigation with a goal at the robot's current localized pose.
+- Optional parameter text: `command_id=<formant command id>`, the id of the walk or dock command
+  to stop (for example `command_id=3f2c9a52-6d1e-4b8a-9c0f-1a2b3c4d5e6f`). With it, only that
+  command is stopped, running or queued; if it already finished or is unknown, nothing happens,
+  the cancel answers `REJECTED(ignored: target not running)` with success=false, and the id is
+  remembered for 10 minutes so the command does not start if it arrives later. Without it (an
+  operator's cancel) the running walk or dock and every queued one are stopped.
+- A cancel of a running walk is answered only after the stop is confirmed from navigation
+  feedback: `DONE: spot.graphnav.cancel` with success, or `STOPPED not confirmed: <reason>` with
+  success=false (the adapter then holds position, and `spot.nav.state` reports
+  `stop_unconfirmed` until a later stop or hold settles it). A cancel that stops nothing answers
+  success=false with `ignored` in the text.
+- A robot already docking onto the dock is not interrupted (`spot.return_and_dock` can be stopped
+  only while it walks to the dock waypoint). `spot.undock` and `spot.rotate_left`/`right` are not
+  stopped by a cancel.
+- With nothing to stop it changes nothing and never takes the body lease.
 
 - `spot.localize` (command)
 - Localizes on the active map from "the robot is at this waypoint" without fiducials
