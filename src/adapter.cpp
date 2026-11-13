@@ -6151,7 +6151,7 @@ bool Adapter::MapActivityBlocksRecovery() {
   }
   std::lock_guard<std::mutex> lk(command_queue_mu_);
   for (const auto& queued : command_queue_) {
-    if (queued.command().rfind("spot.map.", 0) == 0) return true;
+    if (!queued.cancelled && queued.request.command().rfind("spot.map.", 0) == 0) return true;
   }
   return false;
 }
