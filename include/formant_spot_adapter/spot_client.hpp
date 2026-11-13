@@ -163,6 +163,10 @@ class SpotClient {
     double seed_tform_body_qy{0.0};
     double seed_tform_body_qz{0.0};
     double seed_tform_body_qw{1.0};
+    // Odometry at the time of the localization (robot_kinematics), so the
+    // adapter can tell whether the body moved without another RPC.
+    bool has_odom_tform_body{false};
+    LocalizePose odom_tform_body;
   };
 
   // Localize against the loaded map from a guess of "the robot is here relative
@@ -312,10 +316,11 @@ class SpotClient {
   bool SetLocalizationAtWaypoint(const WaypointLocalizeRequest& request,
                                  const LocalizeAcceptancePolicy& policy,
                                  WaypointLocalizeResult* out_result);
-  // Height of the body above Spot's ground plane estimate ("gpe" frame), meters.
-  // About 0.5 standing and lower sitting. False when the robot state has no
-  // ground plane estimate.
-  bool GetBodyHeightAboveGround(double* out_height_m);
+  // One robot state read: odom_tform_body, the body height above Spot's ground
+  // plane estimate ("gpe" frame; about 0.5 m standing, lower sitting) and the
+  // behavior state. False only when the robot state could not be read; missing
+  // frames leave has_odom / has_body_height false.
+  bool GetBodyPoseSample(BodyPoseSample* out_sample);
   bool GetLocalizationWaypointId(std::string* out_waypoint_id);
   bool GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot);
   bool GetLocalizationMapSnapshot(LocalizationMapSnapshot* out_snapshot);

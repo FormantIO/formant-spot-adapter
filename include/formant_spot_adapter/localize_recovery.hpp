@@ -202,7 +202,10 @@ struct LastLocalization;
 // above ground is known both at save time and now, z moves by the difference, so
 // a robot that was standing when saved and sits after the reboot is not guessed
 // 0.3 m above itself (GraphNav reports QUALITY_CHECK_BAD_HEIGHT for a prior whose
-// height is off). A difference over 1 m is treated as a bad reading and ignored.
+// height is off). The correction is clamped to +-0.4 m (about the sit/stand
+// difference), and is only made when both heights were read in a settled
+// behavior state (BodyHeightUsable); the caller passes has_current_body_height
+// false otherwise.
 LocalizePose RecoverySeedPose(const LastLocalization& last, bool has_current_body_height,
                               double current_body_height_m);
 // First pass verifies visual alignment. If GraphNav answers
@@ -215,8 +218,10 @@ WaypointLocalizeSpec RecoveryLocalizeSpec(const LastLocalization& last,
 // First pass: QUALITY_CHECK_SUCCESS, or SKIPPED with verified visual alignment.
 // Unverified second pass: also SKIPPED when the ambiguity check passed and the
 // result is within 0.25 m / 10 deg of the saved pose (on the saved waypoint or a
-// neighbor), i.e. GraphNav found the robot where it was last known to be. Every
-// recovery result stays unconfirmed either way (LocalizationConfirmation).
+// neighbor), i.e. GraphNav found the robot where it was last known to be. That
+// basis is reported as "saved_pose_unverified": it is close to accepting the
+// saved pose itself, so an operator should check the pose before confirming.
+// Every recovery result stays unconfirmed either way (LocalizationConfirmation).
 LocalizeAcceptancePolicy RecoveryAcceptancePolicy(bool unverified_pass = false);
 // True when the first (verified) pass failed only on visual alignment, so the
 // unverified second pass should run.
@@ -241,6 +246,39 @@ struct RecoveryRetryDecision {
 // `status` is the GraphNav status name ("" when the request never got an answer).
 RecoveryRetryDecision DecideRecoveryRetry(bool applied, const std::string& status,
                                           int attempts_made, const RecoveryRetryPolicy& policy);
+
+// Commands that move the body (walks, docks, rotate, stand, sit, self-right).
+// Any of them after the first recovery attempt drops pending retries: the saved
+// guess may no longer describe where the robot is.
+bool IsMotionCommand(const std::string& command);
+
+// Whether a scheduled recovery retry may run now. The retry reuses the guess
+// from attempt 1, so it is only valid while nothing could have moved the robot.
+struct RecoveryRetryCheck {
+  long long now_ms{0};
+  long long first_attempt_ms{0};
+  // Same limit as the restore delay: retries end this long after attempt 1.
+  // 0 means no limit.
+  long long max_window_ms{60000};
+  // Bumped on every walk or dock command, teleop motion or button, and seen
+  // GraphNav navigation or docking.
+  unsigned long long motion_epoch_at_first{0};
+  unsigned long long motion_epoch_now{0};
+  // Odometry at attempt 1 and now.
+  bool has_odom_at_first{false};
+  LocalizePose odom_at_first;
+  bool has_odom_now{false};
+  LocalizePose odom_now;
+  // A spot.map.* command is running or queued, or recording or map processing
+  // is active.
+  bool map_activity{false};
+};
+enum class RecoveryRetryGate { kRun, kWait, kDrop };
+struct RecoveryRetryGateDecision {
+  RecoveryRetryGate gate{RecoveryRetryGate::kDrop};
+  std::string reason;
+};
+RecoveryRetryGateDecision CheckRecoveryRetry(const RecoveryRetryCheck& in);
 
 // Parameters of the `spot.localize` command.
 /**
@@ -303,9 +341,15 @@ struct LastLocalization {
   bool has_body_height{false};
   double body_height_m{0.0};
   // Wall-clock time of the save, milliseconds since the Unix epoch. While the
-  // robot stays localized this is refreshed (see LastLocalizationThrottle), so
-  // it means "last time the robot was known to be here".
+  // robot stays localized and odometry shows the body still, this is refreshed
+  // about once a minute (see LastLocalizationThrottle), so it means "last time
+  // the robot was seen, unmoved, at this pose": in practice the time since it
+  // lost power. Restart recovery's age limit uses it.
   long long updated_ms{0};
+  // When the saved pose last changed: a new waypoint or offset, or odometry
+  // showing the body moved. Refreshes leave it alone. 0 means unknown (a file
+  // written before this field existed); read back as updated_ms.
+  long long moved_ms{0};
 };
 
 // One `key=value` per line. Unknown keys are ignored when reading so the file
@@ -320,25 +364,61 @@ bool SaveLastLocalization(const std::string& path, const LastLocalization& rec,
                           std::string* error);
 bool LoadLastLocalization(const std::string& path, LastLocalization* out);
 
+// Odometry, body height and behavior from one robot state read.
+struct BodyPoseSample {
+  bool has_odom{false};
+  LocalizePose odom_tform_body;
+  bool has_body_height{false};
+  double body_height_m{0.0};
+  // "not_ready", "transition", "standing", "stepping" or "unknown".
+  std::string behavior_state;
+};
+
+// Whether a body height read in this behavior state describes a settled pose
+// (sitting with motors off, or standing still). Mid sit/stand transition or
+// while stepping it does not, and is not used.
+bool BodyHeightUsable(const std::string& behavior_state);
+
+// Empty when `now` is within `max_m` horizontally and `max_yaw_rad` in yaw of
+// `before` (both odom_tform_body); otherwise how far the body moved. Height is
+// ignored: sitting down or standing up is not a move.
+std::string BodyMovedReason(const LocalizePose& before, const LocalizePose& now,
+                            double max_m = 0.1, double max_yaw_rad = 0.08726646259971647);
+
 // Decides when a fresh localization is worth writing to disk. GraphNav reports
-// localization every poll; the file changes when the robot is at a different
-// waypoint or has moved noticeably relative to it, never more often than
-// `min_interval_ms`, and at least every `refresh_interval_ms` while the robot
-// stays localized, so a robot that stands still for an hour still has a fresh
-// timestamp when it reboots (restart recovery skips records older than
-// localize_recovery_max_record_age_sec). A refresh interval of 0 turns that off.
+// localization every poll. A write is due:
+//   - kChanged: first record, a different waypoint or map, the pose moved 0.5 m
+//     or turned 15 deg, or odometry shows the body moved 0.1 m / 5 deg since the
+//     last write. Never more often than `min_interval_ms`. The record's moved_ms
+//     becomes the write time.
+//   - kRefresh: `refresh_interval_ms` since the saved timestamp and odometry has
+//     shown the body still (within 0.1 m / 5 deg) since the last write or for the
+//     whole refresh interval. moved_ms is kept. No odometry, no refresh.
+// A refresh interval of 0 turns refreshes off. A saved stamp ahead of the clock
+// (the clock was set back) is rewritten as kChanged.
 class LastLocalizationThrottle {
  public:
+  enum class Reason { kNone, kChanged, kRefresh };
+
   explicit LastLocalizationThrottle(long long min_interval_ms = 5000,
                                     double min_move_m = 0.5,
                                     double min_turn_rad = 0.2617993877991494 /* 15 deg */,
                                     long long refresh_interval_ms = 60000);
 
-  bool ShouldPersist(const LastLocalization& current, long long now_ms) const;
+  // Call on every poll, before Decide.
+  void ObserveOdom(long long now_ms, bool has_odom, const LocalizePose& odom_tform_body);
+  Reason Decide(const LastLocalization& current, long long now_ms) const;
+  bool ShouldPersist(const LastLocalization& current, long long now_ms) const {
+    return Decide(current, now_ms) != Reason::kNone;
+  }
+  // `rec.moved_ms` is what was written.
   void MarkPersisted(const LastLocalization& rec, long long now_ms);
   // Starts from what is already on disk. The same record is rewritten once its
-  // own timestamp is due a refresh; a different one is written at once.
+  // own timestamp is due a refresh (and the body is seen still); a different one
+  // is written at once.
   void Seed(const LastLocalization& rec);
+  // moved_ms of the last record written or seeded.
+  long long last_moved_ms() const { return last_.moved_ms; }
 
  private:
   long long min_interval_ms_;
@@ -351,6 +431,14 @@ class LastLocalizationThrottle {
   long long last_write_ms_{0};
   // Timestamp of the record on disk, for refresh_interval_ms.
   long long last_stamp_ms_{0};
+  // Latest odometry, and the stretch over which it has been still.
+  bool has_odom_{false};
+  LocalizePose odom_;
+  LocalizePose still_anchor_;
+  long long still_since_ms_{0};
+  // Odometry when the last write happened.
+  bool has_odom_at_write_{false};
+  LocalizePose odom_at_write_;
 };
 
 // Whether a failed nearest-fiducial localization leaves anything for a waypoint
@@ -426,7 +514,12 @@ class LocalizationConfirmation {
   // robot is simply unlocalized and there is nothing to confirm.
   void OnRecoveryFinished();
   // Automatic restart recovery left the robot localized at `waypoint_id`.
-  void OnAutomaticLocalization(const std::string& waypoint_id);
+  // `note` (for example why the evidence is weaker) is shown in pending_reason.
+  void OnAutomaticLocalization(const std::string& waypoint_id, const std::string& note = "");
+  // A scheduled recovery retry is about to call SetLocalization. Same window as
+  // TryBeginOperatorAttempt: the current state is kept, so a retry that finds
+  // the robot already localized and stops changes nothing.
+  bool TryBeginRecoveryRetry(std::string* refusal) { return TryBeginOperatorAttempt(refusal); }
   // An operator spot.localize was accepted on weaker evidence (for example a small
   // correction after visual alignment failed). It needs spot.localize.confirm.
   void OnUnverifiedOperatorLocalization(const std::string& waypoint_id, const std::string& why);

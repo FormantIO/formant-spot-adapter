@@ -122,11 +122,17 @@ class Adapter {
   // One recovery attempt (verified pass, plus the unverified pass if visual
   // alignment failed) at `last`. Schedules a retry when GraphNav was not ready.
   // Call with a localization attempt window open.
+  // `body` is a robot state read taken just before (null if it failed).
   void RunLocalizationRecoveryAttempt(const std::string& map_id,
                                       const SpotClient::StoredMap& map_data,
-                                      const LastLocalization& last, int attempt);
+                                      const LastLocalization& last, int attempt,
+                                      const BodyPoseSample* body);
   // Runs a retry scheduled by RunLocalizationRecoveryAttempt once it is due.
   void MaybeRetryLocalizationRecovery(long long now);
+  // Forgets a scheduled recovery retry; `why` is logged when one was pending.
+  void DropRecoveryRetry(const std::string& why);
+  // A spot.map.* command is running or queued, or recording or processing runs.
+  bool MapActivityBlocksRecovery();
   void RecordLocalizeOutcome(const std::string& source, const std::string& result,
                              const std::string& waypoint_id, const std::string& detail);
   bool StartNavigateWithRecovery(const std::string& action_name,
@@ -527,6 +533,16 @@ class Adapter {
   long long recovery_retry_restore_ms_{0};
   std::string recovery_retry_map_id_;
   fsa::LastLocalization recovery_retry_last_;
+  // Baseline from the first attempt: a retry only runs while nothing could have
+  // moved the robot since then (CheckRecoveryRetry).
+  long long recovery_retry_first_ms_{0};
+  unsigned long long recovery_retry_motion_epoch_{0};
+  fsa::BodyPoseSample recovery_retry_first_pose_;
+  // Bumped on every motion command, teleop motion or button press, and while
+  // GraphNav navigation or docking is seen during a pending recovery retry.
+  std::atomic<unsigned long long> motion_epoch_{0};
+  // A spot.map.* command is running (HandleMapCommand).
+  std::atomic<int> map_command_active_{0};
   std::atomic<long long> last_nav_hold_log_ms_{0};
   std::atomic<long long> last_nav_diag_log_ms_{0};
   std::atomic<bool> force_waypoint_publish_{true};

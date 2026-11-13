@@ -264,11 +264,14 @@ Additional non-GraphNav command-channel actions:
 
 Restart localization recovery:
 - The adapter saves the last confirmed localization (waypoint, the robot's offset from it, and the
-  body height above the ground plane) to `<graphnav_store_dir>/last_localization.txt`, at most
-  every 5 s, when the waypoint changes or the robot moves 0.5 m / turns 15 deg, and at least once
-  a minute while the robot stays localized, so a robot that stood still for hours still has a
-  fresh record when it reboots. Nothing is saved while a restore is pending, a map is recording,
-  or the localization is unconfirmed.
+  body height above the ground plane when sitting or standing still) to
+  `<graphnav_store_dir>/last_localization.txt`, at most every 5 s, when the waypoint changes,
+  the pose moves 0.5 m / turns 15 deg, or odometry shows the body moved 0.1 m / 5 deg
+  (`moved_ms` is then the write time). While odometry shows the body still, the timestamp
+  (`updated_ms`) is refreshed once a minute, so a robot that stood still for hours still has a
+  fresh record when it reboots; the age limit below therefore measures roughly the time since it
+  lost power. Without odometry there is no refresh. Nothing is saved while a restore is pending,
+  a map is recording, or the localization is unconfirmed.
 - The map restore runs at adapter start. It also runs while the adapter keeps running after a
   reconnect (a Spot body reboot drops the connection) when Spot's GraphNav map stats show an empty
   graph on two checks 5 s apart within 2 minutes of the reconnect and no other client holds the
@@ -280,18 +283,29 @@ Restart localization recovery:
   longer exists). With no tag in view, nearest-fiducial localization answers plain
   `STATUS_FAILED`, which is the normal case for a robot rebooted away from its dock. When the body
   height is known for both the saved record and now, the guess height is corrected for sitting
-  versus standing.
+  versus standing (clamped to 0.4 m, and only from readings taken sitting or standing still,
+  not mid-transition or stepping).
   - First pass: visual refinement verification on. Accepts `QUALITY_CHECK_SUCCESS`, or
     `QUALITY_CHECK_SKIPPED` with verified visual alignment.
   - If GraphNav answers `STATUS_VISUAL_ALIGNMENT_FAILED` (nothing applied), a second pass repeats
     the same guess without verification and accepts `QUALITY_CHECK_SKIPPED` only when the result
     is within 0.25 m / 10 deg of the saved pose (on the saved waypoint or a waypoint one edge
-    away). `accepted_by=saved_pose_small_correction` in `localize_detail` marks this.
+    away). This is close to accepting the saved pose itself, so it is labelled:
+    `accepted_by=saved_pose_unverified` and `UNVERIFIED` in `localize_detail`, and
+    `localize_unconfirmed_reason` says to check the pose on the map before confirming.
   - A suspected ambiguity or any other quality result is always rejected.
   - If GraphNav was not ready (`STATUS_ROBOT_IMPAIRED`, for example a camera still initializing
     after the reboot, `STATUS_ABORTED`, or no answer), the same guess is retried every 10 s, up to
     6 attempts (`localize_result=retrying` meanwhile). Any other failure is final: the robot is
     left unlocalized and no other guess is tried.
+  - A retry reuses the first attempt's guess, so it is dropped (robot left unlocalized) if
+    odometry shows the body moved 0.1 m / 5 deg since that attempt, if any walk or dock command,
+    teleop motion or teleop button, GraphNav navigation or docking happened since, if
+    `localize_recovery_max_restore_delay_sec` has passed since the first attempt, if a newer
+    restore started or the active map changed, or when an operator runs `spot.localize`
+    (whatever its result). It waits while a `spot.map.*` command is running or queued, or
+    recording or map processing is active. It checks again whether the robot is already
+    localized after it has blocked other localization attempts, and stops if so.
   It is skipped when the saved record is for another map, its
   waypoint is gone, it is older than `localize_recovery_max_record_age_sec` (default 1800, 0 turns
   recovery off), or the restore ran more than `localize_recovery_max_restore_delay_sec` (default

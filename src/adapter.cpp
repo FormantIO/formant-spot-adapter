@@ -5300,6 +5300,13 @@ void Adapter::MaybePersistLastLocalization(const SpotClient::LocalizationSnapsho
                                            long long now) {
   if (localization.waypoint_id.empty()) return;
   {
+    // Odometry comes with the localization; it tells a refresh (body still)
+    // from a move.
+    std::lock_guard<std::mutex> lk(last_localization_mu_);
+    last_localization_throttle_.ObserveOdom(now, localization.has_odom_tform_body,
+                                            localization.odom_tform_body);
+  }
+  {
     // Never save a guess nobody has confirmed; the next restart would reuse it.
     std::lock_guard<std::mutex> lk(nav_state_mu_);
     if (!localization_confirmation_.AllowsPersist()) return;
@@ -5331,15 +5338,21 @@ void Adapter::MaybePersistLastLocalization(const SpotClient::LocalizationSnapsho
 
   {
     std::lock_guard<std::mutex> lk(last_localization_mu_);
-    if (!last_localization_throttle_.ShouldPersist(rec, now)) return;
+    const auto reason = last_localization_throttle_.Decide(rec, now);
+    if (reason == LastLocalizationThrottle::Reason::kNone) return;
+    // A refresh only says "still here"; the pose last changed when it did.
+    rec.moved_ms = reason == LastLocalizationThrottle::Reason::kRefresh
+                       ? last_localization_throttle_.last_moved_ms()
+                       : now;
   }
   // Only when a write is due (about once a minute while standing still): one
   // robot state read for the body height, so recovery can correct the guess
-  // for sitting versus standing.
-  double body_height_m = 0.0;
-  if (spot_.GetBodyHeightAboveGround(&body_height_m)) {
+  // for sitting versus standing. Not while sitting down, standing up or stepping.
+  BodyPoseSample body;
+  if (spot_.GetBodyPoseSample(&body) && body.has_body_height &&
+      BodyHeightUsable(body.behavior_state)) {
     rec.has_body_height = true;
-    rec.body_height_m = body_height_m;
+    rec.body_height_m = body.body_height_m;
   }
   std::lock_guard<std::mutex> lk(last_localization_mu_);
   std::string error;
@@ -5442,18 +5455,33 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
   const long long age_s = std::max(0LL, (now - in.last.updated_ms) / 1000);
   EmitLog("[graphnav] restart localization recovery: " + plan.reason +
           (waypoint_name.empty() ? std::string() : " name=" + waypoint_name) +
-          " saved_age_s=" + std::to_string(age_s) + " (robot is not moved)");
-  RunLocalizationRecoveryAttempt(restored_map_id, map_data, in.last, 1);
+          " saved_age_s=" + std::to_string(age_s) + " pose_unchanged_for_s=" +
+          std::to_string(std::max(0LL, (in.last.updated_ms - in.last.moved_ms) / 1000)) +
+          " (robot is not moved)");
+  BodyPoseSample body;
+  const bool have_body = spot_.GetBodyPoseSample(&body);
+  {
+    // The baseline every retry is checked against: nothing may move the robot
+    // between this attempt and a retry.
+    std::lock_guard<std::mutex> lk(recovery_retry_mu_);
+    recovery_retry_first_ms_ = now_ms();
+    recovery_retry_motion_epoch_ = motion_epoch_.load();
+    recovery_retry_first_pose_ = have_body ? body : BodyPoseSample{};
+  }
+  RunLocalizationRecoveryAttempt(restored_map_id, map_data, in.last, 1,
+                                 have_body ? &body : nullptr);
 }
 
 void Adapter::RunLocalizationRecoveryAttempt(const std::string& map_id,
                                              const SpotClient::StoredMap& map_data,
-                                             const LastLocalization& last, int attempt) {
+                                             const LastLocalization& last, int attempt,
+                                             const BodyPoseSample* body) {
   // The guess is the saved offset from the saved waypoint (never odom, which the
   // reboot reset), with z corrected for sitting versus standing when both body
-  // heights are known.
-  double body_height_m = 0.0;
-  const bool has_body_height = spot_.GetBodyHeightAboveGround(&body_height_m);
+  // heights are known and were read in a settled behavior state.
+  const bool has_body_height = body && body->has_body_height &&
+                               BodyHeightUsable(body->behavior_state);
+  const double body_height_m = has_body_height ? body->body_height_m : 0.0;
   SpotClient::WaypointLocalizeRequest request =
       RecoveryLocalizeSpec(last, true, has_body_height, body_height_m);
   request.neighbors = NeighborTforms(last.waypoint_id, edge_tforms(map_data.graph));
@@ -5475,11 +5503,19 @@ void Adapter::RunLocalizationRecoveryAttempt(const std::string& map_id,
     accepted = spot_.SetLocalizationAtWaypoint(request, RecoveryAcceptancePolicy(true), &result);
   }
   if (accepted) {
+    // The unverified pass is close to accepting the saved pose itself: say so
+    // where the operator looks before confirming.
+    const bool unverified = result.basis == "saved_pose_unverified";
+    const std::string note =
+        unverified ? "accepted without visual verification near the saved pose; check the pose "
+                     "on the map before spot.localize.confirm"
+                   : "";
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
-      localization_confirmation_.OnAutomaticLocalization(result.localized_waypoint_id);
+      localization_confirmation_.OnAutomaticLocalization(result.localized_waypoint_id, note);
     }
     const std::string detail = localize_detail(result) + "; " + seed +
+                               (unverified ? "; UNVERIFIED: " + note : std::string()) +
                                "; unconfirmed, navigation blocked until spot.localize.confirm";
     EmitLog(tag + " succeeded waypoint_id=" + result.localized_waypoint_id + " " + detail);
     RecordLocalizeResult("restart_recovery", true, result.localized_waypoint_id, detail);
@@ -5536,11 +5572,45 @@ void Adapter::RunLocalizationRecoveryAttempt(const std::string& map_id,
                            "), navigation blocked; " + localize_detail(result));
 }
 
+void Adapter::DropRecoveryRetry(const std::string& why) {
+  bool was_pending = false;
+  {
+    std::lock_guard<std::mutex> lk(recovery_retry_mu_);
+    was_pending = recovery_retry_pending_;
+    recovery_retry_pending_ = false;
+  }
+  if (was_pending) EmitLog("[graphnav] restart localization recovery retry dropped: " + why);
+}
+
+bool Adapter::MapActivityBlocksRecovery() {
+  if (map_command_active_.load() > 0 || map_recording_active_.load() ||
+      map_processing_active_.load()) {
+    return true;
+  }
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (HasActiveMappingSessionLocked()) return true;
+  }
+  std::lock_guard<std::mutex> lk(command_queue_mu_);
+  for (const auto& queued : command_queue_) {
+    if (queued.command().rfind("spot.map.", 0) == 0) return true;
+  }
+  return false;
+}
+
 void Adapter::MaybeRetryLocalizationRecovery(long long now) {
   std::string map_id;
   LastLocalization last;
   int attempt = 0;
   long long restore_ms = 0;
+  RecoveryRetryCheck check;
+  {
+    std::lock_guard<std::mutex> lk(recovery_retry_mu_);
+    if (!recovery_retry_pending_) return;
+  }
+  // Seen on any tick while a retry waits: a walk or dock (including the teleop
+  // dock and return-and-dock, which are not queued commands) invalidates it.
+  if (IsGraphNavNavigationActive() || docking_in_progress_.load()) ++motion_epoch_;
   {
     std::lock_guard<std::mutex> lk(recovery_retry_mu_);
     if (!recovery_retry_pending_ || now < recovery_retry_at_ms_) return;
@@ -5549,6 +5619,10 @@ void Adapter::MaybeRetryLocalizationRecovery(long long now) {
     last = recovery_retry_last_;
     attempt = recovery_retry_attempt_;
     restore_ms = recovery_retry_restore_ms_;
+    check.first_attempt_ms = recovery_retry_first_ms_;
+    check.motion_epoch_at_first = recovery_retry_motion_epoch_;
+    check.has_odom_at_first = recovery_retry_first_pose_.has_odom;
+    check.odom_at_first = recovery_retry_first_pose_.odom_tform_body;
   }
   auto later = [&](long long delay_ms) {
     std::lock_guard<std::mutex> lk(recovery_retry_mu_);
@@ -5556,8 +5630,10 @@ void Adapter::MaybeRetryLocalizationRecovery(long long now) {
     recovery_retry_at_ms_ = now + delay_ms;
   };
   auto drop = [&](const std::string& why) {
-    EmitLog("[graphnav] restart localization recovery retry dropped: " + why);
-    RecordLocalizeResult("restart_recovery", false, last.waypoint_id, "retry dropped: " + why);
+    EmitLog("[graphnav] restart localization recovery retry dropped: " + why +
+            "; robot left unlocalized");
+    RecordLocalizeResult("restart_recovery", false, last.waypoint_id,
+                         "retry dropped: " + why + "; robot left unlocalized");
   };
   if (!SpotConnected()) {
     later(1000);
@@ -5581,28 +5657,51 @@ void Adapter::MaybeRetryLocalizationRecovery(long long now) {
       return;
     }
   }
-  std::string current_waypoint;
-  if (spot_.GetLocalizationWaypointId(&current_waypoint)) {
-    // Something else (a fiducial, spot.localize) localized the robot meanwhile.
-    EmitLog("[graphnav] restart localization recovery retry not needed: robot is localized at "
-            "waypoint_id=" + current_waypoint);
+  // The retry reuses attempt 1's guess, so it is only valid while nothing could
+  // have moved the robot: same motion epoch, odometry within 0.1 m / 5 deg, and
+  // inside the restore-delay window counted from attempt 1.
+  BodyPoseSample body;
+  const bool have_body = spot_.GetBodyPoseSample(&body);
+  check.now_ms = now;
+  check.max_window_ms = SecondsToMsClamped(cfg_.localize_recovery_max_restore_delay_sec);
+  check.motion_epoch_now = motion_epoch_.load();
+  check.has_odom_now = have_body && body.has_odom;
+  check.odom_now = body.odom_tform_body;
+  check.map_activity = MapActivityBlocksRecovery();
+  const RecoveryRetryGateDecision gate = CheckRecoveryRetry(check);
+  if (gate.gate == RecoveryRetryGate::kWait) {
+    later(1000);
+    return;
+  }
+  if (gate.gate == RecoveryRetryGate::kDrop) {
+    drop(gate.reason);
     return;
   }
   {
     std::lock_guard<std::mutex> lk(nav_state_mu_);
-    if (localization_confirmation_.recovery_in_progress()) {
+    std::string refusal;
+    // Keeps the current confirmation state, unlike OnRecoveryStarted, so finding
+    // the robot already localized below changes nothing.
+    if (!localization_confirmation_.TryBeginRecoveryRetry(&refusal)) {
       later(1000);  // an operator spot.localize is running; look again after it
       return;
     }
-    localization_confirmation_.OnRecoveryStarted();
   }
   LocalizeAttemptWindow window(&nav_state_mu_, &localization_confirmation_, true);
+  // Read inside the window: nothing else can localize the robot from here on,
+  // and anything that did before (a fiducial, spot.localize) wins.
+  std::string current_waypoint;
+  if (spot_.GetLocalizationWaypointId(&current_waypoint)) {
+    EmitLog("[graphnav] restart localization recovery retry not needed: robot is localized at "
+            "waypoint_id=" + current_waypoint);
+    return;
+  }
   SpotClient::StoredMap map_data;
   if (!LoadMapFromDisk(map_id, &map_data)) {
     drop("could not read map " + map_id + " from disk");
     return;
   }
-  RunLocalizationRecoveryAttempt(map_id, map_data, last, attempt);
+  RunLocalizationRecoveryAttempt(map_id, map_data, last, attempt, have_body ? &body : nullptr);
 }
 
 bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
@@ -5610,6 +5709,9 @@ bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
   std::string text;
   (void)ExtractCommandText(request, &text);
   const LocalizeCommandParams params = ParseLocalizeCommandParams(text);
+  // An operator choosing where the robot is replaces any automatic retry,
+  // whether this attempt succeeds or not.
+  DropRecoveryRetry("operator spot.localize");
   auto reject = [&](const std::string& waypoint_id, const std::string& reason) {
     EmitLog("[graphnav] " + action + " rejected: " + reason);
     RecordLocalizeResult("command", false, waypoint_id, reason);
@@ -6436,6 +6538,8 @@ bool Adapter::ExecuteUndockCommand() {
 
 bool Adapter::ExecuteQueuedCommand(const v1::model::CommandRequest& request) {
   const std::string& command = request.command();
+  // A pending restart recovery retry must not reuse a guess from before a move.
+  if (IsMotionCommand(command)) ++motion_epoch_;
   if (command != "spot.jetson.reboot" && !SpotConnected()) {
     EmitLog(std::string("[command] rejected while robot unavailable: ") + command);
     return false;
@@ -6529,6 +6633,7 @@ void Adapter::HandleButtons(const v1::model::Bitset& bitset, const std::string& 
 }
 
 void Adapter::HandleButtonPress(const std::string& button_key, const std::string& source_stream) {
+  ++motion_epoch_;  // any teleop button invalidates a pending restart recovery retry
   const std::string norm_key = normalize_button_token(button_key);
   const std::string norm_stream = normalize_button_token(source_stream);
   const auto matches = [&](const std::string& configured_name,
@@ -6933,6 +7038,7 @@ void Adapter::ApplyTeleopTwist(const v1::model::Twist& twist, int source_id,
   const bool has_motion = translational_cmd_nonzero || pitch_cmd_nonzero;
   const int active_source = active_motion_source_.load();
   if (has_motion) {
+    ++motion_epoch_;  // invalidates a pending restart recovery retry
     if (active_source != source_id) {
       active_motion_source_ = source_id;
       EmitLog(std::string("[teleop] motion source active=") + source_name);
@@ -8970,6 +9076,12 @@ void Adapter::PublishGraphNavNavState(long long now) {
 }
 
 bool Adapter::HandleMapCommand(const v1::model::CommandRequest& request) {
+  // Restart recovery retries wait while this runs (MapActivityBlocksRecovery).
+  struct MapCommandMark {
+    std::atomic<int>* n;
+    explicit MapCommandMark(std::atomic<int>* c) : n(c) { ++*n; }
+    ~MapCommandMark() { --*n; }
+  } map_command_mark(&map_command_active_);
   std::string text;
   (void)ExtractCommandText(request, &text);
 
