@@ -86,6 +86,31 @@ int main() {
           "recovery verifies visual alignment");
     check(!req.has_ko_tform_body(), "recovery never sends ko_tform_body, even if odom is given");
   }
+  {
+    // Unverified second pass after a reboot: standing when saved, sitting now.
+    fsa::LastLocalization saved;
+    saved.map_id = "m";
+    saved.waypoint_id = "wp-9";
+    saved.has_waypoint_tform_body = true;
+    saved.x = 1.5;
+    saved.z = 0.01;
+    saved.has_body_height = true;
+    saved.body_height_m = 0.52;
+    auto spec = fsa::RecoveryLocalizeSpec(saved, false, true, 0.22);
+    spec.neighbors.push_back({"wp-10", fsa::LocalizePose{2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0}});
+    const auto req = fsa::BuildWaypointSetLocalizationRequest(spec, &odom);
+    check(req.fiducial_init() == SetLocalizationRequest::FIDUCIAL_INIT_NO_FIDUCIAL,
+          "second pass does not use fiducials");
+    check(req.refinement_case() == SetLocalizationRequest::kRefineWithVisualFeatures &&
+              !req.refine_with_visual_features().verify_refinement_quality(),
+          "second pass refines without verification");
+    check(near(req.initial_guess().waypoint_tform_body().position().z(), 0.01 - 0.30),
+          "guess height follows the body height change");
+    check(req.initial_guess().waypoint_id() == "wp-9",
+          "neighbors are for measuring the result only, never sent");
+    check(near(req.max_distance(), 0.5), "second pass keeps the same search distance");
+    check(!req.has_ko_tform_body(), "second pass never sends ko_tform_body");
+  }
 
   if (failures == 0) std::cout << "localize_request_test: all checks passed" << std::endl;
   return failures == 0 ? 0 : 1;

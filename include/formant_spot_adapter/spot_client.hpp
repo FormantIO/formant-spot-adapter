@@ -335,6 +335,10 @@ class SpotClient {
   bool SetLocalizationAtWaypoint(const WaypointLocalizeRequest& request,
                                  const LocalizeAcceptancePolicy& policy,
                                  WaypointLocalizeResult* out_result);
+  // Height of the body above Spot's ground plane estimate ("gpe" frame), meters.
+  // About 0.5 standing and lower sitting. False when the robot state has no
+  // ground plane estimate.
+  bool GetBodyHeightAboveGround(double* out_height_m);
   bool GetLocalizationWaypointId(std::string* out_waypoint_id);
   bool GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot);
   bool GetLocalizationMapSnapshot(LocalizationMapSnapshot* out_snapshot);

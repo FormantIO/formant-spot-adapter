@@ -1837,14 +1837,18 @@ bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& reques
   if (status == SetLocalizationResponse::STATUS_OK) {
     const auto& loc = r.response.localization();
     result.localized_waypoint_id = loc.waypoint_id();
-    if (loc.waypoint_id() == request.waypoint_id && loc.has_waypoint_tform_body()) {
+    if (loc.has_waypoint_tform_body()) {
       const auto& t = loc.waypoint_tform_body();
       const LocalizePose got{t.position().x(), t.position().y(), t.position().z(),
                              t.rotation().x(), t.rotation().y(), t.rotation().z(),
                              t.rotation().w()};
-      result.has_correction = true;
-      PoseCorrection(request.waypoint_tform_body, got, &result.correction_m,
-                     &result.correction_z_m, &result.correction_yaw_rad);
+      // On the guessed waypoint, or on a neighbor the request listed.
+      LocalizePose got_in_guess_frame;
+      if (ResultInGuessFrame(request, loc.waypoint_id(), got, &got_in_guess_frame)) {
+        result.has_correction = true;
+        PoseCorrection(request.waypoint_tform_body, got_in_guess_frame, &result.correction_m,
+                       &result.correction_z_m, &result.correction_yaw_rad);
+      }
     }
   }
   LocalizeResponseFacts facts;
@@ -1869,6 +1873,26 @@ bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& reques
     return finish(false);
   }
   return finish(true);
+}
+
+bool SpotClient::GetBodyHeightAboveGround(double* out_height_m) {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!out_height_m) return false;
+  if (!EnsureRobotStateClient()) return false;
+  auto state = robot_state_client_->GetRobotState();
+  if (!state.status) {
+    SetLastError(state.status.DebugString());
+    return false;
+  }
+  ::bosdyn::api::SE3Pose gpe_tform_body;
+  if (!::bosdyn::api::get_a_tform_b(state.response.robot_state().kinematic_state().transforms_snapshot(),
+                                    ::bosdyn::api::kGroundPlaneEstimateFrame,
+                                    ::bosdyn::api::kBodyFrame, &gpe_tform_body)) {
+    SetLastError("robot state has no gpe->body transform");
+    return false;
+  }
+  *out_height_m = gpe_tform_body.position().z();
+  return true;
 }
 
 bool SpotClient::GetLocalizationWaypointId(std::string* out_waypoint_id) {

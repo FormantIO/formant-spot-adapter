@@ -5,6 +5,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "formant_spot_adapter/localize_recovery.hpp"
 
@@ -241,20 +242,268 @@ void test_throttle() {
 
   fsa::LastLocalizationThrottle seeded;
   seeded.Seed(a);
-  check(!seeded.ShouldPersist(a, 100), "seeded from disk: same record is not rewritten at startup");
-  check(seeded.ShouldPersist(b, 100), "seeded from disk: a different waypoint is written at once");
+  const long long startup = a.updated_ms + 1000;
+  check(!seeded.ShouldPersist(a, startup),
+        "seeded from disk: same fresh record is not rewritten at startup");
+  check(seeded.ShouldPersist(b, startup), "seeded from disk: a different waypoint is written at once");
 }
 
+fsa::LocalizeResponseFacts facts(const std::string& status, const std::string& quality,
+                                 bool ambiguity = false);
+
 void test_fiducial_errors() {
-  check(fsa::IsNoUsableFiducialError("SetLocalization failed status=STATUS_NO_MATCHING_FIDUCIAL (8)"),
-        "no matching fiducial is recognized");
-  check(fsa::IsNoUsableFiducialError("status=STATUS_FIDUCIAL_TOO_FAR_AWAY"), "too far is recognized");
-  check(fsa::IsNoUsableFiducialError("status=status_fiducial_too_old"), "case insensitive");
-  check(fsa::IsNoUsableFiducialError("STATUS_FIDUCIAL_POSE_UNCERTAIN"), "uncertain is recognized");
-  check(!fsa::IsNoUsableFiducialError("SetLocalization failed status=STATUS_ROBOT_IMPAIRED (2)"),
-        "impaired is not a fiducial problem");
-  check(!fsa::IsNoUsableFiducialError("STATUS_NO_MAP_LOADED"), "no map is not a fiducial problem");
-  check(!fsa::IsNoUsableFiducialError(""), "empty error is not a fiducial problem");
+  // Nov 12, Walt rebooted 2 m from his dock, no tag in view: the nearest-fiducial
+  // attempt answered plain STATUS_FAILED. That must not block recovery.
+  check(fsa::FiducialFailureBlocksWaypointRecovery(
+            "SetLocalization failed status=STATUS_FAILED (5)").empty(),
+        "STATUS_FAILED (no tag in view with FIDUCIAL_INIT_NEAREST) allows recovery");
+  for (const char* e : {"SetLocalization failed status=STATUS_NO_MATCHING_FIDUCIAL (8)",
+                        "status=STATUS_FIDUCIAL_TOO_FAR_AWAY", "status=status_fiducial_too_old",
+                        "STATUS_FIDUCIAL_POSE_UNCERTAIN",
+                        "SetLocalization failed status=STATUS_ROBOT_IMPAIRED (2)",
+                        "SetLocalization failed status=STATUS_ABORTED (4)",
+                        "rpc error: deadline exceeded", ""}) {
+    check(fsa::FiducialFailureBlocksWaypointRecovery(e).empty(),
+          std::string("a waypoint guess may help after: ") + e);
+  }
+  const std::string no_map =
+      fsa::FiducialFailureBlocksWaypointRecovery("SetLocalization failed status=STATUS_NO_MAP_LOADED (12)");
+  check(contains(no_map, "no map"), "no map loaded blocks recovery: " + no_map);
+  const std::string sensors =
+      fsa::FiducialFailureBlocksWaypointRecovery("status=status_incompatible_sensors");
+  check(contains(sensors, "sensor"), "incompatible sensors block recovery (case insensitive): " +
+                                         sensors);
+}
+
+void test_throttle_refresh() {
+  // A robot that stands still keeps its record fresh, so a reboot an hour later
+  // still finds a record younger than the age limit.
+  fsa::LastLocalizationThrottle t(5000, 0.5, 0.2617993877991494, 60000);
+  const auto a = with_pose(rec("m", "wp-a"), 0.0, 0.0, 0.0);
+  t.MarkPersisted(a, 1000);
+  check(!t.ShouldPersist(a, 30000), "unchanged, 29 s later: not rewritten");
+  check(t.ShouldPersist(a, 61000), "unchanged, 60 s later: refreshed");
+  t.MarkPersisted(a, 61000);
+  check(!t.ShouldPersist(a, 100000), "refresh resets the clock");
+  check(t.ShouldPersist(a, 121000), "and refreshes again a minute later");
+
+  fsa::LastLocalizationThrottle off(5000, 0.5, 0.2617993877991494, 0);
+  off.MarkPersisted(a, 1000);
+  check(!off.ShouldPersist(a, 10LL * 3600 * 1000), "refresh interval 0: never refreshed");
+
+  // Seeded from disk: the record's own timestamp counts as the last write.
+  fsa::LastLocalizationThrottle seeded;
+  auto old_rec = a;
+  old_rec.updated_ms = 1000000;
+  seeded.Seed(old_rec);
+  check(!seeded.ShouldPersist(a, 1000000 + 30000), "fresh record on disk: not rewritten at once");
+  check(seeded.ShouldPersist(a, 1000000 + 2LL * 3600 * 1000),
+        "stale record on disk and the robot is still localized: refreshed");
+  check(seeded.ShouldPersist(a, 500000), "record stamped ahead of the clock: rewritten");
+  fsa::LastLocalizationThrottle back;
+  back.MarkPersisted(a, 1000000);
+  check(back.ShouldPersist(a, 900000), "clock set back after a write: rewritten, not stuck");
+}
+
+void test_body_height_serialization() {
+  auto r = with_pose(rec("m", "wp"), 0.1, 0.2, 0.0);
+  r.has_body_height = true;
+  r.body_height_m = 0.523;
+  fsa::LastLocalization back;
+  check(fsa::ParseLastLocalization(fsa::SerializeLastLocalization(r), &back), "parses");
+  check(back.has_body_height && near(back.body_height_m, 0.523), "body height round trips");
+  fsa::LastLocalization old_format;
+  check(fsa::ParseLastLocalization("map_id=m\nwaypoint_id=w\nupdated_ms=5\n", &old_format),
+        "a record written before body_height_m existed still parses");
+  check(!old_format.has_body_height, "and has no body height");
+  fsa::LastLocalization bad;
+  check(fsa::ParseLastLocalization("map_id=m\nwaypoint_id=w\nbody_height_m=nan\n", &bad) &&
+            !bad.has_body_height,
+        "a non-finite body height is dropped");
+}
+
+void test_recovery_seed() {
+  auto saved = with_pose(rec("m", "wp-9"), 1.0, -0.4, 0.3);
+  saved.z = 0.02;
+  {
+    const auto p = fsa::RecoverySeedPose(saved, false, 0.0);
+    check(near(p.x, 1.0) && near(p.y, -0.4) && near(p.z, 0.02),
+          "seed is the saved offset from the waypoint");
+    check(near(p.qz, saved.qz) && near(p.qw, saved.qw), "seed keeps the saved heading");
+  }
+  saved.has_body_height = true;
+  saved.body_height_m = 0.52;  // standing when saved
+  {
+    const auto p = fsa::RecoverySeedPose(saved, true, 0.22);  // sitting after the reboot
+    check(near(p.z, 0.02 - 0.30), "sitting after the reboot: guess drops by the height change");
+    check(near(p.x, 1.0) && near(p.y, -0.4), "height correction leaves x, y alone");
+  }
+  {
+    const auto p = fsa::RecoverySeedPose(saved, false, 0.0);
+    check(near(p.z, 0.02), "current height unknown: saved z used");
+  }
+  {
+    const auto p = fsa::RecoverySeedPose(saved, true, 3.5);
+    check(near(p.z, 0.02), "implausible height change (over 1 m) is ignored");
+  }
+  {
+    const auto p = fsa::RecoverySeedPose(saved, true, std::numeric_limits<double>::quiet_NaN());
+    check(near(p.z, 0.02), "non-finite current height is ignored");
+  }
+  {
+    const auto p = fsa::RecoverySeedPose(rec("m", "wp-9"), true, 0.2);
+    check(near(p.x, 0.0) && near(p.z, 0.0) && near(p.qw, 1.0),
+          "no saved offset: identity at the waypoint");
+  }
+  {
+    const auto spec = fsa::RecoveryLocalizeSpec(saved, false, true, 0.22);
+    check(!spec.verify_visual_refinement && spec.refine_with_visual_features,
+          "unverified pass still refines visually");
+    check(near(spec.waypoint_tform_body.z, 0.02 - 0.30), "spec carries the corrected seed");
+    check(!spec.send_current_ko_tform_body, "never odom: the reboot reset it");
+    check(spec.do_ambiguity_check, "ambiguity check on in both passes");
+    const fsa::WaypointLocalizeLimits defaults;
+    check(near(spec.max_distance_m, defaults.max_distance_m) &&
+              near(spec.max_yaw_rad, defaults.max_yaw_rad),
+          "same search window in both passes");
+  }
+}
+
+void test_pose_math() {
+  const double yaw = 0.5 * 3.14159265358979323846;  // 90 deg
+  const fsa::LocalizePose a_tform_b{1.0, 2.0, 0.0, 0.0, 0.0, std::sin(yaw / 2), std::cos(yaw / 2)};
+  const fsa::LocalizePose b_tform_c{1.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0};
+  const auto a_tform_c = fsa::ComposePoses(a_tform_b, b_tform_c);
+  check(near(a_tform_c.x, 1.0) && near(a_tform_c.y, 3.0) && near(a_tform_c.z, 0.5),
+        "compose rotates the second offset by the first heading");
+  check(near(a_tform_c.qz, std::sin(yaw / 2)) && near(a_tform_c.qw, std::cos(yaw / 2)),
+        "compose keeps the heading");
+  const auto back = fsa::ComposePoses(a_tform_b, fsa::InvertPose(a_tform_b));
+  check(near(back.x, 0.0) && near(back.y, 0.0) && near(back.z, 0.0) && near(std::fabs(back.qw), 1.0),
+        "a pose composed with its inverse is identity");
+  const auto inv = fsa::InvertPose(a_tform_b);
+  check(near(inv.x, -2.0) && near(inv.y, 1.0), "inverse position is rotated back");
+}
+
+void test_neighbor_correction() {
+  // wp-a -> wp-b is 2 m straight ahead; wp-c -> wp-a is 1 m ahead of wp-c.
+  std::vector<fsa::WaypointEdgeTform> edges = {
+      {"wp-a", "wp-b", {2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0}},
+      {"wp-c", "wp-a", {1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0}},
+      {"wp-b", "wp-d", {5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0}},
+  };
+  const auto n = fsa::NeighborTforms("wp-a", edges);
+  check(n.size() == 2, "two neighbors one edge away (wp-d is two away)");
+  fsa::WaypointLocalizeSpec spec;
+  spec.waypoint_id = "wp-a";
+  spec.waypoint_tform_body = {1.9, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0};  // guess: near wp-b
+  spec.neighbors = n;
+  fsa::LocalizePose out;
+  // GraphNav answers relative to wp-b, 0.05 m behind it.
+  check(fsa::ResultInGuessFrame(spec, "wp-b", {-0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0}, &out),
+        "a result on a neighbor is expressed in the guess frame");
+  check(near(out.x, 1.95) && near(out.y, 0.0), "via the edge transform");
+  double xy = 0.0;
+  double z = 0.0;
+  double dyaw = 0.0;
+  fsa::PoseCorrection(spec.waypoint_tform_body, out, &xy, &z, &dyaw);
+  check(near(xy, 0.05), "so the correction is measurable: 5 cm");
+  check(fsa::ResultInGuessFrame(spec, "wp-c", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0}, &out) &&
+            near(out.x, -1.0),
+        "edge stored the other way round is inverted");
+  check(fsa::ResultInGuessFrame(spec, "wp-a", spec.waypoint_tform_body, &out) && near(out.x, 1.9),
+        "result on the guessed waypoint is used as is");
+  check(!fsa::ResultInGuessFrame(spec, "wp-d", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0}, &out),
+        "a waypoint two edges away is not measurable");
+}
+
+void test_recovery_passes() {
+  const auto first = fsa::RecoveryAcceptancePolicy();
+  const auto second = fsa::RecoveryAcceptancePolicy(true);
+  check(!first.allow_skipped_with_small_correction, "verified pass: no small-correction rule");
+  check(second.allow_skipped_with_small_correction, "unverified pass: small-correction rule");
+  check(near(second.max_correction_m, 0.25), "near means within 0.25 m of the saved pose");
+  check(fsa::RecoveryNeedsUnverifiedPass(false, false, "STATUS_VISUAL_ALIGNMENT_FAILED"),
+        "visual alignment failed, nothing applied: run the unverified pass");
+  check(!fsa::RecoveryNeedsUnverifiedPass(true, true, "STATUS_OK"), "accepted: no second pass");
+  check(!fsa::RecoveryNeedsUnverifiedPass(false, true, "STATUS_OK"),
+        "applied but rejected: no second pass (it gets cleared)");
+  check(!fsa::RecoveryNeedsUnverifiedPass(false, false, "STATUS_FAILED"),
+        "no match: no second pass");
+
+  auto f = facts("STATUS_OK", "QUALITY_CHECK_SKIPPED");
+  f.visual_verification_requested = false;
+  f.has_correction = true;
+  f.correction_m = 0.08;
+  f.correction_yaw_rad = 0.05;
+  {
+    const auto a = fsa::EvaluateWaypointLocalization(f, second);
+    check(a.ok && a.basis == "saved_pose_small_correction",
+          "unverified pass: found where it was saved, accepted: " + a.basis + a.reason);
+  }
+  {
+    const auto a = fsa::EvaluateWaypointLocalization(f, first);
+    check(!a.ok && a.applied, "same facts under the verified-pass policy: rejected");
+  }
+  {
+    auto far = f;
+    far.correction_m = 0.4;
+    const auto a = fsa::EvaluateWaypointLocalization(far, second);
+    check(!a.ok && a.applied && contains(a.reason, "0.4"),
+          "moved 0.4 m from the saved pose: rejected: " + a.reason);
+  }
+  {
+    auto turned = f;
+    turned.correction_yaw_rad = 0.3;
+    check(!fsa::EvaluateWaypointLocalization(turned, second).ok, "turned 17 deg: rejected");
+  }
+  {
+    auto unknown = f;
+    unknown.has_correction = false;
+    check(!fsa::EvaluateWaypointLocalization(unknown, second).ok,
+          "correction unknown (not the saved waypoint or a neighbor): rejected");
+  }
+  {
+    auto amb = f;
+    amb.suspected_ambiguity = true;
+    check(!fsa::EvaluateWaypointLocalization(amb, second).ok, "ambiguity: rejected");
+  }
+  {
+    auto poor = f;
+    poor.quality_check = "QUALITY_CHECK_BAD_HEIGHT";
+    check(!fsa::EvaluateWaypointLocalization(poor, second).ok, "bad height: rejected");
+  }
+  {
+    const auto a = fsa::EvaluateWaypointLocalization(f, fsa::OperatorAcceptancePolicy());
+    check(a.ok && a.basis == "operator_small_correction", "operator basis unchanged");
+  }
+}
+
+void test_recovery_retry() {
+  const fsa::RecoveryRetryPolicy policy;
+  {
+    const auto d = fsa::DecideRecoveryRetry(false, "STATUS_ROBOT_IMPAIRED", 1, policy);
+    check(d.retry && d.delay_ms == 10000, "impaired right after the reboot: retry in 10 s");
+    check(contains(d.reason, "attempt 2 of 6"), "reason counts attempts: " + d.reason);
+  }
+  check(fsa::DecideRecoveryRetry(false, "", 1, policy).retry, "no answer (rpc, time sync): retry");
+  check(fsa::DecideRecoveryRetry(false, "STATUS_UNKNOWN", 2, policy).retry, "unknown: retry");
+  check(fsa::DecideRecoveryRetry(false, "STATUS_ABORTED", 2, policy).retry, "aborted: retry");
+  {
+    const auto d = fsa::DecideRecoveryRetry(false, "STATUS_ROBOT_IMPAIRED", 6, policy);
+    check(!d.retry && contains(d.reason, "giving up"), "six attempts: give up: " + d.reason);
+  }
+  for (const char* st : {"STATUS_FAILED", "STATUS_VISUAL_ALIGNMENT_FAILED", "STATUS_UNKNOWN_WAYPOINT",
+                         "STATUS_NO_MAP_LOADED", "STATUS_INCOMPATIBLE_SENSORS"}) {
+    check(!fsa::DecideRecoveryRetry(false, st, 1, policy).retry,
+          std::string("final, no further guessing: ") + st);
+  }
+  check(!fsa::DecideRecoveryRetry(true, "STATUS_OK", 1, policy).retry,
+        "applied but rejected: final");
+  fsa::RecoveryRetryPolicy off;
+  off.retry_interval_ms = 0;
+  check(!fsa::DecideRecoveryRetry(false, "STATUS_ROBOT_IMPAIRED", 1, off).retry,
+        "interval 0 turns retries off");
 }
 
 fsa::WaypointRecoveryInputs walt_after_reboot() {
@@ -273,7 +522,7 @@ fsa::WaypointRecoveryInputs walt_after_reboot() {
 }
 
 fsa::LocalizeResponseFacts facts(const std::string& status, const std::string& quality,
-                                 bool ambiguity = false) {
+                                 bool ambiguity) {
   fsa::LocalizeResponseFacts f;
   f.status = status;
   f.quality_check = quality;
@@ -632,11 +881,51 @@ void test_recovery_decision() {
     check(!fsa::DecideWaypointRecovery(in).attempt, "fiducial success: no recovery");
   }
   {
+    // Nov 12: Walt rebooted about 2 m from his dock, no tag in view. The old
+    // gate skipped this ("a reason a waypoint guess does not fix").
+    auto in = walt_after_reboot();
+    in.fiducial_error = "SetLocalization failed status=STATUS_FAILED (5)";
+    const auto plan = fsa::DecideWaypointRecovery(in);
+    check(plan.attempt, "STATUS_FAILED with no tag in view: attempt");
+    check(contains(plan.reason, "STATUS_FAILED") && contains(plan.reason, "wp-9m-from-dock"),
+          "reason carries the fiducial error and the waypoint: " + plan.reason);
+  }
+  {
     auto in = walt_after_reboot();
     in.fiducial_error = "SetLocalization failed status=STATUS_ROBOT_IMPAIRED (2)";
+    check(fsa::DecideWaypointRecovery(in).attempt,
+          "impaired right after a reboot: attempt (and retry while impaired)");
+  }
+  {
+    auto in = walt_after_reboot();
+    in.fiducial_error = "SetLocalization failed status=STATUS_NO_MAP_LOADED (12)";
     const auto plan = fsa::DecideWaypointRecovery(in);
-    check(!plan.attempt, "impaired robot: no recovery");
-    check(contains(plan.reason, "ROBOT_IMPAIRED"), "reason carries the error: " + plan.reason);
+    check(!plan.attempt && contains(plan.reason, "NO_MAP_LOADED"),
+          "no map loaded: no recovery: " + plan.reason);
+  }
+  {
+    // Standing still for two hours before the reboot. The record was refreshed
+    // a minute before the reboot, so it is fresh even though nothing moved.
+    fsa::LastLocalizationThrottle t;
+    auto saved = with_pose(rec("demo_map", "wp-near-dock"), 1.8, 0.4, 0.2);
+    const long long t0 = saved.updated_ms;
+    t.MarkPersisted(saved, t0);
+    long long last_write = t0;
+    for (long long now = t0; now <= t0 + 2LL * 3600 * 1000; now += 1000) {
+      if (t.ShouldPersist(saved, now)) {
+        t.MarkPersisted(saved, now);
+        last_write = now;
+      }
+    }
+    saved.updated_ms = last_write;
+    auto in = walt_after_reboot();
+    in.fiducial_error = "SetLocalization failed status=STATUS_FAILED (5)";
+    in.last = saved;
+    in.last.map_id = "demo_map";
+    in.now_ms = t0 + 2LL * 3600 * 1000 + 4LL * 60 * 1000;  // body back about 4 min later
+    in.max_record_age_ms = 1800LL * 1000;                 // default 30 min
+    const auto plan = fsa::DecideWaypointRecovery(in);
+    check(plan.attempt, "idle two hours, record refreshed while localized: attempt: " + plan.reason);
   }
   {
     auto in = walt_after_reboot();
@@ -712,6 +1001,13 @@ int main() {
   test_file_io();
   test_throttle();
   test_fiducial_errors();
+  test_throttle_refresh();
+  test_body_height_serialization();
+  test_recovery_seed();
+  test_pose_math();
+  test_neighbor_correction();
+  test_recovery_passes();
+  test_recovery_retry();
   test_acceptance();
   test_pose_correction();
   test_detail_and_confirmation_need();

@@ -93,6 +93,33 @@ std::string localize_detail(const SpotClient::WaypointLocalizeResult& r) {
   return FormatLocalizeDetail(f);
 }
 
+// The map's edges as plain transforms, for NeighborTforms.
+std::vector<WaypointEdgeTform> edge_tforms(const ::bosdyn::api::graph_nav::Graph& graph) {
+  std::vector<WaypointEdgeTform> out;
+  out.reserve(static_cast<size_t>(graph.edges_size()));
+  for (const auto& edge : graph.edges()) {
+    const auto& t = edge.from_tform_to();
+    out.push_back({edge.id().from_waypoint(), edge.id().to_waypoint(),
+                   LocalizePose{t.position().x(), t.position().y(), t.position().z(),
+                                t.rotation().x(), t.rotation().y(), t.rotation().z(),
+                                t.rotation().w()}});
+  }
+  return out;
+}
+
+// "x=0.120 y=-0.050 z=0.010 yaw_deg=12.0" for a recovery seed.
+std::string seed_text(const LocalizePose& p) {
+  std::ostringstream oss;
+  oss.setf(std::ios::fixed);
+  oss.precision(3);
+  const double yaw = std::atan2(2.0 * (p.qw * p.qz + p.qx * p.qy),
+                                1.0 - 2.0 * (p.qy * p.qy + p.qz * p.qz));
+  oss << "x=" << p.x << " y=" << p.y << " z=" << p.z;
+  oss.precision(1);
+  oss << " yaw_deg=" << yaw * 180.0 / 3.14159265358979323846;
+  return oss.str();
+}
+
 // Closes a localization attempt window (LocalizationConfirmation::OnRecoveryStarted
 // or TryBeginOperatorAttempt) on every exit path, exceptions included.
 class LocalizeAttemptWindow {
@@ -4018,6 +4045,7 @@ void Adapter::LeaseRetainLoop() {
     const long long now = now_ms();
     MaybeScheduleRestoreForEmptyRobotGraph(now);
     MaybeRestoreActiveMap(now);
+    MaybeRetryLocalizationRecovery(now);
     PollGraphNavNavigation(now);
 
     if (lease_owned_ && SpotConnected() &&
@@ -5813,8 +5841,13 @@ std::string Adapter::LastLocalizationPath() const {
 
 void Adapter::RecordLocalizeResult(const std::string& source, bool ok,
                                    const std::string& waypoint_id, const std::string& detail) {
+  RecordLocalizeOutcome(source, ok ? "ok" : "failed", waypoint_id, detail);
+}
+
+void Adapter::RecordLocalizeOutcome(const std::string& source, const std::string& result,
+                                    const std::string& waypoint_id, const std::string& detail) {
   std::lock_guard<std::mutex> lk(nav_state_mu_);
-  localize_result_ = ok ? "ok" : "failed";
+  localize_result_ = result;
   localize_source_ = source;
   localize_waypoint_id_ = waypoint_id;
   localize_detail_ = detail;
@@ -5854,8 +5887,19 @@ void Adapter::MaybePersistLastLocalization(const SpotClient::LocalizationSnapsho
   }
   rec.updated_ms = now;
 
+  {
+    std::lock_guard<std::mutex> lk(last_localization_mu_);
+    if (!last_localization_throttle_.ShouldPersist(rec, now)) return;
+  }
+  // Only when a write is due (about once a minute while standing still): one
+  // robot state read for the body height, so recovery can correct the guess
+  // for sitting versus standing.
+  double body_height_m = 0.0;
+  if (spot_.GetBodyHeightAboveGround(&body_height_m)) {
+    rec.has_body_height = true;
+    rec.body_height_m = body_height_m;
+  }
   std::lock_guard<std::mutex> lk(last_localization_mu_);
-  if (!last_localization_throttle_.ShouldPersist(rec, now)) return;
   std::string error;
   if (!SaveLastLocalization(LastLocalizationPath(), rec, &error)) {
     // Mark anyway so a broken disk does not log every second.
@@ -5930,15 +5974,23 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
   in.max_restore_delay_ms = SecondsToMsClamped(cfg_.localize_recovery_max_restore_delay_sec);
   const long long scheduled = restore_scheduled_ms_.load();
   in.restore_delay_ms = scheduled > 0 ? std::max(0LL, now - scheduled) : 0;
+  {
+    // A new restore supersedes a retry left over from an earlier one.
+    std::lock_guard<std::mutex> lk(recovery_retry_mu_);
+    recovery_retry_pending_ = false;
+  }
   const WaypointRecoveryPlan plan = DecideWaypointRecovery(in);
   if (!plan.attempt) {
     EmitLog("[graphnav] restart localization recovery skipped map_id=" + restored_map_id + ": " +
-            plan.reason);
+            plan.reason + "; robot left unlocalized");
+    // Keep the published result of the attempt this restore already made.
+    if (!in.already_attempted) {
+      RecordLocalizeResult("restart_recovery", false, in.last.waypoint_id,
+                           "skipped: " + plan.reason);
+    }
     return;
   }
   waypoint_recovery_attempted_ = true;
-
-  const SpotClient::WaypointLocalizeRequest request = RecoveryLocalizeSpec(in.last);
 
   std::string waypoint_name;
   {
@@ -5949,39 +6001,84 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
   EmitLog("[graphnav] restart localization recovery: " + plan.reason +
           (waypoint_name.empty() ? std::string() : " name=" + waypoint_name) +
           " saved_age_s=" + std::to_string(age_s) + " (robot is not moved)");
+  RunLocalizationRecoveryAttempt(restored_map_id, map_data, in.last, 1);
+}
+
+void Adapter::RunLocalizationRecoveryAttempt(const std::string& map_id,
+                                             const SpotClient::StoredMap& map_data,
+                                             const LastLocalization& last, int attempt) {
+  // The guess is the saved offset from the saved waypoint (never odom, which the
+  // reboot reset), with z corrected for sitting versus standing when both body
+  // heights are known.
+  double body_height_m = 0.0;
+  const bool has_body_height = spot_.GetBodyHeightAboveGround(&body_height_m);
+  SpotClient::WaypointLocalizeRequest request =
+      RecoveryLocalizeSpec(last, true, has_body_height, body_height_m);
+  request.neighbors = NeighborTforms(last.waypoint_id, edge_tforms(map_data.graph));
+  const std::string seed = "seed " + seed_text(request.waypoint_tform_body) +
+                           (last.has_waypoint_tform_body ? "" : " (no saved offset)") +
+                           (has_body_height && last.has_body_height ? " height_corrected" : "");
+  const std::string tag =
+      "[graphnav] restart localization recovery attempt=" + std::to_string(attempt);
+  EmitLog(tag + " waypoint_id=" + last.waypoint_id + " " + seed +
+          " max_distance_m=" + std::to_string(request.max_distance_m) +
+          " fiducial_init=NO_FIDUCIAL");
 
   SpotClient::WaypointLocalizeResult result;
-  if (spot_.SetLocalizationAtWaypoint(request, RecoveryAcceptancePolicy(), &result)) {
+  bool accepted = spot_.SetLocalizationAtWaypoint(request, RecoveryAcceptancePolicy(false), &result);
+  if (RecoveryNeedsUnverifiedPass(accepted, result.applied, result.status)) {
+    EmitLog(tag + ": visual alignment failed (nothing applied); repeating the same guess without "
+                  "visual verification, accepting it only within 0.25 m / 10 deg of the saved pose");
+    request.verify_visual_refinement = false;
+    accepted = spot_.SetLocalizationAtWaypoint(request, RecoveryAcceptancePolicy(true), &result);
+  }
+  if (accepted) {
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
       localization_confirmation_.OnAutomaticLocalization(result.localized_waypoint_id);
     }
-    const std::string detail =
-        localize_detail(result) + "; unconfirmed, navigation blocked until spot.localize.confirm";
-    EmitLog("[graphnav] restart localization recovery succeeded waypoint_id=" +
-            result.localized_waypoint_id + " " + detail);
+    const std::string detail = localize_detail(result) + "; " + seed +
+                               "; unconfirmed, navigation blocked until spot.localize.confirm";
+    EmitLog(tag + " succeeded waypoint_id=" + result.localized_waypoint_id + " " + detail);
     RecordLocalizeResult("restart_recovery", true, result.localized_waypoint_id, detail);
     return;
   }
 
   const std::string error = spot_.LastError();
   if (!result.applied) {
-    EmitLog("[graphnav] restart localization recovery failed: " + error + "; " +
+    const RecoveryRetryDecision retry =
+        DecideRecoveryRetry(false, result.status, attempt, RecoveryRetryPolicy{});
+    if (retry.retry) {
+      {
+        std::lock_guard<std::mutex> lk(recovery_retry_mu_);
+        recovery_retry_pending_ = true;
+        recovery_retry_at_ms_ = now_ms() + retry.delay_ms;
+        recovery_retry_attempt_ = attempt + 1;
+        recovery_retry_restore_ms_ = restore_scheduled_ms_.load();
+        recovery_retry_map_id_ = map_id;
+        recovery_retry_last_ = last;
+      }
+      EmitLog(tag + " not ready: " + error + "; " + retry.reason);
+      RecordLocalizeOutcome("restart_recovery", "retrying", last.waypoint_id,
+                            error + "; " + retry.reason + "; " + localize_detail(result));
+      return;
+    }
+    EmitLog(tag + " failed: " + error + "; " + retry.reason + "; robot left unlocalized; " +
             localize_detail(result));
-    RecordLocalizeResult("restart_recovery", false, in.last.waypoint_id,
-                         error + "; " + localize_detail(result));
+    RecordLocalizeResult("restart_recovery", false, last.waypoint_id,
+                         error + "; robot left unlocalized; " + localize_detail(result));
     return;
   }
   // GraphNav applied a localization we do not trust. Leave the robot unlocalized.
   std::string clear_error;
-  if (ClearRejectedLocalization(restored_map_id, map_data, &clear_error)) {
+  if (ClearRejectedLocalization(map_id, map_data, &clear_error)) {
     {
       std::lock_guard<std::mutex> lk(nav_state_mu_);
       localization_confirmation_.OnLocalizationCleared();
     }
-    EmitLog("[graphnav] restart localization recovery rejected (" + result.reason +
+    EmitLog(tag + " rejected (" + result.reason +
             "); localization cleared, robot left unlocalized; " + localize_detail(result));
-    RecordLocalizeResult("restart_recovery", false, in.last.waypoint_id,
+    RecordLocalizeResult("restart_recovery", false, last.waypoint_id,
                          result.reason + "; localization cleared; " + localize_detail(result));
     return;
   }
@@ -5990,12 +6087,80 @@ void Adapter::MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored
     localization_confirmation_.OnRejectedLocalization(result.localized_waypoint_id,
                                                       result.reason);
   }
-  EmitLog("[graphnav] restart localization recovery rejected (" + result.reason +
-          ") and clearing it failed: " + clear_error +
+  EmitLog(tag + " rejected (" + result.reason + ") and clearing it failed: " + clear_error +
           "; navigation blocked until the localization is confirmed or replaced");
-  RecordLocalizeResult("restart_recovery", false, in.last.waypoint_id,
+  RecordLocalizeResult("restart_recovery", false, last.waypoint_id,
                        result.reason + "; could not clear (" + clear_error +
                            "), navigation blocked; " + localize_detail(result));
+}
+
+void Adapter::MaybeRetryLocalizationRecovery(long long now) {
+  std::string map_id;
+  LastLocalization last;
+  int attempt = 0;
+  long long restore_ms = 0;
+  {
+    std::lock_guard<std::mutex> lk(recovery_retry_mu_);
+    if (!recovery_retry_pending_ || now < recovery_retry_at_ms_) return;
+    recovery_retry_pending_ = false;
+    map_id = recovery_retry_map_id_;
+    last = recovery_retry_last_;
+    attempt = recovery_retry_attempt_;
+    restore_ms = recovery_retry_restore_ms_;
+  }
+  auto later = [&](long long delay_ms) {
+    std::lock_guard<std::mutex> lk(recovery_retry_mu_);
+    recovery_retry_pending_ = true;
+    recovery_retry_at_ms_ = now + delay_ms;
+  };
+  auto drop = [&](const std::string& why) {
+    EmitLog("[graphnav] restart localization recovery retry dropped: " + why);
+    RecordLocalizeResult("restart_recovery", false, last.waypoint_id, "retry dropped: " + why);
+  };
+  if (!SpotConnected()) {
+    later(1000);
+    return;
+  }
+  if (restore_scheduled_ms_.load() != restore_ms) {
+    // A newer restore runs its own recovery.
+    EmitLog("[graphnav] restart localization recovery retry dropped: a newer map restore replaced it");
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(map_mu_);
+    if (!pending_restore_map_id_.empty()) {
+      EmitLog("[graphnav] restart localization recovery retry dropped: map " +
+              pending_restore_map_id_ + " is being restored");
+      return;
+    }
+    const std::string active = active_map_id_.empty() ? default_map_id_ : active_map_id_;
+    if (active != map_id) {
+      drop("active map is now " + active + ", not " + map_id);
+      return;
+    }
+  }
+  std::string current_waypoint;
+  if (spot_.GetLocalizationWaypointId(&current_waypoint)) {
+    // Something else (a fiducial, spot.localize) localized the robot meanwhile.
+    EmitLog("[graphnav] restart localization recovery retry not needed: robot is localized at "
+            "waypoint_id=" + current_waypoint);
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(nav_state_mu_);
+    if (localization_confirmation_.recovery_in_progress()) {
+      later(1000);  // an operator spot.localize is running; look again after it
+      return;
+    }
+    localization_confirmation_.OnRecoveryStarted();
+  }
+  LocalizeAttemptWindow window(&nav_state_mu_, &localization_confirmation_, true);
+  SpotClient::StoredMap map_data;
+  if (!LoadMapFromDisk(map_id, &map_data)) {
+    drop("could not read map " + map_id + " from disk");
+    return;
+  }
+  RunLocalizationRecoveryAttempt(map_id, map_data, last, attempt);
 }
 
 bool Adapter::ExecuteLocalizeCommand(const v1::model::CommandRequest& request) {
