@@ -128,6 +128,52 @@ std::string behavior_status_to_string(::bosdyn::api::BehaviorFault::Status statu
   }
 }
 
+std::string system_fault_id(const ::bosdyn::api::SystemFault& fault) {
+  return !fault.name().empty() ? fault.name() : fault.uuid();
+}
+
+std::string behavior_fault_id(const ::bosdyn::api::BehaviorFault& fault) {
+  return "behavior_fault_id:" + std::to_string(fault.behavior_fault_id());
+}
+
+std::string service_fault_id(const ::bosdyn::api::ServiceFault& fault) {
+  const auto& id = fault.fault_id();
+  if (!id.fault_name().empty()) return id.fault_name();
+  if (!id.service_name().empty()) return id.service_name();
+  return "service_fault";
+}
+
+SpotClient::ImpairedCause impaired_cause_from_state(const ::bosdyn::api::RobotImpairedState& state) {
+  SpotClient::ImpairedCause cause;
+  cause.status = ::bosdyn::api::RobotImpairedState::ImpairedStatus_Name(state.impaired_status());
+  const auto add_detail = [&cause](const std::string& id, const std::string& message) {
+    cause.fault_ids.push_back(id);
+    if (!cause.detail.empty()) return;
+    cause.detail = message.empty() ? id : id + ": " + message;
+  };
+  for (const auto& fault : state.system_faults()) add_detail(system_fault_id(fault), fault.error_message());
+  for (const auto& fault : state.service_faults()) {
+    add_detail(service_fault_id(fault), fault.error_message());
+  }
+  for (const auto& fault : state.behavior_faults()) {
+    add_detail(behavior_fault_id(fault), "cause=" + behavior_cause_to_string(fault.cause()));
+  }
+  if (cause.detail.empty()) cause.detail = cause.status;
+  return cause;
+}
+
+// The last NavigateTo* result on this thread (see LastNavigateImpaired).
+thread_local bool tl_last_navigate_impaired = false;
+thread_local SpotClient::ImpairedCause tl_last_navigate_cause;
+
+void record_navigate_result(const ::bosdyn::api::graph_nav::NavigateToResponse& response) {
+  tl_last_navigate_impaired =
+      response.status() == ::bosdyn::api::graph_nav::NavigateToResponse::STATUS_ROBOT_IMPAIRED;
+  tl_last_navigate_cause = tl_last_navigate_impaired
+                               ? impaired_cause_from_state(response.impaired_state())
+                               : SpotClient::ImpairedCause();
+}
+
 std::string lowercase_ascii(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(),
                  [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
@@ -683,6 +729,19 @@ bool SpotClient::EmergencyStop() {
   return r.status;
 }
 
+bool SpotClient::StopMotion() {
+  std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  if (!robot_command_client_) {
+    SetLastError("Robot command client unavailable");
+    return false;
+  }
+  if (!EnsureTimeSync()) return false;
+  auto cmd = ::bosdyn::client::StopCommand();
+  auto r = robot_command_client_->RobotCommand(cmd);
+  if (!r.status) SetLastError(r.status.DebugString());
+  return r.status;
+}
+
 bool SpotClient::RecoverSelfRight() {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
   if (!robot_command_client_) return false;
@@ -898,7 +957,7 @@ bool SpotClient::GetRobotStateSnapshot(RobotStateSnapshot* out_snapshot) {
 
   for (const auto& fault : robot_state.system_fault_state().faults()) {
     FaultInfo item;
-    item.id = !fault.name().empty() ? fault.name() : fault.uuid();
+    item.id = system_fault_id(fault);
     item.severity = system_severity_to_string(fault.severity());
     item.message = fault.error_message();
     snap.system_faults.push_back(std::move(item));
@@ -906,7 +965,7 @@ bool SpotClient::GetRobotStateSnapshot(RobotStateSnapshot* out_snapshot) {
 
   for (const auto& fault : robot_state.behavior_fault_state().faults()) {
     FaultInfo item;
-    item.id = "behavior_fault_id:" + std::to_string(fault.behavior_fault_id());
+    item.id = behavior_fault_id(fault);
     item.severity = behavior_status_to_string(fault.status());
     item.message = "cause=" + behavior_cause_to_string(fault.cause());
     snap.behavior_faults.push_back(std::move(item));
@@ -914,14 +973,7 @@ bool SpotClient::GetRobotStateSnapshot(RobotStateSnapshot* out_snapshot) {
 
   for (const auto& fault : robot_state.service_fault_state().faults()) {
     FaultInfo item;
-    const auto& id = fault.fault_id();
-    if (!id.fault_name().empty()) {
-      item.id = id.fault_name();
-    } else if (!id.service_name().empty()) {
-      item.id = id.service_name();
-    } else {
-      item.id = "service_fault";
-    }
+    item.id = service_fault_id(fault);
     item.severity = service_severity_to_string(fault.severity());
     item.message = fault.error_message();
     snap.service_faults.push_back(std::move(item));
@@ -1978,6 +2030,8 @@ bool SpotClient::NavigateToWaypointPose(const std::string& waypoint_id,
                                         int command_timeout_sec,
                                         uint32_t* out_command_id) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  tl_last_navigate_impaired = false;
+  tl_last_navigate_cause = ImpairedCause();
   if (waypoint_id.empty()) return false;
   if (!EnsureGraphNavClient()) return false;
   if (!EnsureTimeSync()) return false;
@@ -2004,6 +2058,7 @@ bool SpotClient::NavigateToWaypointPose(const std::string& waypoint_id,
   }
 
   auto r = graph_nav_client_->NavigateTo(req);
+  record_navigate_result(r.response);
   if (!r.status) {
     SetLastError(r.status.DebugString());
     return false;
@@ -2029,6 +2084,8 @@ bool SpotClient::NavigateToWaypointPoseStraight(const std::string& waypoint_id,
                                                 int command_timeout_sec,
                                                 uint32_t* out_command_id) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
+  tl_last_navigate_impaired = false;
+  tl_last_navigate_cause = ImpairedCause();
   if (waypoint_id.empty()) return false;
   if (!EnsureGraphNavClient()) return false;
   if (!EnsureTimeSync()) return false;
@@ -2063,6 +2120,7 @@ bool SpotClient::NavigateToWaypointPoseStraight(const std::string& waypoint_id,
       ::bosdyn::api::graph_nav::RouteFollowingParams::ROUTE_BLOCKED_FAIL);
 
   auto r = graph_nav_client_->NavigateTo(req);
+  record_navigate_result(r.response);
   if (!r.status) {
     SetLastError(r.status.DebugString());
     return false;
@@ -2108,6 +2166,10 @@ bool SpotClient::GetNavigationFeedbackSnapshot(uint32_t command_id,
   fb.route_following_status = static_cast<int>(r.response.route_following_status());
   fb.blockage_status = static_cast<int>(r.response.blockage_status());
   fb.stuck_reason = static_cast<int>(r.response.stuck_reason());
+  if (r.response.status() ==
+      ::bosdyn::api::graph_nav::NavigationFeedbackResponse::STATUS_ROBOT_IMPAIRED) {
+    fb.impaired = impaired_cause_from_state(r.response.impaired_state());
+  }
   for (const auto& entry : r.response.active_region_information()) {
     const int region_status = static_cast<int>(entry.second.region_status());
     if (region_status == 2) ++fb.waiting_region_count;
@@ -2275,7 +2337,8 @@ bool SpotClient::GetDockingStatus(int* out_status) {
   return true;
 }
 
-bool SpotClient::AutoDock(int dock_id, int attempts, int poll_ms, int command_timeout_sec) {
+bool SpotClient::AutoDock(int dock_id, int attempts, int poll_ms, int command_timeout_sec,
+                          const std::function<bool()>& should_cancel) {
   if (dock_id <= 0) return false;
   if (!EnsureDockingClient()) return false;
   if (!EnsureTimeSync()) return false;
@@ -2288,7 +2351,7 @@ bool SpotClient::AutoDock(int dock_id, int attempts, int poll_ms, int command_ti
   std::string last_err;
 
   for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-    if (cancel_docking_.load()) {
+    if (cancel_docking_.load() || (should_cancel && should_cancel())) {
       SetLastError("Docking canceled");
       return false;
     }
@@ -2330,7 +2393,7 @@ bool SpotClient::AutoDock(int dock_id, int attempts, int poll_ms, int command_ti
     const uint32_t cmd_id = start.response.docking_command_id();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(command_timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
-      if (cancel_docking_.load()) {
+      if (cancel_docking_.load() || (should_cancel && should_cancel())) {
         SetLastError("Docking canceled");
         return false;
       }
@@ -2514,6 +2577,13 @@ bool SpotClient::EnsureGraphNavClient() {
   }
   graph_nav_client_ = client.response;
   return true;
+}
+
+bool SpotClient::GraphNavServiceReady() { return EnsureGraphNavClient(); }
+
+bool SpotClient::LastNavigateImpaired(ImpairedCause* out_cause) const {
+  if (out_cause) *out_cause = tl_last_navigate_cause;
+  return tl_last_navigate_impaired;
 }
 
 bool SpotClient::EnsureGraphNavRecordingClient() {

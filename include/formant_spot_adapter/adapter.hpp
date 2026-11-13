@@ -14,8 +14,11 @@
 #include <unordered_set>
 #include <vector>
 
+#include "formant_spot_adapter/camera_discovery.hpp"
+#include "formant_spot_adapter/command_cancel.hpp"
 #include "formant_spot_adapter/config.hpp"
 #include "formant_spot_adapter/formant_agent_client.hpp"
+#include "formant_spot_adapter/impaired_retry.hpp"
 #include "formant_spot_adapter/localize_recovery.hpp"
 #include "formant_spot_adapter/spot_client.hpp"
 
@@ -61,14 +64,32 @@ class Adapter {
     double body_pitch_rate_limit_radps{0.5};
   };
 
+  // A configured camera stream and the Spot image sources it needs.
+  struct CameraStreamSpec {
+    enum class Kind { kHand, kSurround, kFront };
+    Kind kind{Kind::kHand};
+    std::string stream;
+    std::vector<std::string> sources;  // two for the stitched front stream
+    bool rotate_180{false};
+  };
+  struct SurroundSource {
+    std::string source;
+    std::string stream;
+    bool rotate_180{false};
+  };
+
   void CameraLoop(const std::string& source, const std::string& stream, int output_fps,
                   int poll_hz, bool rotate_180, bool normalize_jpeg, int post_timeout_ms);
-  // Waits for a camera source that was missing or 0x0 at startup (the arm
-  // cameras come up after the rest of the robot after a reboot), then runs
-  // CameraLoop for it.
-  void DeferredCameraLoop(const std::string& source, const std::string& stream, int output_fps,
-                          int poll_hz, bool rotate_180, bool normalize_jpeg, int post_timeout_ms);
-  void SurroundImageLoop(int output_fps, int poll_hz);
+  // Lists Spot's image sources until it answers (backoff 1 s to 30 s), starts
+  // each configured camera stream once its sources are listed with a real
+  // size, and keeps re-checking the ones that are missing or 0x0 (an arm that
+  // boots after the body, a body camera with a fault). Asks again right away
+  // after a reconnect. Owns and joins the camera threads it starts.
+  void CameraDiscoveryLoop();
+  void StartReadyCameraStreams(const std::vector<CameraWant>& ready, long long waited_ms,
+                               const std::unordered_set<std::string>& were_unready,
+                               std::vector<std::thread>* threads);
+  void SurroundImageLoop(int output_fps, int poll_hz, std::vector<SurroundSource> sources);
   void FrontImageLoop(const std::string& stream, int fps, int poll_hz);
   void LocalizationImageLoop(const std::string& stream, int fps, int poll_hz);
   void GraphNavMapImageLoop(const std::string& stream, int fps, int poll_hz);
@@ -96,6 +117,49 @@ class Adapter {
                                 uint32_t nav_completed_before);
   uint32_t NavCompletedCommandId();
   void CommandExecutionLoop();
+  // Records that the command running on the command thread was refused
+  // because the robot is impaired (ROBOT_IMPAIRED from GraphNav, or a dock step
+  // that failed while Spot reported a critical fault), with GraphNav's named
+  // causes. A no-op on any other thread, so background navigation (the
+  // lease-retain poll, the teleop dock loop) can never mark or clear it.
+  void NoteCommandImpaired(const std::string& detail, const std::vector<std::string>& cause_ids);
+  // True on the command thread once a spot.graphnav.cancel stopped the running
+  // command.
+  bool CancelRequested() const;
+  // On the command thread: if a cancel stopped this command, marks it
+  // cancelled, logs that nothing is sent for `what`, and returns true.
+  bool AbortIfCancelled(const std::string& what);
+  // Marks the running dock command as docking onto the dock (no cancel from
+  // here on). False if a cancel already arrived, in which case it must not dock.
+  bool EnterDockPhase();
+  void LeaveDockPhase();
+  // Stops the robot for a cancel (a Spot stop command, which preempts GraphNav
+  // without powering anything on, retried up to three times) and confirms from
+  // navigation feedback that the navigation is no longer following its route.
+  // Confirmed: marks it interrupted and answers the pending cancels with
+  // success. Not confirmed: answers them with failure and leaves the
+  // navigation marked active so hold position runs next. Returns confirmed.
+  bool StopForCancel(const std::string& what, uint32_t nav_command_id);
+  // Sends Spot's stop command (up to three times) and confirms from the
+  // feedback of nav_command_id that it is no longer following its route.
+  StopConfirmation StopAndConfirm(uint32_t nav_command_id);
+  // Posts the answer for every cancel waiting on the running command's stop.
+  void AnswerPendingCancels(bool success, const std::string& result_text);
+  // Spends the command's one impaired self-right (none on the retry pass).
+  // Always true off the command thread, which keeps its old behaviour.
+  bool TakeSelfRightBudget();
+  // What can change under a held command (operator actions, lease, connection,
+  // queued commands); see HoldWatch in impaired_retry.hpp.
+  HoldWatch CurrentHoldWatch();
+  // Waits, bounded by impaired_retry_window_sec, for the fault behind a
+  // ROBOT_IMPAIRED refusal to clear. See impaired_retry.hpp.
+  ImpairedHoldResult HoldImpairedCommand(const v1::model::CommandRequest& request,
+                                         const HoldWatch& watch_at_command_start,
+                                         const std::string& failure_fault,
+                                         const std::vector<std::string>& cause_ids);
+  // Reads Spot's robot state once for the impaired hold (and keeps the shared
+  // degraded state in step). cause_ids are GraphNav's named causes.
+  ImpairmentSample SampleImpairment(const std::vector<std::string>& cause_ids = {});
   bool ExecuteCameraCalibrateCommand();
   bool ExecuteWaypointGotoCommand(const v1::model::CommandRequest& request);
   bool ExecuteWaypointGotoStraightCommand(const v1::model::CommandRequest& request);
@@ -356,16 +420,9 @@ class Adapter {
   double last_sent_body_pitch_{0.0};
   long long last_sent_velocity_ms_{0};
 
-  struct DeferredCameraSource {
-    std::string source;
-    std::string stream;
-  };
-  // Hand camera sources that were unavailable at startup; Run() starts a
-  // DeferredCameraLoop for each.
-  std::vector<DeferredCameraSource> deferred_camera_sources_;
-  std::vector<std::thread> camera_threads_;
-  std::thread surround_image_thread_;
-  std::thread front_image_thread_;
+  // Camera streams to start, built in Init(); CameraDiscoveryLoop starts them.
+  std::vector<CameraStreamSpec> camera_stream_specs_;
+  std::thread camera_discovery_thread_;
   std::thread localization_image_thread_;
   std::thread graphnav_map_image_thread_;
   std::thread lease_thread_;
@@ -379,9 +436,38 @@ class Adapter {
   bool app_config_thread_stop_{false};
   std::string app_config_refresh_reason_;
 
+  // A queued command; cancelled when a spot.graphnav.cancel ended it before it
+  // started (see command_cancel.hpp).
+  struct QueuedCommand {
+    v1::model::CommandRequest request;
+    bool cancelled{false};
+    // Queued by the adapter itself (hold position after a stop that was not
+    // confirmed): run it, but post no answer.
+    bool internal{false};
+    // An untargeted cancel that already ended queued walks or docks.
+    bool stopped_queued{false};
+  };
   std::mutex command_queue_mu_;
   std::condition_variable command_queue_cv_;
-  std::deque<v1::model::CommandRequest> command_queue_;
+  std::deque<QueuedCommand> command_queue_;
+  // The queued command running now ("" when none), its Formant command id, and
+  // whether it has started docking onto the dock (AutoDock), which a cancel
+  // never interrupts. Guarded by command_queue_mu_.
+  std::string running_command_;
+  std::string running_command_id_;
+  bool running_in_dock_phase_{false};
+  // Set (under command_queue_mu_) when a cancel stops the running command;
+  // cleared when the next command starts.
+  std::atomic<bool> running_cancel_requested_{false};
+  // The last navigation a cancel stopped (or tried to). PollGraphNavNavigation
+  // never self-rights or re-sends it.
+  std::atomic<uint32_t> cancelled_nav_command_id_{0};
+  // Cancels waiting for the running command's stop to be confirmed; answered
+  // by AnswerPendingCancels. Guarded by command_queue_mu_.
+  std::vector<std::string> pending_cancel_answers_;
+  // Targets of cancels that arrived before their command. Guarded by
+  // command_queue_mu_.
+  CancelledTargets cancelled_targets_;
 
   mutable std::mutex hb_mu_;
   long long last_heartbeat_ms_{0};
@@ -418,6 +504,17 @@ class Adapter {
   std::atomic<int> spot_reconnect_attempt_{0};
   std::atomic<int> spot_health_failures_{0};
   std::atomic<bool> spot_degraded_non_estop_{false};
+  // Counts transitions to connected, so a loop can tell a reconnect happened.
+  std::atomic<unsigned> spot_connect_generation_{0};
+  // Bumped whenever the adapter loses or gives up the body lease; an impaired
+  // hold that sees it change is not retried.
+  std::atomic<unsigned long long> lease_epoch_{0};
+  // Bumped on every teleop button press and every teleop twist asking for
+  // motion; an impaired hold that sees it change is not retried.
+  std::atomic<unsigned long long> operator_actions_{0};
+  // Consecutive map restore attempts that failed because Spot's GraphNav
+  // service was not answering; sets the restore backoff.
+  std::atomic<int> map_restore_failures_{0};
   std::atomic<long long> last_degraded_state_log_ms_{0};
   mutable std::mutex spot_connection_mu_;
   std::string last_spot_error_;
@@ -470,6 +567,18 @@ class Adapter {
   double last_nav_remaining_route_m_{0.0};
   long long last_nav_progress_change_ms_{0};
   std::string last_nav_state_payload_;
+  // An impaired command being held (DEV-17754), published on spot.nav.state so
+  // a mission driver can see why the command has not answered yet. Guarded by
+  // nav_state_mu_.
+  // A walk whose cancel stop could not be confirmed (it may still be moving):
+  // reported on spot.nav.state, and stopped again by the next cancel.
+  // Guarded by nav_state_mu_.
+  uint32_t stop_unconfirmed_nav_id_{0};
+  std::string stop_unconfirmed_reason_;
+  bool command_hold_active_{false};
+  std::string command_hold_command_;
+  std::string command_hold_fault_;
+  long long command_hold_deadline_ms_{0};
   std::string nav_phase_{"idle"};
   std::string nav_terminal_result_;
   std::string nav_terminal_reason_;

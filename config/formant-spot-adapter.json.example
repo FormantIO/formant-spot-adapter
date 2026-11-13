@@ -95,5 +95,6 @@
     { "stream": "spot.adapter.log", "enabled": true }
   ],
   "graphnavCommandTimeoutSec": 60,
+  "impairedRetryWindowSec": 20,
   "mapProcessTopologyOnCommit": true
 }
