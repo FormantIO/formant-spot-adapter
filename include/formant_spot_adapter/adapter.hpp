@@ -119,6 +119,16 @@ class Adapter {
   void MaybeRecoverLocalizationAtLastWaypoint(const std::string& restored_map_id,
                                               const SpotClient::StoredMap& map_data,
                                               const std::string& fiducial_error);
+  // One recovery attempt (verified pass, plus the unverified pass if visual
+  // alignment failed) at `last`. Schedules a retry when GraphNav was not ready.
+  // Call with a localization attempt window open.
+  void RunLocalizationRecoveryAttempt(const std::string& map_id,
+                                      const SpotClient::StoredMap& map_data,
+                                      const LastLocalization& last, int attempt);
+  // Runs a retry scheduled by RunLocalizationRecoveryAttempt once it is due.
+  void MaybeRetryLocalizationRecovery(long long now);
+  void RecordLocalizeOutcome(const std::string& source, const std::string& result,
+                             const std::string& waypoint_id, const std::string& detail);
   bool StartNavigateWithRecovery(const std::string& action_name,
                                  const std::string& waypoint_id,
                                  uint32_t* out_command_id,
@@ -507,6 +517,16 @@ class Adapter {
   std::atomic<bool> graph_left_empty_by_adapter_{false};
   std::mutex last_localization_mu_;
   fsa::LastLocalizationThrottle last_localization_throttle_;
+  // A restart recovery attempt to repeat because GraphNav was not ready (for
+  // example the robot was still impaired right after a reboot). Guarded by
+  // recovery_retry_mu_. Dropped when the restore it belongs to is superseded.
+  std::mutex recovery_retry_mu_;
+  bool recovery_retry_pending_{false};
+  long long recovery_retry_at_ms_{0};
+  int recovery_retry_attempt_{0};
+  long long recovery_retry_restore_ms_{0};
+  std::string recovery_retry_map_id_;
+  fsa::LastLocalization recovery_retry_last_;
   std::atomic<long long> last_nav_hold_log_ms_{0};
   std::atomic<long long> last_nav_diag_log_ms_{0};
   std::atomic<bool> force_waypoint_publish_{true};

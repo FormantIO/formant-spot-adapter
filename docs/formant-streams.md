@@ -221,8 +221,10 @@ parameters documented in the repository `README.md`.
   localization fields: `localized`, `current_waypoint_id`, `has_current_seed_pose`,
   `current_seed_x`, `current_seed_y`, `current_seed_z`, and `current_seed_yaw_rad`.
 - Result of the last `spot.localize`, `spot.localize.confirm` or restart localization recovery:
-  `localize_result` (`ok`, `failed`, or empty if none yet), `localize_source` (`command`,
+  `localize_result` (`ok`, `failed`, `retrying` while restart recovery waits to repeat an
+  attempt GraphNav was not ready for, or empty if none yet), `localize_source` (`command`,
   `confirm` or `restart_recovery`), `localize_waypoint_id`, `localize_detail` and `localize_at_ms`.
+  A skipped restart recovery has `localize_detail` starting `skipped:` with the reason.
   For a SetLocalization attempt `localize_detail` holds the rejection reason (if any) plus
   `status`, `quality`, `accepted_by`, `visual_verification`, `correction_m` (horizontal),
   `correction_z_m` and `correction_deg`.

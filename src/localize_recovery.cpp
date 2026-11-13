@@ -142,6 +142,7 @@ std::string SerializeLastLocalization(const LastLocalization& rec) {
     oss << "waypoint_tform_body=" << rec.x << "," << rec.y << "," << rec.z << "," << rec.qx << ","
         << rec.qy << "," << rec.qz << "," << rec.qw << "\n";
   }
+  if (rec.has_body_height) oss << "body_height_m=" << rec.body_height_m << "\n";
   oss << "updated_ms=" << rec.updated_ms << "\n";
   return oss.str();
 }
@@ -164,6 +165,12 @@ bool ParseLastLocalization(const std::string& text, LastLocalization* out) {
     } else if (key == "updated_ms") {
       long long v = 0;
       if (parse_long_long(value, &v)) rec.updated_ms = v;
+    } else if (key == "body_height_m") {
+      double v = 0.0;
+      if (parse_double(value, &v)) {
+        rec.has_body_height = true;
+        rec.body_height_m = v;
+      }
     } else if (key == "waypoint_tform_body") {
       double v[7];
       std::stringstream ss(value);
@@ -267,14 +274,28 @@ bool LoadLastLocalization(const std::string& path, LastLocalization* out) {
 }
 
 LastLocalizationThrottle::LastLocalizationThrottle(long long min_interval_ms, double min_move_m,
-                                                   double min_turn_rad)
-    : min_interval_ms_(min_interval_ms), min_move_m_(min_move_m), min_turn_rad_(min_turn_rad) {}
+                                                   double min_turn_rad,
+                                                   long long refresh_interval_ms)
+    : min_interval_ms_(min_interval_ms),
+      min_move_m_(min_move_m),
+      min_turn_rad_(min_turn_rad),
+      refresh_interval_ms_(refresh_interval_ms) {}
 
 bool LastLocalizationThrottle::ShouldPersist(const LastLocalization& current,
                                              long long now_ms) const {
   if (current.map_id.empty() || current.waypoint_id.empty()) return false;
   if (!has_last_) return true;
-  if (last_write_ms_ != 0 && (now_ms - last_write_ms_) < min_interval_ms_) return false;
+  if (last_write_ms_ != 0 && now_ms >= last_write_ms_ &&
+      (now_ms - last_write_ms_) < min_interval_ms_) {
+    return false;
+  }
+  // Still here: refresh the timestamp even though nothing moved. A saved stamp
+  // ahead of the clock (the clock was set back) is rewritten too, or recovery
+  // would reject it as "from the future" after the next reboot.
+  if (refresh_interval_ms_ > 0 &&
+      (now_ms < last_stamp_ms_ || (now_ms - last_stamp_ms_) >= refresh_interval_ms_)) {
+    return true;
+  }
   if (current.map_id != last_.map_id || current.waypoint_id != last_.waypoint_id) return true;
   if (current.has_waypoint_tform_body != last_.has_waypoint_tform_body) return true;
   if (!current.has_waypoint_tform_body) return false;
@@ -289,20 +310,25 @@ void LastLocalizationThrottle::MarkPersisted(const LastLocalization& rec, long l
   has_last_ = true;
   last_ = rec;
   last_write_ms_ = now_ms;
+  last_stamp_ms_ = now_ms;
 }
 
 void LastLocalizationThrottle::Seed(const LastLocalization& rec) {
   has_last_ = true;
   last_ = rec;
   last_write_ms_ = 0;
+  last_stamp_ms_ = rec.updated_ms;
 }
 
-bool IsNoUsableFiducialError(const std::string& error_text) {
+std::string FiducialFailureBlocksWaypointRecovery(const std::string& error_text) {
   const std::string upper = to_upper(error_text);
-  return upper.find("NO_MATCHING_FIDUCIAL") != std::string::npos ||
-         upper.find("FIDUCIAL_TOO_FAR_AWAY") != std::string::npos ||
-         upper.find("FIDUCIAL_TOO_OLD") != std::string::npos ||
-         upper.find("FIDUCIAL_POSE_UNCERTAIN") != std::string::npos;
+  if (upper.find("STATUS_NO_MAP_LOADED") != std::string::npos) {
+    return "GraphNav has no map loaded";
+  }
+  if (upper.find("STATUS_INCOMPATIBLE_SENSORS") != std::string::npos) {
+    return "the map was recorded with a different sensor setup than the robot has now";
+  }
+  return "";
 }
 
 WaypointRecoveryPlan DecideWaypointRecovery(const WaypointRecoveryInputs& in) {
@@ -311,9 +337,10 @@ WaypointRecoveryPlan DecideWaypointRecovery(const WaypointRecoveryInputs& in) {
     plan.reason = "fiducial localization succeeded";
     return plan;
   }
-  if (!IsNoUsableFiducialError(in.fiducial_error)) {
-    plan.reason = "fiducial localization failed for a reason a waypoint guess does not fix: " +
-                  in.fiducial_error;
+  const std::string blocked = FiducialFailureBlocksWaypointRecovery(in.fiducial_error);
+  if (!blocked.empty()) {
+    plan.reason = "fiducial localization failed and a waypoint guess cannot help (" + blocked +
+                  "): " + in.fiducial_error;
     return plan;
   }
   if (in.already_attempted) {
@@ -360,7 +387,9 @@ WaypointRecoveryPlan DecideWaypointRecovery(const WaypointRecoveryInputs& in) {
     return plan;
   }
   plan.attempt = true;
-  plan.reason = "no usable fiducial; trying saved waypoint " + in.last.waypoint_id;
+  plan.reason = "fiducial localization failed (" +
+                (in.fiducial_error.empty() ? std::string("no error text") : in.fiducial_error) +
+                "); trying saved waypoint " + in.last.waypoint_id;
   return plan;
 }
 
@@ -422,7 +451,7 @@ LocalizeAcceptance EvaluateWaypointLocalization(const LocalizeResponseFacts& fac
       return a;
     }
     a.ok = true;
-    a.basis = "operator_small_correction";
+    a.basis = policy.small_correction_basis;
     return a;
   }
   a.reason = "GraphNav quality check " +
@@ -447,6 +476,75 @@ void PoseCorrection(const LocalizePose& guess, const LocalizePose& result, doubl
   r.qz = result.qz;
   r.qw = result.qw;
   if (out_yaw_rad) *out_yaw_rad = angle_diff(yaw_of(r), yaw_of(g));
+}
+
+LocalizePose ComposePoses(const LocalizePose& ab, const LocalizePose& bc) {
+  // Rotate bc's position by ab's rotation: v' = v + 2w(q x v) + 2 q x (q x v).
+  const double qx = ab.qx, qy = ab.qy, qz = ab.qz, qw = ab.qw;
+  const double vx = bc.x, vy = bc.y, vz = bc.z;
+  const double tx = 2.0 * (qy * vz - qz * vy);
+  const double ty = 2.0 * (qz * vx - qx * vz);
+  const double tz = 2.0 * (qx * vy - qy * vx);
+  LocalizePose out;
+  out.x = ab.x + vx + qw * tx + (qy * tz - qz * ty);
+  out.y = ab.y + vy + qw * ty + (qz * tx - qx * tz);
+  out.z = ab.z + vz + qw * tz + (qx * ty - qy * tx);
+  // Hamilton product ab.q * bc.q.
+  out.qw = qw * bc.qw - qx * bc.qx - qy * bc.qy - qz * bc.qz;
+  out.qx = qw * bc.qx + qx * bc.qw + qy * bc.qz - qz * bc.qy;
+  out.qy = qw * bc.qy - qx * bc.qz + qy * bc.qw + qz * bc.qx;
+  out.qz = qw * bc.qz + qx * bc.qy - qy * bc.qx + qz * bc.qw;
+  return out;
+}
+
+LocalizePose InvertPose(const LocalizePose& ab) {
+  LocalizePose rot_only;
+  rot_only.qx = -ab.qx;
+  rot_only.qy = -ab.qy;
+  rot_only.qz = -ab.qz;
+  rot_only.qw = ab.qw;
+  LocalizePose neg;
+  neg.x = -ab.x;
+  neg.y = -ab.y;
+  neg.z = -ab.z;
+  // b_tform_a = (R^-1, -R^-1 p): the conjugate rotation applied to -p.
+  return ComposePoses(rot_only, neg);
+}
+
+std::vector<NeighborWaypointTform> NeighborTforms(const std::string& waypoint_id,
+                                                  const std::vector<WaypointEdgeTform>& edges) {
+  std::vector<NeighborWaypointTform> out;
+  auto add = [&](const std::string& id, const LocalizePose& tform) {
+    if (id.empty() || id == waypoint_id) return;
+    for (const auto& n : out) {
+      if (n.waypoint_id == id) return;  // parallel edges: keep the first
+    }
+    out.push_back({id, tform});
+  };
+  for (const auto& e : edges) {
+    if (e.from_waypoint_id == waypoint_id) {
+      add(e.to_waypoint_id, e.from_tform_to);
+    } else if (e.to_waypoint_id == waypoint_id) {
+      add(e.from_waypoint_id, InvertPose(e.from_tform_to));
+    }
+  }
+  return out;
+}
+
+bool ResultInGuessFrame(const WaypointLocalizeSpec& spec, const std::string& result_waypoint_id,
+                        const LocalizePose& result_waypoint_tform_body, LocalizePose* out) {
+  if (!out || result_waypoint_id.empty()) return false;
+  if (result_waypoint_id == spec.waypoint_id) {
+    *out = result_waypoint_tform_body;
+    return true;
+  }
+  for (const auto& n : spec.neighbors) {
+    if (n.waypoint_id == result_waypoint_id) {
+      *out = ComposePoses(n.guess_tform_waypoint, result_waypoint_tform_body);
+      return true;
+    }
+  }
+  return false;
 }
 
 std::string FormatLocalizeDetail(const LocalizeDetailFields& f) {
@@ -491,27 +589,73 @@ LocalizeAcceptancePolicy OperatorAcceptancePolicy() {
   return policy;
 }
 
-WaypointLocalizeSpec RecoveryLocalizeSpec(const LastLocalization& last) {
+LocalizePose RecoverySeedPose(const LastLocalization& last, bool has_current_body_height,
+                              double current_body_height_m) {
+  LocalizePose pose;  // identity: "at the waypoint"
+  if (!last.has_waypoint_tform_body) return pose;
+  pose = {last.x, last.y, last.z, last.qx, last.qy, last.qz, last.qw};
+  if (last.has_body_height && has_current_body_height && std::isfinite(current_body_height_m) &&
+      std::isfinite(last.body_height_m)) {
+    const double delta = current_body_height_m - last.body_height_m;
+    if (std::fabs(delta) <= 1.0) pose.z += delta;
+  }
+  return pose;
+}
+
+WaypointLocalizeSpec RecoveryLocalizeSpec(const LastLocalization& last,
+                                          bool verify_visual_refinement,
+                                          bool has_current_body_height,
+                                          double current_body_height_m) {
   WaypointLocalizeSpec spec;
   spec.waypoint_id = last.waypoint_id;
-  if (last.has_waypoint_tform_body) {
-    spec.waypoint_tform_body = {last.x, last.y, last.z, last.qx, last.qy, last.qz, last.qw};
-  }
+  spec.waypoint_tform_body =
+      RecoverySeedPose(last, has_current_body_height, current_body_height_m);
   const WaypointLocalizeLimits limits;
   spec.max_distance_m = limits.max_distance_m;
   spec.max_yaw_rad = limits.max_yaw_rad;
   spec.refine_with_visual_features = true;
-  spec.verify_visual_refinement = true;
+  spec.verify_visual_refinement = verify_visual_refinement;
   spec.do_ambiguity_check = true;
   // The saved pose was taken before the restart; that odom frame is gone.
   spec.send_current_ko_tform_body = false;
   return spec;
 }
 
-LocalizeAcceptancePolicy RecoveryAcceptancePolicy() {
+LocalizeAcceptancePolicy RecoveryAcceptancePolicy(bool unverified_pass) {
   LocalizeAcceptancePolicy policy;
-  policy.allow_skipped_with_small_correction = false;
+  policy.allow_skipped_with_small_correction = unverified_pass;
+  policy.small_correction_basis = "saved_pose_small_correction";
   return policy;
+}
+
+bool RecoveryNeedsUnverifiedPass(bool accepted, bool applied, const std::string& status) {
+  return !accepted && !applied && status == "STATUS_VISUAL_ALIGNMENT_FAILED";
+}
+
+RecoveryRetryDecision DecideRecoveryRetry(bool applied, const std::string& status,
+                                          int attempts_made, const RecoveryRetryPolicy& policy) {
+  RecoveryRetryDecision d;
+  if (applied) {
+    d.reason = "GraphNav applied a result that was rejected; not retrying";
+    return d;
+  }
+  const bool transient = status.empty() || status == "STATUS_UNKNOWN" ||
+                         status == "STATUS_ROBOT_IMPAIRED" || status == "STATUS_ABORTED";
+  if (!transient) {
+    d.reason = "GraphNav answered " + status + "; the saved guess does not match, not retrying";
+    return d;
+  }
+  const std::string what = status.empty() ? std::string("no answer from GraphNav") : status;
+  if (attempts_made >= policy.max_attempts || policy.retry_interval_ms <= 0) {
+    d.reason = what + " after " + std::to_string(attempts_made) + " attempts; giving up";
+    return d;
+  }
+  d.retry = true;
+  d.delay_ms = policy.retry_interval_ms;
+  d.reason = what + "; retrying in " + std::to_string(policy.retry_interval_ms / 1000) +
+             " s (attempt " + std::to_string(attempts_made + 1) + " of " +
+             std::to_string(policy.max_attempts) + ")";
+  return d;
 }
 
 std::string LocalizationConfirmation::pending_reason() const {

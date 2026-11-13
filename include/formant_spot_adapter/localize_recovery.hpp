@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace fsa {
 
@@ -49,16 +50,19 @@ constexpr double kMaxLocalizeYawDeg = 45.0;
 //   3. QUALITY_CHECK_SUCCESS is accepted.
 //   4. QUALITY_CHECK_SKIPPED is accepted when visual verification was requested
 //      (STATUS_OK then means it passed), or, only where the policy allows it (an
-//      operator who asserted the waypoint), when the ambiguity check was
+//      operator who asserted the waypoint, or restart recovery's unverified
+//      second pass at the last saved pose), when the ambiguity check was
 //      requested and the pose moved at most max_correction (horizontal x/y and
 //      yaw) from the guess. If that happened on the retry without visual
 //      verification, the localization still needs spot.localize.confirm.
 //   5. Every other quality result (poor point cloud match, poor gravity
 //      alignment, bad height, unknown) is rejected.
 // Trade-off of 4b: a small correction does not prove the point clouds matched;
-// a poorly constrained match can also stay near the guess. It is accepted only
-// on a person's word that the robot is at that waypoint, with the ambiguity check
-// as the remaining automatic guard. Restart recovery never uses it.
+// a poorly constrained match can also stay near the guess. It is accepted on a
+// person's word that the robot is at that waypoint, or by restart recovery when
+// the guess is the robot's last saved pose; the ambiguity check is the remaining
+// automatic guard, and a recovery result is never trusted for navigation until
+// it is confirmed (or replaced by a fiducial localization).
 
 struct LocalizePose {
   double x{0.0};
@@ -68,6 +72,15 @@ struct LocalizePose {
   double qy{0.0};
   double qz{0.0};
   double qw{1.0};
+};
+
+// A waypoint joined to the guessed waypoint by one map edge, and where it sits in
+// the guessed waypoint's frame. GraphNav can answer with a neighbor of the
+// waypoint it was given; this lets the adapter still measure how far the result
+// is from the guess.
+struct NeighborWaypointTform {
+  std::string waypoint_id;
+  LocalizePose guess_tform_waypoint;
 };
 
 // Everything that goes into one SetLocalization request at a waypoint.
@@ -86,6 +99,9 @@ struct WaypointLocalizeSpec {
   // guess is about the robot's pose right now; a guess saved before a reboot
   // refers to an odom frame that no longer exists.
   bool send_current_ko_tform_body{true};
+  // Not sent to the robot. Used only to measure the correction when GraphNav
+  // localizes to one of these neighbors instead of `waypoint_id`.
+  std::vector<NeighborWaypointTform> neighbors;
 };
 
 struct LocalizeAcceptancePolicy {
@@ -93,6 +109,8 @@ struct LocalizeAcceptancePolicy {
   bool allow_skipped_with_small_correction{false};
   double max_correction_m{0.25};
   double max_correction_yaw_rad{0.17453292519943295};  // 10 degrees
+  // The `basis` reported when rule 4b accepts a result.
+  std::string small_correction_basis{"operator_small_correction"};
 };
 
 // What the request asked for and what GraphNav answered.
@@ -130,6 +148,27 @@ LocalizeAcceptance EvaluateWaypointLocalization(const LocalizeResponseFacts& fac
 void PoseCorrection(const LocalizePose& guess, const LocalizePose& result, double* out_xy_m,
                     double* out_z_m, double* out_yaw_rad);
 
+// SE3 helpers (quaternions are x, y, z, w). ComposePoses(a_tform_b, b_tform_c)
+// is a_tform_c; InvertPose(a_tform_b) is b_tform_a.
+LocalizePose ComposePoses(const LocalizePose& a_tform_b, const LocalizePose& b_tform_c);
+LocalizePose InvertPose(const LocalizePose& a_tform_b);
+
+// One map edge: `from_tform_to` is the `to` waypoint in the `from` waypoint's frame.
+struct WaypointEdgeTform {
+  std::string from_waypoint_id;
+  std::string to_waypoint_id;
+  LocalizePose from_tform_to;
+};
+// Every waypoint one edge away from `waypoint_id`, in its frame.
+std::vector<NeighborWaypointTform> NeighborTforms(const std::string& waypoint_id,
+                                                  const std::vector<WaypointEdgeTform>& edges);
+
+// The robot pose GraphNav returned (`result_waypoint_tform_body`, relative to
+// `result_waypoint_id`) expressed in the guessed waypoint's frame. False when the
+// result waypoint is neither the guess nor one of `spec.neighbors`.
+bool ResultInGuessFrame(const WaypointLocalizeSpec& spec, const std::string& result_waypoint_id,
+                        const LocalizePose& result_waypoint_tform_body, LocalizePose* out);
+
 // Everything localize_detail reports about one SetLocalization attempt.
 struct LocalizeDetailFields {
   std::string status;
@@ -158,8 +197,50 @@ LocalizeAcceptancePolicy OperatorAcceptancePolicy();
 // accepted only on a small correction without verified visual alignment.
 bool OperatorAcceptNeedsConfirmation(const std::string& accepted_by, bool visual_verification);
 struct LastLocalization;
-WaypointLocalizeSpec RecoveryLocalizeSpec(const LastLocalization& last);
-LocalizeAcceptancePolicy RecoveryAcceptancePolicy();
+// Restart recovery's initial guess: the saved offset from the saved waypoint, in
+// the waypoint's frame (never odom, which a reboot resets). When the body height
+// above ground is known both at save time and now, z moves by the difference, so
+// a robot that was standing when saved and sits after the reboot is not guessed
+// 0.3 m above itself (GraphNav reports QUALITY_CHECK_BAD_HEIGHT for a prior whose
+// height is off). A difference over 1 m is treated as a bad reading and ignored.
+LocalizePose RecoverySeedPose(const LastLocalization& last, bool has_current_body_height,
+                              double current_body_height_m);
+// First pass verifies visual alignment. If GraphNav answers
+// STATUS_VISUAL_ALIGNMENT_FAILED (nothing applied), the second pass repeats the
+// same guess without verification under RecoveryAcceptancePolicy(true).
+WaypointLocalizeSpec RecoveryLocalizeSpec(const LastLocalization& last,
+                                          bool verify_visual_refinement = true,
+                                          bool has_current_body_height = false,
+                                          double current_body_height_m = 0.0);
+// First pass: QUALITY_CHECK_SUCCESS, or SKIPPED with verified visual alignment.
+// Unverified second pass: also SKIPPED when the ambiguity check passed and the
+// result is within 0.25 m / 10 deg of the saved pose (on the saved waypoint or a
+// neighbor), i.e. GraphNav found the robot where it was last known to be. Every
+// recovery result stays unconfirmed either way (LocalizationConfirmation).
+LocalizeAcceptancePolicy RecoveryAcceptancePolicy(bool unverified_pass = false);
+// True when the first (verified) pass failed only on visual alignment, so the
+// unverified second pass should run.
+bool RecoveryNeedsUnverifiedPass(bool accepted, bool applied, const std::string& status);
+
+// Retrying a recovery attempt that applied nothing because the robot or GraphNav
+// was not ready yet (impaired right after a reboot, for example a camera still
+// initializing; the request aborted; the RPC or time sync failed). A clean "no
+// match" (STATUS_FAILED, STATUS_VISUAL_ALIGNMENT_FAILED after both passes), an
+// unknown waypoint, a missing map and a result that was applied but rejected are
+// final. The same saved guess is reused each time; nothing is widened.
+struct RecoveryRetryPolicy {
+  int max_attempts{6};
+  long long retry_interval_ms{10000};
+};
+struct RecoveryRetryDecision {
+  bool retry{false};
+  long long delay_ms{0};
+  std::string reason;
+};
+// `attempts_made` counts the attempts so far, including the one that just failed.
+// `status` is the GraphNav status name ("" when the request never got an answer).
+RecoveryRetryDecision DecideRecoveryRetry(bool applied, const std::string& status,
+                                          int attempts_made, const RecoveryRetryPolicy& policy);
 
 // Parameters of the `spot.localize` command.
 /**
@@ -216,7 +297,14 @@ struct LastLocalization {
   double qy{0.0};
   double qz{0.0};
   double qw{1.0};
-  // Wall-clock time of the save, milliseconds since the Unix epoch.
+  // Height of the body above the ground plane estimate ("gpe" frame) at save
+  // time. Lets restart recovery correct the guess when the robot was standing
+  // when saved and is sitting after the reboot (or the other way round).
+  bool has_body_height{false};
+  double body_height_m{0.0};
+  // Wall-clock time of the save, milliseconds since the Unix epoch. While the
+  // robot stays localized this is refreshed (see LastLocalizationThrottle), so
+  // it means "last time the robot was known to be here".
   long long updated_ms{0};
 };
 
@@ -233,32 +321,51 @@ bool SaveLastLocalization(const std::string& path, const LastLocalization& rec,
 bool LoadLastLocalization(const std::string& path, LastLocalization* out);
 
 // Decides when a fresh localization is worth writing to disk. GraphNav reports
-// localization every poll; the file only needs to change when the robot is at a
-// different waypoint or has moved noticeably relative to it, and never more often
-// than `min_interval_ms`.
+// localization every poll; the file changes when the robot is at a different
+// waypoint or has moved noticeably relative to it, never more often than
+// `min_interval_ms`, and at least every `refresh_interval_ms` while the robot
+// stays localized, so a robot that stands still for an hour still has a fresh
+// timestamp when it reboots (restart recovery skips records older than
+// localize_recovery_max_record_age_sec). A refresh interval of 0 turns that off.
 class LastLocalizationThrottle {
  public:
   explicit LastLocalizationThrottle(long long min_interval_ms = 5000,
                                     double min_move_m = 0.5,
-                                    double min_turn_rad = 0.2617993877991494 /* 15 deg */);
+                                    double min_turn_rad = 0.2617993877991494 /* 15 deg */,
+                                    long long refresh_interval_ms = 60000);
 
   bool ShouldPersist(const LastLocalization& current, long long now_ms) const;
   void MarkPersisted(const LastLocalization& rec, long long now_ms);
-  // Starts from what is already on disk so a restart does not rewrite it at once.
+  // Starts from what is already on disk. The same record is rewritten once its
+  // own timestamp is due a refresh; a different one is written at once.
   void Seed(const LastLocalization& rec);
 
  private:
   long long min_interval_ms_;
   double min_move_m_;
   double min_turn_rad_;
+  long long refresh_interval_ms_;
   bool has_last_{false};
   LastLocalization last_;
+  // When this process last wrote (0: not yet), for min_interval_ms.
   long long last_write_ms_{0};
+  // Timestamp of the record on disk, for refresh_interval_ms.
+  long long last_stamp_ms_{0};
 };
 
-// True for SetLocalization errors that mean "no usable fiducial": the robot sees
-// no tag that is in the map, or the tag it sees is too far, too old or uncertain.
-bool IsNoUsableFiducialError(const std::string& error_text);
+// Whether a failed nearest-fiducial localization leaves anything for a waypoint
+// guess to do. Empty when restart recovery may try the saved waypoint; otherwise
+// why not.
+//
+// FIDUCIAL_INIT_NEAREST with no tag in view answers plain STATUS_FAILED ("failed
+// to localize for some other reason"); the proto documents NO_MATCHING_FIDUCIAL,
+// FIDUCIAL_TOO_FAR_AWAY, FIDUCIAL_TOO_OLD and FIDUCIAL_POSE_UNCERTAIN only for
+// use_fiducial_id. So the "no usable fiducial" statuses cannot be the gate: Walt
+// rebooted 2 m from his dock on Nov 12 got STATUS_FAILED and recovery was
+// skipped. Only failures that a waypoint guess cannot change block recovery:
+// no map loaded, or a map recorded with different sensors. A robot that is
+// impaired right after a reboot is tried (and retried, see DecideRecoveryRetry).
+std::string FiducialFailureBlocksWaypointRecovery(const std::string& error_text);
 
 struct WaypointRecoveryInputs {
   // The map that was just restored and the error from the fiducial attempt.
@@ -288,8 +395,9 @@ struct WaypointRecoveryPlan {
 };
 
 // After a restart the adapter re-uploads the map and tries fiducial localization.
-// When that fails only because no fiducial is usable, it may try once more with the
-// last saved waypoint as the initial guess. It never moves the robot.
+// When that fails for any reason a waypoint guess could fix (see
+// FiducialFailureBlocksWaypointRecovery), it tries the last saved waypoint as the
+// initial guess. It never moves the robot.
 WaypointRecoveryPlan DecideWaypointRecovery(const WaypointRecoveryInputs& in);
 
 // Tracks whether the current localization came from an automatic guess that a
