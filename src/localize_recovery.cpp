@@ -22,6 +22,8 @@ namespace fsa {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+// About the difference between Spot sitting and standing.
+constexpr double kMaxBodyHeightCorrectionM = 0.4;
 
 std::string trim(const std::string& in) {
   size_t begin = 0;
@@ -144,6 +146,7 @@ std::string SerializeLastLocalization(const LastLocalization& rec) {
   }
   if (rec.has_body_height) oss << "body_height_m=" << rec.body_height_m << "\n";
   oss << "updated_ms=" << rec.updated_ms << "\n";
+  if (rec.moved_ms > 0) oss << "moved_ms=" << rec.moved_ms << "\n";
   return oss.str();
 }
 
@@ -165,6 +168,9 @@ bool ParseLastLocalization(const std::string& text, LastLocalization* out) {
     } else if (key == "updated_ms") {
       long long v = 0;
       if (parse_long_long(value, &v)) rec.updated_ms = v;
+    } else if (key == "moved_ms") {
+      long long v = 0;
+      if (parse_long_long(value, &v)) rec.moved_ms = v;
     } else if (key == "body_height_m") {
       double v = 0.0;
       if (parse_double(value, &v)) {
@@ -200,6 +206,7 @@ bool ParseLastLocalization(const std::string& text, LastLocalization* out) {
     }
   }
   if (rec.map_id.empty() || rec.waypoint_id.empty()) return false;
+  if (rec.moved_ms <= 0) rec.moved_ms = rec.updated_ms;
   *out = rec;
   return true;
 }
@@ -273,6 +280,50 @@ bool LoadLastLocalization(const std::string& path, LastLocalization* out) {
   return ParseLastLocalization(buf.str(), out);
 }
 
+bool BodyHeightUsable(const std::string& behavior_state) {
+  return behavior_state == "not_ready" || behavior_state == "standing";
+}
+
+namespace {
+std::string moved_text(const char* frame, const LocalizePose& before, const LocalizePose& now,
+                       double max_m, double max_yaw_rad);
+}  // namespace
+
+std::string BodyMovedReason(const LocalizePose& before, const LocalizePose& now, double max_m,
+                            double max_yaw_rad) {
+  return moved_text("odometry", before, now, max_m, max_yaw_rad);
+}
+
+std::string BodyMovedInEitherFrame(const LocalizePose& odom_before, const LocalizePose& odom_now,
+                                   bool has_vision_before, const LocalizePose& vision_before,
+                                   bool has_vision_now, const LocalizePose& vision_now,
+                                   bool* vision_compared) {
+  const bool compare_vision = has_vision_before && has_vision_now;
+  if (vision_compared) *vision_compared = compare_vision;
+  const std::string odom = BodyMovedReason(odom_before, odom_now);
+  if (!odom.empty()) return odom;
+  if (!compare_vision) return "";
+  return moved_text("the vision frame", vision_before, vision_now, 0.1, 0.08726646259971647);
+}
+
+namespace {
+std::string moved_text(const char* frame, const LocalizePose& before, const LocalizePose& now,
+                       double max_m, double max_yaw_rad) {
+  double xy = 0.0;
+  double z = 0.0;
+  double yaw = 0.0;
+  PoseCorrection(before, now, &xy, &z, &yaw);
+  if (xy <= max_m && yaw <= max_yaw_rad) return "";
+  std::ostringstream oss;
+  oss.setf(std::ios::fixed);
+  oss.precision(2);
+  oss << frame << " shows the body moved " << xy << " m";
+  oss.precision(1);
+  oss << " / " << yaw * 180.0 / kPi << " deg";
+  return oss.str();
+}
+}  // namespace
+
 LastLocalizationThrottle::LastLocalizationThrottle(long long min_interval_ms, double min_move_m,
                                                    double min_turn_rad,
                                                    long long refresh_interval_ms)
@@ -281,29 +332,72 @@ LastLocalizationThrottle::LastLocalizationThrottle(long long min_interval_ms, do
       min_turn_rad_(min_turn_rad),
       refresh_interval_ms_(refresh_interval_ms) {}
 
-bool LastLocalizationThrottle::ShouldPersist(const LastLocalization& current,
-                                             long long now_ms) const {
-  if (current.map_id.empty() || current.waypoint_id.empty()) return false;
-  if (!has_last_) return true;
+void LastLocalizationThrottle::ObserveOdom(long long now_ms, bool has_odom,
+                                           const LocalizePose& odom_tform_body, bool has_vision,
+                                           const LocalizePose& vision_tform_body) {
+  if (!has_odom) {
+    has_odom_ = false;
+    has_vision_ = false;
+    still_since_ms_ = 0;
+    return;
+  }
+  if (!has_odom_ || still_since_ms_ == 0 ||
+      !BodyMovedInEitherFrame(still_anchor_, odom_tform_body, still_anchor_has_vision_,
+                              still_anchor_vision_, has_vision, vision_tform_body)
+           .empty()) {
+    still_anchor_ = odom_tform_body;
+    still_anchor_has_vision_ = has_vision;
+    still_anchor_vision_ = vision_tform_body;
+    still_since_ms_ = now_ms;
+  } else if (has_vision && !still_anchor_has_vision_) {
+    // Vision just became available: start comparing from here.
+    still_anchor_has_vision_ = true;
+    still_anchor_vision_ = vision_tform_body;
+  }
+  has_odom_ = true;
+  odom_ = odom_tform_body;
+  has_vision_ = has_vision;
+  vision_ = vision_tform_body;
+}
+
+LastLocalizationThrottle::Reason LastLocalizationThrottle::Decide(const LastLocalization& current,
+                                                                  long long now_ms) const {
+  if (current.map_id.empty() || current.waypoint_id.empty()) return Reason::kNone;
+  if (!has_last_) return Reason::kChanged;
   if (last_write_ms_ != 0 && now_ms >= last_write_ms_ &&
       (now_ms - last_write_ms_) < min_interval_ms_) {
-    return false;
+    return Reason::kNone;
   }
-  // Still here: refresh the timestamp even though nothing moved. A saved stamp
-  // ahead of the clock (the clock was set back) is rewritten too, or recovery
-  // would reject it as "from the future" after the next reboot.
-  if (refresh_interval_ms_ > 0 &&
-      (now_ms < last_stamp_ms_ || (now_ms - last_stamp_ms_) >= refresh_interval_ms_)) {
-    return true;
+  // A saved stamp ahead of the clock (the clock was set back) would be
+  // rejected as "from the future" after the next reboot: rewrite it.
+  if (now_ms < last_stamp_ms_) return Reason::kChanged;
+  if (current.map_id != last_.map_id || current.waypoint_id != last_.waypoint_id) {
+    return Reason::kChanged;
   }
-  if (current.map_id != last_.map_id || current.waypoint_id != last_.waypoint_id) return true;
-  if (current.has_waypoint_tform_body != last_.has_waypoint_tform_body) return true;
-  if (!current.has_waypoint_tform_body) return false;
-  const double dx = current.x - last_.x;
-  const double dy = current.y - last_.y;
-  const double dz = current.z - last_.z;
-  if (std::sqrt(dx * dx + dy * dy + dz * dz) >= min_move_m_) return true;
-  return angle_diff(yaw_of(current), yaw_of(last_)) >= min_turn_rad_;
+  if (current.has_waypoint_tform_body != last_.has_waypoint_tform_body) return Reason::kChanged;
+  if (current.has_waypoint_tform_body) {
+    const double dx = current.x - last_.x;
+    const double dy = current.y - last_.y;
+    const double dz = current.z - last_.z;
+    if (std::sqrt(dx * dx + dy * dy + dz * dz) >= min_move_m_) return Reason::kChanged;
+    if (angle_diff(yaw_of(current), yaw_of(last_)) >= min_turn_rad_) return Reason::kChanged;
+  }
+  // Odometry moved since the last write, even if GraphNav's pose barely did.
+  if (has_odom_ && has_odom_at_write_ &&
+      !BodyMovedInEitherFrame(odom_at_write_, odom_, has_vision_at_write_, vision_at_write_,
+                              has_vision_, vision_)
+           .empty()) {
+    return Reason::kChanged;
+  }
+  // Still here: refresh the timestamp, but only on odometry's word that the
+  // body has not moved since the last write (or for a whole refresh interval).
+  if (refresh_interval_ms_ > 0 && (now_ms - last_stamp_ms_) >= refresh_interval_ms_ &&
+      has_odom_ && still_since_ms_ > 0) {
+    const bool still_since_write = last_write_ms_ != 0 && still_since_ms_ <= last_write_ms_;
+    const bool still_long_enough = (now_ms - still_since_ms_) >= refresh_interval_ms_;
+    if (still_since_write || still_long_enough) return Reason::kRefresh;
+  }
+  return Reason::kNone;
 }
 
 void LastLocalizationThrottle::MarkPersisted(const LastLocalization& rec, long long now_ms) {
@@ -311,13 +405,20 @@ void LastLocalizationThrottle::MarkPersisted(const LastLocalization& rec, long l
   last_ = rec;
   last_write_ms_ = now_ms;
   last_stamp_ms_ = now_ms;
+  has_odom_at_write_ = has_odom_;
+  odom_at_write_ = odom_;
+  has_vision_at_write_ = has_vision_;
+  vision_at_write_ = vision_;
 }
 
 void LastLocalizationThrottle::Seed(const LastLocalization& rec) {
   has_last_ = true;
   last_ = rec;
+  if (last_.moved_ms <= 0) last_.moved_ms = last_.updated_ms;
   last_write_ms_ = 0;
   last_stamp_ms_ = rec.updated_ms;
+  has_odom_at_write_ = false;
+  has_vision_at_write_ = false;
 }
 
 std::string FiducialFailureBlocksWaypointRecovery(const std::string& error_text) {
@@ -597,7 +698,7 @@ LocalizePose RecoverySeedPose(const LastLocalization& last, bool has_current_bod
   if (last.has_body_height && has_current_body_height && std::isfinite(current_body_height_m) &&
       std::isfinite(last.body_height_m)) {
     const double delta = current_body_height_m - last.body_height_m;
-    if (std::fabs(delta) <= 1.0) pose.z += delta;
+    pose.z += std::max(-kMaxBodyHeightCorrectionM, std::min(kMaxBodyHeightCorrectionM, delta));
   }
   return pose;
 }
@@ -624,7 +725,7 @@ WaypointLocalizeSpec RecoveryLocalizeSpec(const LastLocalization& last,
 LocalizeAcceptancePolicy RecoveryAcceptancePolicy(bool unverified_pass) {
   LocalizeAcceptancePolicy policy;
   policy.allow_skipped_with_small_correction = unverified_pass;
-  policy.small_correction_basis = "saved_pose_small_correction";
+  policy.small_correction_basis = "saved_pose_unverified";
   return policy;
 }
 
@@ -655,6 +756,58 @@ RecoveryRetryDecision DecideRecoveryRetry(bool applied, const std::string& statu
   d.reason = what + "; retrying in " + std::to_string(policy.retry_interval_ms / 1000) +
              " s (attempt " + std::to_string(attempts_made + 1) + " of " +
              std::to_string(policy.max_attempts) + ")";
+  return d;
+}
+
+bool IsMotionCommand(const std::string& command) {
+  static const char* const kMotion[] = {
+      "spot.stand",          "spot.sit",
+      "spot.recover",        "spot.dock",
+      "spot.undock",         "spot.return_and_dock",
+      "spot.rotate_left",    "spot.rotate_right",
+      "spot.waypoint.goto",  "spot.waypoint.goto_straight",
+      "spot.graphnav.goto_pose", "spot.graphnav.goto_pose_straight",
+  };
+  for (const char* m : kMotion) {
+    if (command == m) return true;
+  }
+  return false;
+}
+
+RecoveryRetryGateDecision CheckRecoveryRetry(const RecoveryRetryCheck& in) {
+  RecoveryRetryGateDecision d;
+  if (in.max_window_ms > 0 && in.now_ms - in.first_attempt_ms > in.max_window_ms) {
+    d.reason = "retry window of " + std::to_string(in.max_window_ms / 1000) +
+               " s since the first attempt has passed";
+    return d;
+  }
+  if (in.motion_epoch_now != in.motion_epoch_at_first) {
+    d.reason = "a walk, dock or teleop motion happened since the first attempt";
+    return d;
+  }
+  if (!in.has_odom_at_first) {
+    d.reason = "no odometry from the first attempt to check the robot has not moved";
+    return d;
+  }
+  if (!in.has_odom_now) {
+    d.gate = RecoveryRetryGate::kWait;
+    d.reason = "odometry not available yet";
+    return d;
+  }
+  const std::string moved =
+      BodyMovedInEitherFrame(in.odom_at_first, in.odom_now, in.has_vision_at_first,
+                             in.vision_at_first, in.has_vision_now, in.vision_now,
+                             &d.vision_compared);
+  if (!moved.empty()) {
+    d.reason = moved + " since the first attempt";
+    return d;
+  }
+  if (in.map_activity) {
+    d.gate = RecoveryRetryGate::kWait;
+    d.reason = "a map command, recording or map processing is active";
+    return d;
+  }
+  d.gate = RecoveryRetryGate::kRun;
   return d;
 }
 
@@ -703,11 +856,12 @@ void LocalizationConfirmation::OnRecoveryFinished() {
   if (state_ == State::kRecovering) state_ = State::kConfirmed;
 }
 
-void LocalizationConfirmation::OnAutomaticLocalization(const std::string& waypoint_id) {
+void LocalizationConfirmation::OnAutomaticLocalization(const std::string& waypoint_id,
+                                                       const std::string& note) {
   state_ = State::kAutomatic;
   waypoint_id_ = waypoint_id;
   rejection_.clear();
-  unverified_note_.clear();
+  unverified_note_ = note;
 }
 
 void LocalizationConfirmation::OnUnverifiedOperatorLocalization(const std::string& waypoint_id,

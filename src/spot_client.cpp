@@ -1875,23 +1875,43 @@ bool SpotClient::SetLocalizationAtWaypoint(const WaypointLocalizeRequest& reques
   return finish(true);
 }
 
-bool SpotClient::GetBodyHeightAboveGround(double* out_height_m) {
+bool SpotClient::GetBodyPoseSample(BodyPoseSample* out_sample) {
   std::lock_guard<std::recursive_mutex> lk(api_mu_);
-  if (!out_height_m) return false;
+  if (!out_sample) return false;
   if (!EnsureRobotStateClient()) return false;
   auto state = robot_state_client_->GetRobotState();
   if (!state.status) {
     SetLastError(state.status.DebugString());
     return false;
   }
-  ::bosdyn::api::SE3Pose gpe_tform_body;
-  if (!::bosdyn::api::get_a_tform_b(state.response.robot_state().kinematic_state().transforms_snapshot(),
-                                    ::bosdyn::api::kGroundPlaneEstimateFrame,
-                                    ::bosdyn::api::kBodyFrame, &gpe_tform_body)) {
-    SetLastError("robot state has no gpe->body transform");
-    return false;
+  const auto& robot_state = state.response.robot_state();
+  const auto& snapshot = robot_state.kinematic_state().transforms_snapshot();
+  BodyPoseSample sample;
+  ::bosdyn::api::SE3Pose odom_tform_body;
+  if (::bosdyn::api::GetOdomTformBody(snapshot, &odom_tform_body)) {
+    sample.has_odom = true;
+    sample.odom_tform_body = {odom_tform_body.position().x(), odom_tform_body.position().y(),
+                              odom_tform_body.position().z(), odom_tform_body.rotation().x(),
+                              odom_tform_body.rotation().y(), odom_tform_body.rotation().z(),
+                              odom_tform_body.rotation().w()};
   }
-  *out_height_m = gpe_tform_body.position().z();
+  ::bosdyn::api::SE3Pose vision_tform_body;
+  if (::bosdyn::api::get_a_tform_b(snapshot, ::bosdyn::api::kVisionFrame,
+                                    ::bosdyn::api::kBodyFrame, &vision_tform_body)) {
+    sample.has_vision = true;
+    sample.vision_tform_body = {vision_tform_body.position().x(), vision_tform_body.position().y(),
+                                vision_tform_body.position().z(), vision_tform_body.rotation().x(),
+                                vision_tform_body.rotation().y(), vision_tform_body.rotation().z(),
+                                vision_tform_body.rotation().w()};
+  }
+  ::bosdyn::api::SE3Pose gpe_tform_body;
+  if (::bosdyn::api::get_a_tform_b(snapshot, ::bosdyn::api::kGroundPlaneEstimateFrame,
+                                    ::bosdyn::api::kBodyFrame, &gpe_tform_body)) {
+    sample.has_body_height = true;
+    sample.body_height_m = gpe_tform_body.position().z();
+  }
+  sample.behavior_state = behavior_state_to_string(robot_state.behavior_state().state());
+  *out_sample = std::move(sample);
   return true;
 }
 
@@ -1941,6 +1961,28 @@ bool SpotClient::GetLocalizationSnapshot(LocalizationSnapshot* out_snapshot) {
     snapshot.waypoint_tform_body_qy = localization.waypoint_tform_body().rotation().y();
     snapshot.waypoint_tform_body_qz = localization.waypoint_tform_body().rotation().z();
     snapshot.waypoint_tform_body_qw = localization.waypoint_tform_body().rotation().w();
+  }
+  ::bosdyn::api::SE3Pose odom_tform_body;
+  if (::bosdyn::api::GetOdomTformBody(r.response.robot_kinematics().transforms_snapshot(),
+                                      &odom_tform_body)) {
+    snapshot.has_odom_tform_body = true;
+    snapshot.odom_tform_body = {odom_tform_body.position().x(), odom_tform_body.position().y(),
+                                odom_tform_body.position().z(), odom_tform_body.rotation().x(),
+                                odom_tform_body.rotation().y(), odom_tform_body.rotation().z(),
+                                odom_tform_body.rotation().w()};
+  }
+  ::bosdyn::api::SE3Pose vision_tform_body;
+  if (::bosdyn::api::get_a_tform_b(r.response.robot_kinematics().transforms_snapshot(),
+                                    ::bosdyn::api::kVisionFrame, ::bosdyn::api::kBodyFrame,
+                                    &vision_tform_body)) {
+    snapshot.has_vision_tform_body = true;
+    snapshot.vision_tform_body = {vision_tform_body.position().x(),
+                                  vision_tform_body.position().y(),
+                                  vision_tform_body.position().z(),
+                                  vision_tform_body.rotation().x(),
+                                  vision_tform_body.rotation().y(),
+                                  vision_tform_body.rotation().z(),
+                                  vision_tform_body.rotation().w()};
   }
   if (localization.has_seed_tform_body()) {
     snapshot.has_seed_tform_body = true;

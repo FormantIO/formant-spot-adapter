@@ -275,34 +275,299 @@ void test_fiducial_errors() {
                                          sensors);
 }
 
+fsa::LocalizePose odom_at(double x, double y, double yaw_rad) {
+  return fsa::LocalizePose{x, y, 0.0, 0.0, 0.0, std::sin(yaw_rad / 2.0), std::cos(yaw_rad / 2.0)};
+}
+
 void test_throttle_refresh() {
+  using R = fsa::LastLocalizationThrottle::Reason;
   // A robot that stands still keeps its record fresh, so a reboot an hour later
   // still finds a record younger than the age limit.
   fsa::LastLocalizationThrottle t(5000, 0.5, 0.2617993877991494, 60000);
   const auto a = with_pose(rec("m", "wp-a"), 0.0, 0.0, 0.0);
+  const auto still = odom_at(3.0, 4.0, 0.2);
+  t.ObserveOdom(1000, true, still);
+  check(t.Decide(a, 1000) == R::kChanged, "first record is a change");
   t.MarkPersisted(a, 1000);
-  check(!t.ShouldPersist(a, 30000), "unchanged, 29 s later: not rewritten");
-  check(t.ShouldPersist(a, 61000), "unchanged, 60 s later: refreshed");
+  t.ObserveOdom(30000, true, still);
+  check(t.Decide(a, 30000) == R::kNone, "unchanged, 29 s later: not rewritten");
+  t.ObserveOdom(61000, true, still);
+  check(t.Decide(a, 61000) == R::kRefresh, "unchanged and odometry still, 60 s later: refresh");
   t.MarkPersisted(a, 61000);
-  check(!t.ShouldPersist(a, 100000), "refresh resets the clock");
-  check(t.ShouldPersist(a, 121000), "and refreshes again a minute later");
+  t.ObserveOdom(100000, true, odom_at(3.02, 4.0, 0.2));  // 2 cm of jitter
+  check(t.Decide(a, 100000) == R::kNone, "refresh resets the clock");
+  t.ObserveOdom(121000, true, odom_at(3.02, 4.0, 0.2));
+  check(t.Decide(a, 121000) == R::kRefresh, "jitter under 0.1 m still counts as still");
 
-  fsa::LastLocalizationThrottle off(5000, 0.5, 0.2617993877991494, 0);
-  off.MarkPersisted(a, 1000);
-  check(!off.ShouldPersist(a, 10LL * 3600 * 1000), "refresh interval 0: never refreshed");
+  // Odometry moved 0.3 m: GraphNav's pose moved too little to trigger a write,
+  // but the body moved, so it is a change, not a refresh.
+  {
+    fsa::LastLocalizationThrottle m(5000, 0.5, 0.2617993877991494, 60000);
+    m.ObserveOdom(1000, true, still);
+    m.MarkPersisted(a, 1000);
+    m.ObserveOdom(20000, true, odom_at(3.3, 4.0, 0.2));
+    check(m.Decide(a, 20000) == R::kChanged, "odometry moved 0.3 m: written as a change");
+    m.MarkPersisted(a, 20000);
+    // Pushed back and forth: moved since the stillness anchor, so no refresh
+    // until it has been still for a whole interval.
+    m.ObserveOdom(70000, true, odom_at(3.3, 4.0, 0.2));
+    m.ObserveOdom(81000, true, odom_at(3.3, 4.0, 0.2));
+    check(m.Decide(a, 81000) == R::kRefresh, "still since the last write: refresh");
+  }
+  // Seeded from disk after a restart: no write in this process yet, so a refresh
+  // waits until odometry has been still for a whole interval.
+  {
+    fsa::LastLocalizationThrottle seeded;
+    auto old_rec = a;
+    old_rec.updated_ms = 1000000;
+    seeded.Seed(old_rec);
+    check(seeded.last_moved_ms() == 1000000, "seeded moved_ms defaults to updated_ms");
+    const long long t0 = 1000000 + 2LL * 3600 * 1000;
+    seeded.ObserveOdom(t0, true, still);
+    check(seeded.Decide(a, t0) == R::kNone, "stale record, odometry just started: no refresh yet");
+    seeded.ObserveOdom(t0 + 30000, true, odom_at(3.5, 4.0, 0.2));  // moved
+    seeded.ObserveOdom(t0 + 70000, true, odom_at(3.5, 4.0, 0.2));
+    check(seeded.Decide(a, t0 + 70000) == R::kNone,
+          "moved 40 s ago: not still for a whole interval");
+    seeded.ObserveOdom(t0 + 91000, true, odom_at(3.5, 4.0, 0.2));
+    check(seeded.Decide(a, t0 + 91000) == R::kRefresh, "still for 61 s: refresh");
+  }
+  {
+    fsa::LastLocalizationThrottle no_odom;
+    no_odom.MarkPersisted(a, 1000);
+    no_odom.ObserveOdom(10LL * 3600 * 1000, false, still);
+    check(no_odom.Decide(a, 10LL * 3600 * 1000) == R::kNone, "no odometry: never refreshed");
+  }
+  {
+    fsa::LastLocalizationThrottle off(5000, 0.5, 0.2617993877991494, 0);
+    off.ObserveOdom(1000, true, still);
+    off.MarkPersisted(a, 1000);
+    off.ObserveOdom(10LL * 3600 * 1000, true, still);
+    check(off.Decide(a, 10LL * 3600 * 1000) == R::kNone, "refresh interval 0: never refreshed");
+  }
+  {
+    fsa::LastLocalizationThrottle seeded;
+    auto old_rec = a;
+    old_rec.updated_ms = 1000000;
+    seeded.Seed(old_rec);
+    check(seeded.Decide(a, 500000) == R::kChanged, "record stamped ahead of the clock: rewritten");
+    fsa::LastLocalizationThrottle back;
+    back.MarkPersisted(a, 1000000);
+    check(back.Decide(a, 900000) == R::kChanged, "clock set back after a write: rewritten");
+  }
+  {
+    auto r = a;
+    r.moved_ms = 777;
+    fsa::LastLocalizationThrottle k;
+    k.MarkPersisted(r, 1000);
+    check(k.last_moved_ms() == 777, "moved_ms is carried from the written record");
+  }
+}
 
-  // Seeded from disk: the record's own timestamp counts as the last write.
-  fsa::LastLocalizationThrottle seeded;
-  auto old_rec = a;
-  old_rec.updated_ms = 1000000;
-  seeded.Seed(old_rec);
-  check(!seeded.ShouldPersist(a, 1000000 + 30000), "fresh record on disk: not rewritten at once");
-  check(seeded.ShouldPersist(a, 1000000 + 2LL * 3600 * 1000),
-        "stale record on disk and the robot is still localized: refreshed");
-  check(seeded.ShouldPersist(a, 500000), "record stamped ahead of the clock: rewritten");
-  fsa::LastLocalizationThrottle back;
-  back.MarkPersisted(a, 1000000);
-  check(back.ShouldPersist(a, 900000), "clock set back after a write: rewritten, not stuck");
+void test_motion_helpers() {
+  check(fsa::BodyMovedReason(odom_at(1, 1, 0), odom_at(1.05, 1.05, 0.05)).empty(),
+        "7 cm / 3 deg is still");
+  const std::string moved = fsa::BodyMovedReason(odom_at(1, 1, 0), odom_at(1.12, 1, 0));
+  check(contains(moved, "0.12 m"), "12 cm is a move: " + moved);
+  check(!fsa::BodyMovedReason(odom_at(1, 1, 0), odom_at(1, 1, 0.1)).empty(), "6 deg is a move");
+  fsa::LocalizePose sat = odom_at(1, 1, 0);
+  sat.z = -0.3;
+  check(fsa::BodyMovedReason(odom_at(1, 1, 0), sat).empty(), "sitting down is not a move");
+
+  check(fsa::BodyHeightUsable("not_ready"), "sitting, motors off: settled");
+  check(fsa::BodyHeightUsable("standing"), "standing: settled");
+  for (const char* st : {"transition", "stepping", "unknown", ""}) {
+    check(!fsa::BodyHeightUsable(st), std::string("not settled: ") + st);
+  }
+
+  for (const char* c : {"spot.waypoint.goto", "spot.waypoint.goto_straight", "spot.graphnav.goto_pose",
+                        "spot.graphnav.goto_pose_straight", "spot.dock", "spot.undock",
+                        "spot.return_and_dock", "spot.rotate_left", "spot.rotate_right",
+                        "spot.stand", "spot.sit", "spot.recover"}) {
+    check(fsa::IsMotionCommand(c), std::string("motion command: ") + c);
+  }
+  for (const char* c : {"spot.localize", "spot.localize.confirm", "spot.map.list",
+                        "spot.graphnav.cancel", "spot.camera.calibrate"}) {
+    check(!fsa::IsMotionCommand(c), std::string("not a motion command: ") + c);
+  }
+}
+
+fsa::RecoveryRetryCheck retry_ok() {
+  fsa::RecoveryRetryCheck c;
+  c.first_attempt_ms = 1000000;
+  c.now_ms = c.first_attempt_ms + 10000;
+  c.max_window_ms = 60000;
+  c.motion_epoch_at_first = 7;
+  c.motion_epoch_now = 7;
+  c.has_odom_at_first = true;
+  c.odom_at_first = odom_at(2.0, -1.0, 0.4);
+  c.has_odom_now = true;
+  c.odom_now = odom_at(2.01, -1.0, 0.41);
+  return c;
+}
+
+void test_retry_gate() {
+  using G = fsa::RecoveryRetryGate;
+  check(fsa::CheckRecoveryRetry(retry_ok()).gate == G::kRun, "nothing moved: run");
+  {
+    auto c = retry_ok();
+    c.odom_now = odom_at(2.9, -1.0, 0.4);  // someone moved him about 1 m
+    const auto d = fsa::CheckRecoveryRetry(c);
+    check(d.gate == G::kDrop && contains(d.reason, "moved"), "moved about 1 m: drop: " + d.reason);
+  }
+  {
+    auto c = retry_ok();
+    c.odom_now = odom_at(2.0, -1.0, 0.5);  // turned 5.7 deg
+    check(fsa::CheckRecoveryRetry(c).gate == G::kDrop, "turned 6 deg: drop");
+  }
+  {
+    auto c = retry_ok();
+    c.odom_now.z -= 0.3;  // sat down
+    check(fsa::CheckRecoveryRetry(c).gate == G::kRun, "sat down in place: still run");
+  }
+  {
+    auto c = retry_ok();
+    c.motion_epoch_now = 8;
+    const auto d = fsa::CheckRecoveryRetry(c);
+    check(d.gate == G::kDrop && contains(d.reason, "walk, dock or teleop"),
+          "a walk, dock or teleop motion: drop even if odometry looks still: " + d.reason);
+  }
+  {
+    auto c = retry_ok();
+    c.now_ms = c.first_attempt_ms + 61000;
+    const auto d = fsa::CheckRecoveryRetry(c);
+    check(d.gate == G::kDrop && contains(d.reason, "window"), "past the window: drop: " + d.reason);
+  }
+  {
+    auto c = retry_ok();
+    c.max_window_ms = 0;
+    c.now_ms = c.first_attempt_ms + 3600000;
+    check(fsa::CheckRecoveryRetry(c).gate == G::kRun, "window 0: no time limit");
+  }
+  {
+    auto c = retry_ok();
+    c.has_odom_at_first = false;
+    check(fsa::CheckRecoveryRetry(c).gate == G::kDrop, "no baseline odometry: drop");
+  }
+  {
+    auto c = retry_ok();
+    c.has_odom_now = false;
+    check(fsa::CheckRecoveryRetry(c).gate == G::kWait, "odometry unavailable now: wait");
+  }
+  {
+    auto c = retry_ok();
+    c.map_activity = true;
+    const auto d = fsa::CheckRecoveryRetry(c);
+    check(d.gate == G::kWait && contains(d.reason, "map"), "map command running: wait: " + d.reason);
+    c.odom_now = odom_at(3.0, -1.0, 0.4);
+    check(fsa::CheckRecoveryRetry(c).gate == G::kDrop, "moved and map busy: drop wins");
+  }
+}
+
+void test_vision_frame() {
+  using R = fsa::LastLocalizationThrottle::Reason;
+  using G = fsa::RecoveryRetryGate;
+  const auto odom = odom_at(3.0, 4.0, 0.2);
+  const auto vis = odom_at(-7.0, 2.0, 1.1);
+  const auto vis_carried = odom_at(-6.6, 2.0, 1.1);  // rolled 0.4 m on a cart, no stepping
+  {
+    bool compared = false;
+    const std::string m =
+        fsa::BodyMovedInEitherFrame(odom, odom, true, vis, true, vis_carried, &compared);
+    check(compared && contains(m, "vision frame"), "odom still, vision moved: moved: " + m);
+    check(fsa::BodyMovedInEitherFrame(odom, odom, true, vis, true, odom_at(-6.97, 2.0, 1.1),
+                                      &compared)
+              .empty() && compared,
+          "both still (3 cm vision jitter): still");
+    const std::string fb =
+        fsa::BodyMovedInEitherFrame(odom, odom, false, vis, true, vis_carried, &compared);
+    check(fb.empty() && !compared, "vision missing at one end: odometry only, not compared");
+    check(!fsa::BodyMovedInEitherFrame(odom, odom_at(3.2, 4.0, 0.2), false, vis, false, vis,
+                                       &compared)
+               .empty(),
+          "vision missing: an odometry move still counts");
+  }
+  {
+    // Refresh: odometry still, vision moved -> a change, not a refresh.
+    fsa::LastLocalizationThrottle t(5000, 0.5, 0.2617993877991494, 60000);
+    const auto a = with_pose(rec("m", "wp-a"), 0.0, 0.0, 0.0);
+    t.ObserveOdom(1000, true, odom, true, vis);
+    t.MarkPersisted(a, 1000);
+    t.ObserveOdom(30000, true, odom, true, vis_carried);
+    check(t.Decide(a, 30000) == R::kChanged, "carried on a cart (vision moved): written as change");
+    t.MarkPersisted(a, 30000);
+    t.ObserveOdom(91000, true, odom, true, vis_carried);
+    check(t.Decide(a, 91000) == R::kRefresh, "then both still: refresh");
+  }
+  {
+    // Still in both frames for a whole interval after a restart: refresh.
+    fsa::LastLocalizationThrottle t(5000, 0.5, 0.2617993877991494, 60000);
+    auto a = with_pose(rec("m", "wp-a"), 0.0, 0.0, 0.0);
+    a.updated_ms = 1000;
+    t.Seed(a);
+    t.ObserveOdom(500000, true, odom, true, vis);
+    t.ObserveOdom(530000, true, odom, true, vis_carried);  // vision moved: anchor resets
+    t.ObserveOdom(570000, true, odom, true, vis_carried);
+    check(t.Decide(a, 570000) == R::kNone, "vision moved 40 s ago: no refresh yet");
+    t.ObserveOdom(591000, true, odom, true, vis_carried);
+    check(t.Decide(a, 591000) == R::kRefresh, "still in both frames for 61 s: refresh");
+  }
+  {
+    // Vision unavailable: falls back to odometry and still refreshes.
+    fsa::LastLocalizationThrottle t(5000, 0.5, 0.2617993877991494, 60000);
+    const auto a = with_pose(rec("m", "wp-a"), 0.0, 0.0, 0.0);
+    t.ObserveOdom(1000, true, odom);
+    t.MarkPersisted(a, 1000);
+    t.ObserveOdom(61000, true, odom);
+    check(t.Decide(a, 61000) == R::kRefresh, "no vision frame: odometry-only refresh");
+  }
+  {
+    auto c = retry_ok();
+    c.has_vision_at_first = true;
+    c.vision_at_first = vis;
+    c.has_vision_now = true;
+    c.vision_now = vis_carried;
+    const auto d = fsa::CheckRecoveryRetry(c);
+    check(d.gate == G::kDrop && contains(d.reason, "vision frame"),
+          "retry: odom still, vision moved: drop: " + d.reason);
+    c.vision_now = vis;
+    const auto ok = fsa::CheckRecoveryRetry(c);
+    check(ok.gate == G::kRun && ok.vision_compared, "retry: both still: run, vision compared");
+    c.has_vision_now = false;
+    const auto fb = fsa::CheckRecoveryRetry(c);
+    check(fb.gate == G::kRun && !fb.vision_compared,
+          "retry: vision unavailable: odometry only, reported as not compared");
+  }
+}
+
+void test_retry_window_keeps_state() {
+  std::string refusal;
+  {
+    // An operator localization accepted on weak evidence is pending confirm. A
+    // retry that opens its window and finds the robot localized must not
+    // promote it to confirmed.
+    fsa::LocalizationConfirmation c;
+    c.OnUnverifiedOperatorLocalization("wp-op", "visual alignment failed");
+    check(c.TryBeginRecoveryRetry(&refusal), "retry window opens");
+    c.OnRecoveryFinished();
+    check(!c.confirmed() && contains(c.pending_reason(), "wp-op"),
+          "state kept: still unconfirmed at the operator's waypoint");
+  }
+  {
+    fsa::LocalizationConfirmation c;
+    check(c.TryBeginOperatorAttempt(&refusal), "operator attempt running");
+    check(!c.TryBeginRecoveryRetry(&refusal), "retry waits while spot.localize runs");
+    c.OnRecoveryFinished();
+  }
+  {
+    fsa::LocalizationConfirmation c;
+    c.OnAutomaticLocalization("wp-9", "accepted without visual verification near the saved pose");
+    check(contains(c.pending_reason(), "without visual verification"),
+          "unverified recovery says so on spot.nav.state: " + c.pending_reason());
+    c.OnAutomaticLocalization("wp-9");
+    check(contains(c.pending_reason(), "set automatically after a restart"),
+          "verified recovery keeps the usual reason: " + c.pending_reason());
+  }
 }
 
 void test_body_height_serialization() {
@@ -316,6 +581,15 @@ void test_body_height_serialization() {
   check(fsa::ParseLastLocalization("map_id=m\nwaypoint_id=w\nupdated_ms=5\n", &old_format),
         "a record written before body_height_m existed still parses");
   check(!old_format.has_body_height, "and has no body height");
+  {
+    auto m = r;
+    m.updated_ms = 5000;
+    m.moved_ms = 2000;
+    fsa::LastLocalization mb;
+    check(fsa::ParseLastLocalization(fsa::SerializeLastLocalization(m), &mb) && mb.moved_ms == 2000,
+          "moved_ms round trips");
+  }
+  check(old_format.moved_ms == 5, "a record without moved_ms reads it as updated_ms");
   fsa::LastLocalization bad;
   check(fsa::ParseLastLocalization("map_id=m\nwaypoint_id=w\nbody_height_m=nan\n", &bad) &&
             !bad.has_body_height,
@@ -344,7 +618,9 @@ void test_recovery_seed() {
   }
   {
     const auto p = fsa::RecoverySeedPose(saved, true, 3.5);
-    check(near(p.z, 0.02), "implausible height change (over 1 m) is ignored");
+    check(near(p.z, 0.02 + 0.4), "height correction clamped to +0.4 m");
+    const auto q = fsa::RecoverySeedPose(saved, true, -1.0);
+    check(near(q.z, 0.02 - 0.4), "and to -0.4 m");
   }
   {
     const auto p = fsa::RecoverySeedPose(saved, true, std::numeric_limits<double>::quiet_NaN());
@@ -438,7 +714,7 @@ void test_recovery_passes() {
   f.correction_yaw_rad = 0.05;
   {
     const auto a = fsa::EvaluateWaypointLocalization(f, second);
-    check(a.ok && a.basis == "saved_pose_small_correction",
+    check(a.ok && a.basis == "saved_pose_unverified",
           "unverified pass: found where it was saved, accepted: " + a.basis + a.reason);
   }
   {
@@ -909,9 +1185,11 @@ void test_recovery_decision() {
     fsa::LastLocalizationThrottle t;
     auto saved = with_pose(rec("demo_map", "wp-near-dock"), 1.8, 0.4, 0.2);
     const long long t0 = saved.updated_ms;
+    t.ObserveOdom(t0, true, fsa::LocalizePose{5.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0});
     t.MarkPersisted(saved, t0);
     long long last_write = t0;
     for (long long now = t0; now <= t0 + 2LL * 3600 * 1000; now += 1000) {
+      t.ObserveOdom(now, true, fsa::LocalizePose{5.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0});
       if (t.ShouldPersist(saved, now)) {
         t.MarkPersisted(saved, now);
         last_write = now;
@@ -1002,6 +1280,10 @@ int main() {
   test_throttle();
   test_fiducial_errors();
   test_throttle_refresh();
+  test_motion_helpers();
+  test_retry_gate();
+  test_retry_window_keeps_state();
+  test_vision_frame();
   test_body_height_serialization();
   test_recovery_seed();
   test_pose_math();
